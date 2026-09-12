@@ -1,5 +1,4 @@
 import { createRoot } from 'react-dom/client';
+import App from './App.js';
 
-createRoot(document.getElementById('root')!).render(
-  <main><h1>wave-mech</h1><p>Manual-turn voice workspace. Implementation in progress.</p></main>,
-);
+createRoot(document.getElementById('root')!).render(<App />);

@@ -6,7 +6,7 @@
 /.claude/
 
 # Local project instructions and planning notes
-/CLAUDE.md
+**/CLAUDE.md
 /plan/
 
 # Generated files
