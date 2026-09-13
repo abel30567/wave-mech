@@ -1,4 +1,5 @@
 import type { HarnessEvent } from '../../shared/contracts.js';
+import { DiagnosticLog, type DiagnosticReason, type DiagnosticStatus } from '../../shared/diagnostics.js';
 import {
   MAX_AUDIO_SEQUENCE,
   PCM_RATE,
@@ -15,35 +16,13 @@ import {
   type TranscriptEntry,
 } from '../../shared/realtime.js';
 
-/**
- * P2 conversation coordinator.
- *
- * Owns the durable conversational state for one authenticated session while
- * main owns authentication, the single-session registry, the connection epoch
- * and the 120-second detach expiry. Sockets attach and detach around this
- * coordinator; the transcript, turn state and the persistent Claude Code CLI
- * inference all survive a reconnection.
- *
- * Invariants enforced here (see docs/p2-worker-contract.md):
- *  - Turn ids strictly increase; ids/state are reserved before any await.
- *  - Input audio is contiguous, accepted at most once, and bounded; an ACK is
- *    emitted only once the speech adapter actually accepts a frame.
- *  - Commit, user text and inference happen exactly once per turn; duplicate
- *    calls with identical content are idempotent and conflicting reuse fails.
- *  - Never more than one inference in flight, and never continue past an
- *    unconfirmed interrupt settlement.
- *  - A disconnected response finishes into retained text without emitting
- *    unbounded unheard TTS, and resume never replays possibly heard audio.
- */
-
-// ~120 seconds of mono PCM16 @ 16 kHz — the same recording ceiling P1 uses.
 const MAX_INPUT_BYTES = PCM_RATE * 2 * 120;
-// Bound the transcript we retain for snapshots. This does not reset the model's
-// own context (the persistent CLI keeps that) — it only bounds resume payloads.
 const MAX_MESSAGES = 200;
-// Enough recent per-seq fingerprints to detect a conflicting duplicate frame
-// without retaining the whole utterance.
 const FINGERPRINT_WINDOW = 256;
+
+const SAFE_SPEECH_CATEGORIES = new Set([
+  'stt_error', 'tts_error', 'connection_lost', 'timeout', 'quota_exceeded',
+]);
 
 type InputStatus = 'recording' | 'committing' | 'committed' | 'aborted' | 'failed';
 
@@ -70,7 +49,6 @@ interface ActiveResponse {
   assistantIndex: number | undefined;
 }
 
-/** Cheap order-sensitive checksum used only to spot conflicting duplicate frames. */
 function fingerprint(pcm: Uint8Array): number {
   let hash = 2166136261 >>> 0;
   hash = Math.imul(hash ^ pcm.byteLength, 16777619);
@@ -104,7 +82,6 @@ class Conversation implements RetainedConversation {
   private input: ActiveInput | undefined;
   private response: ActiveResponse | undefined;
   private nextResponseId = 0;
-  /** turnId -> signature of the accepted command, for idempotent replay handling. */
   private readonly turnSignatures = new Map<number, string>();
   private inference: Promise<void> | undefined;
 
@@ -112,11 +89,16 @@ class Conversation implements RetainedConversation {
   private closePromise: Promise<void> | undefined;
   private closed = false;
 
+  private readonly diagnostics: DiagnosticLog;
+  private readonly onSpeechDiagnostic: ((category: string, detail?: string) => void) | undefined;
+
   constructor(private readonly options: ConversationOptions) {
     this.id = options.id;
     this.mode = options.mode;
     this.now = options.now ?? Date.now;
     this.speechConfigured = typeof options.speech === 'function';
+    this.diagnostics = new DiagnosticLog('server', this.now);
+    this.onSpeechDiagnostic = options.onSpeechDiagnostic;
   }
 
   // --- lifecycle ------------------------------------------------------------
@@ -134,7 +116,6 @@ class Conversation implements RetainedConversation {
       });
     }
 
-    // Initialize the harness without a hidden inference warm-up.
     this.startPromise = this.harness.start().then(() => {
       if (this.closed) return;
       this.setPhase('idle');
@@ -147,16 +128,12 @@ class Conversation implements RetainedConversation {
       send({ type: 'ended' });
       return;
     }
-    // A freshly attached socket is authoritative going forward; the previous
-    // sink (if any) is dropped. Main only forwards commands from this one.
     this.sink = send;
     send({ type: 'snapshot', snapshot: this.snapshot() });
   }
 
   detach(): void {
     this.sink = undefined;
-    // Suppress uncertain, unheard audio for an in-flight response, but let the
-    // inference keep running into retained text. Do not touch input context.
     const response = this.response;
     if (response && !response.finished && !response.cancelled && !response.ttsSuppressed) {
       response.ttsSuppressed = true;
@@ -164,7 +141,7 @@ class Conversation implements RetainedConversation {
       try {
         this.speech?.cancelSpeech();
       } catch {
-        /* best-effort: cancellation must not throw out of detach */
+        /* best-effort */
       }
     }
   }
@@ -173,6 +150,7 @@ class Conversation implements RetainedConversation {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
     this.phase = 'closed';
+    this.diagnostics.add({ kind: 'session_closed' });
     this.closePromise = (async () => {
       try {
         this.speech?.close();
@@ -197,7 +175,6 @@ class Conversation implements RetainedConversation {
     try {
       switch (command.type) {
         case 'hello':
-          // Authentication and attachment are main-owned; nothing to do here.
           return;
         case 'ping':
           this.emit({ type: 'pong', id: command.id });
@@ -225,7 +202,6 @@ class Conversation implements RetainedConversation {
           return;
       }
     } catch {
-      // A handler must never reject into main; surface a non-fatal notice.
       this.emitNotice('command_failed', 'That request could not be completed.');
     }
   }
@@ -233,32 +209,25 @@ class Conversation implements RetainedConversation {
   audio(frame: AudioFrame): void {
     if (this.closed) return;
     const input = this.input;
-    // Drop frames that do not belong to the current open recording turn: no ACK.
     if (!input || input.status !== 'recording' || frame.turnId !== input.turnId) return;
     if (frame.seq < 1 || frame.seq > MAX_AUDIO_SEQUENCE) return;
 
     const fp = fingerprint(frame.pcm);
 
     if (frame.seq <= input.receivedSeq) {
-      // Possible retransmit of an already-accepted frame.
       const known = input.fingerprints.get(frame.seq);
       if (known === fp) {
-        // Benign duplicate: re-ACK without feeding the recognizer twice.
         this.emit({ type: 'audio_ack', turnId: input.turnId, seq: frame.seq });
       } else if (known !== undefined) {
-        // Conflicting reuse of a committed sequence number: abort and repeat.
         this.failInput(input, 'discontinuity');
       }
       return;
     }
 
     if (frame.seq > input.receivedSeq + 1) {
-      // Gap: audio must be contiguous. Drop without ACK so the client resends
-      // from above the cumulative ack rather than committing a truncated prefix.
       return;
     }
 
-    // Contiguous next frame. Enforce the independent per-turn byte ceiling.
     if (input.bytes + frame.pcm.byteLength > MAX_INPUT_BYTES) {
       this.failInput(input, 'overflow');
       return;
@@ -266,8 +235,6 @@ class Conversation implements RetainedConversation {
 
     const accepted = this.speech?.writeAudio(frame.pcm) ?? false;
     if (!accepted) {
-      // The recognizer refused the frame (closed/over-limit/cannot enqueue).
-      // Never ACK dropped PCM; abort the unfinished input and ask for a repeat.
       this.failInput(input, 'overflow');
       return;
     }
@@ -304,6 +271,7 @@ class Conversation implements RetainedConversation {
     }
     if (this.capabilities) snapshot.capabilities = this.capabilities;
     if (this.notice) snapshot.notice = this.notice;
+    snapshot.diagnostics = this.diagnostics.snapshot();
     return snapshot;
   }
 
@@ -314,7 +282,6 @@ class Conversation implements RetainedConversation {
       this.emitNotice('speech_unavailable', 'Speech is not configured. You can still type a message.');
       return;
     }
-    // Idempotent re-record of the current open turn: just re-signal readiness.
     if (this.input && this.input.turnId === turnId && this.input.status === 'recording') {
       this.emit({ type: 'input_ready', turnId });
       return;
@@ -328,7 +295,6 @@ class Conversation implements RetainedConversation {
       return;
     }
 
-    // Reserve turn state before the async recognition handshake.
     const input: ActiveInput = {
       turnId,
       status: 'recording',
@@ -358,16 +324,13 @@ class Conversation implements RetainedConversation {
 
   private async onFinish(turnId: number, lastSeq: number): Promise<void> {
     const input = this.input;
-    // Idempotent finish of an already-committed turn (e.g. a reconnect replay).
     if (this.turnSignatures.get(turnId) === `audio:${lastSeq}`) return;
     if (!input || input.turnId !== turnId) {
       this.emitNotice('stale_turn', 'There is no recording to finish.');
       return;
     }
-    if (input.status !== 'recording') return; // already committing/committed
+    if (input.status !== 'recording') return;
     if (lastSeq !== input.receivedSeq) {
-      // A declared last sequence we never fully received means missing tail
-      // audio; refuse to commit a truncated prefix and ask for a repeat.
       this.failInput(input, 'discontinuity');
       return;
     }
@@ -379,8 +342,6 @@ class Conversation implements RetainedConversation {
     try {
       text = (await this.speech!.commitRecognition()).trim();
     } catch {
-      // STT failure resets only this unfinished input; no inference ran so
-      // nothing is replayed.
       if (this.input === input) {
         input.status = 'failed';
         this.input = undefined;
@@ -412,7 +373,7 @@ class Conversation implements RetainedConversation {
   private onText(turnId: number, text: string): void {
     const signature = `text:${textSignature(text)}`;
     const existing = this.turnSignatures.get(turnId);
-    if (existing === signature) return; // idempotent replay
+    if (existing === signature) return;
     if (existing !== undefined || turnId <= this.lastTurnId) {
       this.emitNotice('stale_turn', 'That turn is no longer current.');
       return;
@@ -448,7 +409,6 @@ class Conversation implements RetainedConversation {
 
   private beginInference(turnId: number, text: string): void {
     if (this.closed || !this.harness) return;
-    // Reserve the response id/state before the long-running send await.
     const response: ActiveResponse = {
       turnId,
       responseId: ++this.nextResponseId,
@@ -462,13 +422,11 @@ class Conversation implements RetainedConversation {
       awaitingPlayback: false,
       assistantIndex: undefined,
     };
-    // A response created while detached has no audience for TTS; suppress it up
-    // front so we never synthesize unheard audio.
     if (response.ttsSuppressed) response.audioInterrupted = true;
     this.response = response;
     this.input = undefined;
     this.setPhase('thinking');
-    // Run detached so interrupts can be handled while inference is in flight.
+    this.diagnostics.add({ kind: 'turn_start', detail: `turnId=${turnId} responseId=${response.responseId}` });
     this.inference = this.runInference(response, text);
   }
 
@@ -478,20 +436,19 @@ class Conversation implements RetainedConversation {
     } catch {
       response.inferenceActive = false;
       if (response.cancelled || this.closed) return;
-      // Inference failed on its own. Cancel any partial synthesis and reset.
       try {
         this.speech?.cancelSpeech();
       } catch {
         /* ignore */
       }
       if (this.response === response) this.setPhase('idle');
+      this.diagnostics.add({ kind: 'inference_failed', detail: `turnId=${response.turnId}` });
       this.emit({ type: 'error', code: 'inference_failed', message: 'The response could not be completed.', fatal: false });
       return;
     }
     response.inferenceActive = false;
     if (response.cancelled || this.closed) return;
 
-    // Flush and await final TTS unless output was suppressed (detached / no audience).
     if (this.speech && !response.ttsSuppressed) {
       try {
         await this.speech.finishSpeech();
@@ -520,30 +477,23 @@ class Conversation implements RetainedConversation {
 
   private async onInterrupt(responseId: number): Promise<void> {
     const response = this.response;
-    if (!response || response.responseId !== responseId) return; // stale/unknown
+    if (!response || response.responseId !== responseId) return;
     if (response.cancelled) return;
     response.cancelled = true;
     response.audioInterrupted = true;
     this.setPhase('interrupting');
+    this.diagnostics.add({ kind: 'interruption', detail: `responseId=${responseId}` });
 
-    // Clear unheard output immediately on a separate synthesis epoch.
     try {
       this.speech?.cancelSpeech();
     } catch {
       /* ignore */
     }
 
-    // Only wait for a real inference settlement; playback-only has no result.
     if (response.inferenceActive && this.harness) {
       try {
         await this.harness.interrupt();
       } catch {
-        // The interrupt could not be confirmed: the harness has quarantined the
-        // still-live generation and can no longer serve turns. Do NOT announce a
-        // settled cancellation or reopen admission — that would fabricate
-        // continuity over generation that may still complete. Keep the fence
-        // (response stays cancelled/uncleared) and surface a fatal, closed
-        // recovery outcome instead.
         response.audioInterrupted = true;
         this.emit({ type: 'error', code: 'interrupt_failed', message: 'Could not stop the response cleanly.', fatal: true });
         void this.close();
@@ -590,12 +540,24 @@ class Conversation implements RetainedConversation {
       case 'tool': {
         const response = this.response;
         if (!response || response.cancelled) return;
-        this.emit({ type: 'tool', responseId: response.responseId, name: event.name, status: event.status });
+        const callId = event.callId;
+        this.emit({ type: 'tool', responseId: response.responseId, name: event.name, status: event.status, callId });
+        if (event.status !== 'running') {
+          this.diagnostics.record({
+            callId: callId ?? `unknown-${this.now()}`,
+            name: event.name,
+            status: event.status as DiagnosticStatus,
+            durationMs: event.durationMs,
+            reason: (event.reason as DiagnosticReason) ?? undefined,
+            statusCode: event.statusCode,
+            turnId: response.turnId,
+            responseId: response.responseId,
+          });
+          this.emitDiagnostic();
+        }
         return;
       }
       case 'error': {
-        // A turn-scoped error also rejects harness.send(), which runInference
-        // handles. Only an error with no inference in flight is session-fatal.
         if (this.response?.inferenceActive) return;
         this.emit({ type: 'error', code: 'harness_failed', message: 'The local inference process failed.', fatal: true });
         void this.close();
@@ -615,7 +577,6 @@ class Conversation implements RetainedConversation {
   private onAudio(audio: string, sampleRate: number): void {
     if (this.closed) return;
     const response = this.response;
-    // Epoch fence: drop audio for a cancelled/suppressed or superseded response.
     if (!response || response.cancelled || response.ttsSuppressed || response.finished) return;
     const seq = ++response.audioSeq;
     response.lastAudioSeq = seq;
@@ -632,9 +593,19 @@ class Conversation implements RetainedConversation {
 
   private onSpeechError(message: string): void {
     if (this.closed) return;
+
+    const safeCategory = this.classifySpeechError(message);
+    if (this.onSpeechDiagnostic) {
+      try {
+        this.onSpeechDiagnostic(safeCategory);
+      } catch {
+        /* ignore callback errors */
+      }
+    }
+    this.diagnostics.add({ kind: 'speech_error', detail: safeCategory });
+
     const input = this.input;
     if (input && input.status === 'recording') {
-      // STT dropped before commit: reset only the unfinished input.
       input.status = 'failed';
       this.input = undefined;
       this.setPhase('idle');
@@ -649,7 +620,16 @@ class Conversation implements RetainedConversation {
       return;
     }
     this.emitNotice('speech_error', 'The speech connection reported a problem.');
-    void message;
+  }
+
+  private classifySpeechError(message: string): string {
+    const lower = message.toLowerCase();
+    if (lower.includes('timeout')) return 'timeout';
+    if (lower.includes('quota')) return 'quota_exceeded';
+    if (lower.includes('connection') || lower.includes('disconnect')) return 'connection_lost';
+    if (lower.includes('stt') || lower.includes('recognition') || lower.includes('transcri')) return 'stt_error';
+    if (lower.includes('tts') || lower.includes('synthe') || lower.includes('speech')) return 'tts_error';
+    return 'unknown';
   }
 
   // --- helpers --------------------------------------------------------------
@@ -662,19 +642,17 @@ class Conversation implements RetainedConversation {
       const server = event.mcp.find((m) => m.name === 'fermi');
       fermi = server ? (server.status === 'connected' ? 'connected' : 'unavailable') : 'unavailable';
     }
+    const model = event.model;
     this.capabilities = { web, fermi, tools: [...tools] };
+    if (model) this.capabilities.model = model;
+    if (model) this.diagnostics.setModel(model);
+    this.diagnostics.add({ kind: 'connection_ready' });
     this.emit({ type: 'capabilities', capabilities: this.capabilities });
   }
 
-  /** True when a turn is being recorded, committed, or answered. */
   private isBusy(): boolean {
     const response = this.response;
     if (response) {
-      // Busy for the whole response lifecycle: inference, TTS synthesis
-      // finalization (the window after inference resolves but before
-      // finishSpeech settles), and playback acknowledgement. Admitting a new
-      // turn during synthesis finalization would retag the previous response's
-      // trailing audio.
       if (!response.finished && !response.cancelled) return true;
       if (response.awaitingPlayback) return true;
     }
@@ -711,7 +689,6 @@ class Conversation implements RetainedConversation {
       if (entry && entry.role === 'assistant' && entry.turnId === response.turnId) {
         entry.text += text;
       } else {
-        // The entry was trimmed away; start a fresh one.
         this.pushMessage({ turnId: response.turnId, role: 'assistant', text });
         response.assistantIndex = this.messages.length - 1;
       }
@@ -723,7 +700,6 @@ class Conversation implements RetainedConversation {
     if (this.messages.length > MAX_MESSAGES) {
       const dropped = this.messages.length - MAX_MESSAGES;
       this.messages.splice(0, dropped);
-      // Keep the current assistant pointer valid after trimming from the front.
       if (this.response?.assistantIndex !== undefined) {
         this.response.assistantIndex = Math.max(0, this.response.assistantIndex - dropped);
       }
@@ -739,7 +715,6 @@ class Conversation implements RetainedConversation {
   }
 
   private trimTurnSignatures(): void {
-    // Keep only the most recent turn signatures for idempotent replay handling.
     while (this.turnSignatures.size > 16) {
       const oldest = this.turnSignatures.keys().next().value;
       if (oldest === undefined) break;
@@ -756,6 +731,10 @@ class Conversation implements RetainedConversation {
   private emitNotice(code: string, message: string): void {
     this.notice = message;
     this.emit({ type: 'notice', code, message });
+  }
+
+  private emitDiagnostic(): void {
+    this.emit({ type: 'diagnostic', snapshot: this.diagnostics.snapshot() });
   }
 
   private emit(event: RealtimeEvent): void {

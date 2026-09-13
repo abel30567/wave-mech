@@ -11,12 +11,12 @@ export const MAX_AUDIO_SEQUENCE = 8192;
 export const SESSION_GRACE_MS = 120000;
 
 export type ConversationPhase = 'idle' | 'opening-input' | 'recording' | 'thinking' | 'speaking' | 'interrupting' | 'paused' | 'closed';
-export type ToolStatus = 'running' | 'done' | 'failed' | 'denied';
+export type ToolStatus = 'running' | 'done' | 'failed' | 'denied' | 'pending' | 'cancelled';
 export interface TranscriptEntry { turnId: number; role: 'user' | 'assistant'; text: string }
 export interface AudioFrame { turnId: number; seq: number; pcm: Uint8Array }
 export interface InputProgress { turnId: number; lastSeq: number; committed: boolean }
 export interface ResponseProgress { turnId: number; responseId: number; lastAudioSeq: number; finished: boolean; audioInterrupted: boolean }
-export interface ToolCapabilities { web: boolean; fermi: 'pending' | 'connected' | 'unavailable'; tools: string[] }
+export interface ToolCapabilities { web: boolean; fermi: 'pending' | 'connected' | 'unavailable'; tools: string[]; model?: string }
 export interface ConversationSnapshot {
   sessionId: string;
   mode: 'live' | 'fixture';
@@ -28,6 +28,7 @@ export interface ConversationSnapshot {
   response?: ResponseProgress;
   capabilities?: ToolCapabilities;
   notice?: string;
+  diagnostics?: import('./diagnostics.js').DiagnosticSnapshot;
 }
 
 export type RealtimeCommand =
@@ -53,7 +54,8 @@ export type RealtimeEvent =
   | { type: 'audio'; turnId: number; responseId: number; seq: number; audio: string; sampleRate: number }
   | { type: 'response_done'; turnId: number; responseId: number; lastAudioSeq: number }
   | { type: 'response_cancelled'; responseId: number }
-  | { type: 'tool'; responseId: number; name: string; status: ToolStatus }
+  | { type: 'tool'; responseId: number; name: string; status: ToolStatus; callId?: string }
+  | { type: 'diagnostic'; snapshot: import('./diagnostics.js').DiagnosticSnapshot }
   | { type: 'capabilities'; capabilities: ToolCapabilities }
   | { type: 'notice'; code: string; message: string }
   | { type: 'error'; code: string; message: string; fatal: boolean }
@@ -75,6 +77,7 @@ export interface ConversationOptions {
     onAudio(audio: string, sampleRate: number): void;
     onError(message: string): void;
   }) => RealtimeSpeech;
+  onSpeechDiagnostic?: (category: string, detail?: string) => void;
   now?: () => number;
 }
 export interface RetainedConversation {
