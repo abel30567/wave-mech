@@ -16,6 +16,22 @@ import {
 } from './protocol.js';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
+// ElevenLabs' TTS `stream-input` socket closes after 20 s of inactivity (its
+// default `inactivity_timeout`). During a long Fermi tool wait the model can
+// open TTS with a preamble and then pause well past that window, so the socket
+// is silently dropped and the eventual continuation fails. The documented
+// keepalive is a single space, which resets the idle timer WITHOUT ending
+// generation — an *empty* string would be the End-of-Sequence and close the
+// stream, so it must never be used as a keepalive. We ping comfortably inside
+// the window. (Bounded: it runs only while a TTS socket is open and is cleared
+// on flush/cancel/teardown/close.)
+const DEFAULT_TTS_KEEPALIVE_MS = 15_000;
+
+/** Internal, non-contract tuning knobs (kept out of the shared SpeechOptions). */
+export interface SpeechTuning {
+  /** Interval between TTS idle keepalive pings; must stay below the server's idle timeout. */
+  ttsKeepAliveMs?: number;
+}
 // Deliberately small: the caller drives one manual turn at a time, so a large
 // backlog means the peer is unhealthy rather than merely slow.
 const MAX_QUEUED_FRAMES = 256;
@@ -155,10 +171,11 @@ function rawToString(data: RawData): string {
   return Buffer.from(data as ArrayBuffer).toString('utf8');
 }
 
-export function createSpeech(options: SpeechOptions): SpeechSession {
+export function createSpeech(options: SpeechOptions, tuning: SpeechTuning = {}): SpeechSession {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const sttEndpoint = options.endpoints?.stt ?? DEFAULT_STT_ENDPOINT;
   const ttsEndpoint = options.endpoints?.tts ?? DEFAULT_TTS_ENDPOINT;
+  const ttsKeepAliveMs = tuning.ttsKeepAliveMs ?? DEFAULT_TTS_KEEPALIVE_MS;
 
   let closed = false;
 
@@ -303,6 +320,29 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
   // Synthesis epoch: bumped on cancel/close so a socket that finishes opening —
   // or an audio frame that arrives — after cancellation cannot feed a replacement.
   let ttsGeneration = 0;
+  let ttsKeepAlive: ReturnType<typeof setTimeout> | undefined;
+
+  const clearTtsKeepAlive = (): void => {
+    if (ttsKeepAlive) clearTimeout(ttsKeepAlive);
+    ttsKeepAlive = undefined;
+  };
+
+  // Keep an open-but-idle TTS socket alive during a long tool wait. A single
+  // space resets the server's idle timer without ending generation; we never
+  // send an empty string here (that is EOS). Re-armed after each real frame and
+  // after each ping; cleared whenever the socket is finishing or torn down so a
+  // ping can never race a flush or land after EOS.
+  const armTtsKeepAlive = (): void => {
+    clearTtsKeepAlive();
+    const socket = tts;
+    if (closed || !socket) return;
+    ttsKeepAlive = setTimeout(() => {
+      if (closed || tts !== socket || pendingFinish) return;
+      socket.send(ttsTextFrame(' '));
+      armTtsKeepAlive();
+    }, ttsKeepAliveMs);
+    (ttsKeepAlive as { unref?: () => void }).unref?.();
+  };
 
   const settleFinish = (error: Error): void => {
     if (!pendingFinish) return;
@@ -313,6 +353,7 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
   };
 
   const teardownTts = (): void => {
+    clearTtsKeepAlive();
     tts?.teardown();
     tts = undefined;
     ttsStarting = undefined;
@@ -346,6 +387,7 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
     });
     tts = socket;
     socket.send(ttsInitFrame());
+    armTtsKeepAlive();
     ttsStarting = (async () => {
       const token = await options.getToken('tts_websocket');
       if (closed || generation !== ttsGeneration || tts !== socket) {
@@ -377,11 +419,15 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
     ensureTts();
     tts?.send(ttsTextFrame(textBuffer.slice(0, end)));
     textBuffer = textBuffer.slice(end);
+    // Real text resets the idle window; re-arm so the next tool wait is covered.
+    armTtsKeepAlive();
   };
 
   const finishSpeech = (): Promise<void> => {
     if (closed) return Promise.reject(new Error('speech_closed'));
     if (pendingFinish) return Promise.reject(new Error('speech_finish_in_progress'));
+    // No more idle: we are about to send EOS, so a keepalive space must not race it.
+    clearTtsKeepAlive();
     if (textBuffer) {
       ensureTts();
       tts?.send(ttsTextFrame(`${textBuffer} `));

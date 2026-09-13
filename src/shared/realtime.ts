@@ -1,4 +1,5 @@
 import type { HarnessEvent, HarnessSession, SpeechSession } from './contracts.js';
+import type { DiagnosticEvent, DiagnosticInput, DiagnosticSnapshot, DiagnosticToolStatus, DiagnosticReason } from './diagnostics.js';
 
 export const REALTIME_VERSION = 2;
 export const PCM_RATE = 16000;
@@ -11,7 +12,7 @@ export const MAX_AUDIO_SEQUENCE = 8192;
 export const SESSION_GRACE_MS = 120000;
 
 export type ConversationPhase = 'idle' | 'opening-input' | 'recording' | 'thinking' | 'speaking' | 'interrupting' | 'paused' | 'closed';
-export type ToolStatus = 'running' | 'done' | 'failed' | 'denied';
+export type ToolStatus = DiagnosticToolStatus;
 export interface TranscriptEntry { turnId: number; role: 'user' | 'assistant'; text: string }
 export interface AudioFrame { turnId: number; seq: number; pcm: Uint8Array }
 export interface InputProgress { turnId: number; lastSeq: number; committed: boolean }
@@ -27,6 +28,8 @@ export interface ConversationSnapshot {
   input?: InputProgress;
   response?: ResponseProgress;
   capabilities?: ToolCapabilities;
+  model?: string;
+  diagnostics?: DiagnosticSnapshot;
   notice?: string;
 }
 
@@ -53,8 +56,9 @@ export type RealtimeEvent =
   | { type: 'audio'; turnId: number; responseId: number; seq: number; audio: string; sampleRate: number }
   | { type: 'response_done'; turnId: number; responseId: number; lastAudioSeq: number }
   | { type: 'response_cancelled'; responseId: number }
-  | { type: 'tool'; responseId: number; name: string; status: ToolStatus }
-  | { type: 'capabilities'; capabilities: ToolCapabilities }
+  | { type: 'tool'; responseId: number; name: string; status: ToolStatus; callId?: string; reason?: DiagnosticReason; statusCode?: number; durationMs?: number }
+  | { type: 'diagnostic'; event: DiagnosticEvent }
+  | { type: 'capabilities'; capabilities: ToolCapabilities; model?: string }
   | { type: 'notice'; code: string; message: string }
   | { type: 'error'; code: string; message: string; fatal: boolean }
   | { type: 'pong'; id: number }
@@ -74,6 +78,7 @@ export interface ConversationOptions {
     onPartial(text: string): void;
     onAudio(audio: string, sampleRate: number): void;
     onError(message: string): void;
+    onDiagnostic?(event: DiagnosticInput): void;
   }) => RealtimeSpeech;
   now?: () => number;
 }
@@ -97,6 +102,7 @@ export interface HandsFreeAudioOptions {
   onState(state: 'ready' | 'suspended' | 'closed'): void;
   onError(message: string): void;
   onDiscontinuity(): void;
+  onDiagnostic?(event: DiagnosticInput): void;
 }
 export interface HandsFreeAudio {
   setMode(mode: AudioMode): void;
@@ -121,6 +127,7 @@ export interface ConversationView {
   notice?: string;
   tool?: { name: string; status: ToolStatus };
   capabilities?: ToolCapabilities;
+  model?: string;
 }
 export interface ConversationClientOptions {
   url: string;
@@ -137,4 +144,5 @@ export interface ConversationClient {
   mute(muted: boolean): void;
   resumeAudio(): Promise<void>;
   end(): Promise<void>;
+  diagnostics?(): DiagnosticSnapshot;
 }

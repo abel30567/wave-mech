@@ -13,6 +13,7 @@ import {
   type TranscriptEntry,
 } from '../../shared/realtime.js';
 import { encodeAudio } from '../../shared/realtime-wire.js';
+import { DiagnosticLog, type DiagnosticInput, type DiagnosticSnapshot } from '../../shared/diagnostics.js';
 import { OutstandingAudio } from './outstanding.js';
 
 // Reconnect/stall timing. These are client-transport concerns, not part of the
@@ -75,6 +76,10 @@ class Client implements ConversationClient {
   private notice: string | undefined;
   private tool: { name: string; status: ToolStatus } | undefined;
   private capabilities: ToolCapabilities | undefined;
+  private model: string | undefined;
+  private readonly diagnosticLog = new DiagnosticLog('client');
+  private turnStartedAt: number | undefined;
+  private firstAudioResponse: number | undefined;
 
   private turnCounter = 0;
   private input: InputTurn | null = null;
@@ -98,9 +103,14 @@ class Client implements ConversationClient {
 
   // --- public API -----------------------------------------------------------
 
+  diagnostics(): DiagnosticSnapshot { return this.diagnosticLog.snapshot(); }
+
+  private recordDiagnostic(event: DiagnosticInput): void { this.diagnosticLog.record(event); }
+
   async start(): Promise<void> {
     if (this.started) return;
     this.started = true;
+    this.recordDiagnostic({ source: 'client', code: 'session_start' });
     this.phase = 'loading-audio';
     this.connection = 'connecting';
     this.emit();
@@ -139,6 +149,7 @@ class Client implements ConversationClient {
       onState: this.onAudioState,
       onError: this.onAudioError,
       onDiscontinuity: this.onDiscontinuity,
+      onDiagnostic: event => this.recordDiagnostic(event),
     });
     this.audioCreating = creating;
     void creating.then(
@@ -177,6 +188,7 @@ class Client implements ConversationClient {
       this.discardInput();
     }
     const turnId = ++this.turnCounter;
+    this.recordDiagnostic({ source: 'client', code: 'text_submitted', turnId });
     this.send({ type: 'text', turnId, text: trimmed });
     this.partial = '';
     this.setPhase('thinking');
@@ -222,6 +234,7 @@ class Client implements ConversationClient {
   async end(): Promise<void> {
     if (this.ended) return;
     this.ended = true;
+    this.recordDiagnostic({ source: 'client', code: 'session_end' });
     this.clearStall();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
@@ -252,6 +265,7 @@ class Client implements ConversationClient {
     if (this.ended || this.connection === 'offline' || this.connection === 'expired') return;
     if (this.muted || this.outputPaused) return; // suppressed while paused/muted
     if (this.input) return; // never admit an overlapping input turn
+    this.recordDiagnostic({ source: 'audio', code: this.phase === 'speaking' ? 'barge_in' : 'vad_speech_start', responseId: this.currentResponseId ?? undefined });
     if (this.phase === 'speaking' && this.currentResponseId !== null) {
       // Barge-in: drop playback immediately and ask the server to interrupt,
       // keeping the shared context open for the new turn. The server is still
@@ -281,6 +295,7 @@ class Client implements ConversationClient {
   };
 
   private onSpeechEnd = (): void => {
+    this.recordDiagnostic({ source: 'audio', code: 'vad_speech_end', turnId: this.input?.turnId });
     void this.finishInput();
   };
 
@@ -294,6 +309,7 @@ class Client implements ConversationClient {
   };
 
   private onAudioState = (state: 'ready' | 'suspended' | 'closed'): void => {
+    this.recordDiagnostic({ source: 'audio', code: `audio_${state}`, responseId: this.currentResponseId ?? undefined });
     if (state === 'suspended') {
       this.outputPaused = true;
       if (!this.input && this.currentResponseId === null) this.setPhase('paused');
@@ -306,11 +322,13 @@ class Client implements ConversationClient {
   };
 
   private onAudioError = (message: string): void => {
+    this.recordDiagnostic({ source: 'audio', code: 'audio_error', reason: 'unknown', responseId: this.currentResponseId ?? undefined });
     this.notice = message;
     this.emit();
   };
 
   private onDiscontinuity = (): void => {
+    this.recordDiagnostic({ source: 'audio', code: 'input_discontinuity', turnId: this.input?.turnId });
     const input = this.input;
     if (!input) return;
     // A main-thread stall means the captured prefix is truncated; abandon it
@@ -450,6 +468,8 @@ class Client implements ConversationClient {
     const audio = this.audio;
     const result = audio ? await audio.finishOutput(responseId, lastSeq) : 'played';
     if (this.ended) return;
+    this.recordDiagnostic({ source: 'client', code: `playback_${audio ? result : 'unavailable'}`, responseId, count: lastSeq,
+      durationMs: this.turnStartedAt === undefined ? undefined : Math.max(0, Date.now() - this.turnStartedAt) });
     if (result === 'paused') {
       // Retain the completion obligation across pause/resume: withhold the
       // acknowledgement, keep the response current, and never advertise
@@ -478,6 +498,7 @@ class Client implements ConversationClient {
   // --- transport ------------------------------------------------------------
 
   private connect(isReconnect: boolean): void {
+    this.recordDiagnostic({ source: 'client', code: isReconnect ? 'reconnect_started' : 'connect_started' });
     this.connection = isReconnect ? 'reconnecting' : 'connecting';
     this.emit();
     const socket = this.socketFactory(this.options.url);
@@ -489,6 +510,7 @@ class Client implements ConversationClient {
     }
     socket.onopen = (): void => {
       if (this.socket !== socket) return;
+      this.recordDiagnostic({ source: 'client', code: 'socket_open' });
       // Preserve the known sessionId so the server reattaches context rather
       // than silently replacing it.
       this.send(this.sessionId ? { type: 'hello', version: 2, sessionId: this.sessionId } : { type: 'hello', version: 2 });
@@ -508,6 +530,7 @@ class Client implements ConversationClient {
       this.onMessage(event);
     };
     socket.onerror = (): void => {
+      if (this.socket === socket) this.recordDiagnostic({ source: 'client', code: 'socket_error', reason: 'network' });
       /* the matching close handler performs the reconnect */
     };
     socket.onclose = (): void => {
@@ -519,6 +542,7 @@ class Client implements ConversationClient {
   private onSocketClosed(): void {
     this.socket = null;
     if (this.ended || this.connection === 'expired') return;
+    this.recordDiagnostic({ source: 'client', code: 'socket_closed', reason: 'network', responseId: this.currentResponseId ?? undefined });
     this.connection = 'reconnecting';
     this.emit();
     // A transient fault reconnects automatically; it never sends end or clears
@@ -552,6 +576,9 @@ class Client implements ConversationClient {
     switch (event.type) {
       case 'snapshot':
         this.reconcile(event.snapshot);
+        return;
+      case 'diagnostic':
+        if (typeof event.event?.id === 'string' && event.event.id.startsWith('server:')) this.diagnosticLog.add(event.event);
         return;
       case 'state':
         return; // local phase is authoritative for the view
@@ -590,6 +617,8 @@ class Client implements ConversationClient {
         }
         return;
       case 'user':
+        this.turnStartedAt = Date.now();
+        this.recordDiagnostic({ source: 'client', code: 'user_turn_accepted', turnId: event.turnId });
         this.messages.push({ turnId: event.turnId, role: 'user', text: event.text });
         // The server has committed this input; release the finalizing slot so a
         // later reconnect never re-sends its finish.
@@ -607,6 +636,11 @@ class Client implements ConversationClient {
       case 'audio': {
         if (this.isStaleResponse(event.responseId)) return;
         this.adoptResponse(event.responseId);
+        if (this.firstAudioResponse !== event.responseId) {
+          this.firstAudioResponse = event.responseId;
+          this.recordDiagnostic({ source: 'client', code: 'first_audio_received', responseId: event.responseId, turnId: event.turnId, sampleRate: event.sampleRate,
+            durationMs: this.turnStartedAt === undefined ? undefined : Math.max(0, Date.now() - this.turnStartedAt) });
+        }
         this.audio?.enqueueOutput(event.audio, event.sampleRate, event.responseId, event.seq);
         // Only emit when the audio frame actually changes visible state (the
         // first frame that flips us into `speaking`). Subsequent audio-only
@@ -638,13 +672,16 @@ class Client implements ConversationClient {
         return;
       case 'capabilities':
         this.capabilities = event.capabilities;
+        if (event.model && /^claude-[a-z0-9.\[\]-]{1,80}$/.test(event.model)) this.model = event.model;
         this.emit();
         return;
       case 'notice':
+        this.recordDiagnostic({ source: 'client', code: `notice_${event.code}`, responseId: this.currentResponseId ?? undefined });
         this.notice = event.message;
         this.emit();
         return;
       case 'error':
+        this.recordDiagnostic({ source: 'client', code: `error_${event.code}`, responseId: this.currentResponseId ?? undefined });
         this.notice = event.message;
         if (event.fatal) {
           this.connection = event.code === 'expired' ? 'expired' : this.connection;
@@ -666,6 +703,11 @@ class Client implements ConversationClient {
     this.messages = snapshot.messages.map((entry) => ({ ...entry }));
     this.turnCounter = Math.max(this.turnCounter, snapshot.lastTurnId);
     this.capabilities = snapshot.capabilities ?? this.capabilities;
+    if (snapshot.model && /^claude-[a-z0-9.\[\]-]{1,80}$/.test(snapshot.model)) this.model = snapshot.model;
+    if (snapshot.diagnostics && Array.isArray(snapshot.diagnostics.entries)) this.diagnosticLog.merge({
+      entries: snapshot.diagnostics.entries.filter(entry => typeof entry?.id === 'string' && entry.id.startsWith('server:')), dropped: snapshot.diagnostics.dropped,
+    });
+    this.recordDiagnostic({ source: 'client', code: 'snapshot_received' });
     if (snapshot.notice !== undefined) this.notice = snapshot.notice;
 
     // Reconcile an in-flight input turn without replaying accepted commands.
@@ -796,6 +838,7 @@ class Client implements ConversationClient {
       notice: this.notice,
       tool: this.tool,
       capabilities: this.capabilities,
+      model: this.model,
     };
   }
 }

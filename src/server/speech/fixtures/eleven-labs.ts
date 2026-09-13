@@ -24,6 +24,13 @@ export interface FixtureOptions {
   ttsNeverFinal?: boolean;
   /** Delay the audio + final frames on EOS by N ms (deferred-finalization race). */
   ttsDeferFinalMs?: number;
+  /**
+   * Mirror ElevenLabs' idle-timeout behaviour: close the TTS socket if no client
+   * message arrives within this many ms. Any inbound frame — including a
+   * single-space keepalive — resets the timer, so a correct keepalive keeps the
+   * socket open across a simulated tool wait.
+   */
+  ttsInactivityMs?: number;
 }
 
 export interface Fixture {
@@ -100,7 +107,25 @@ function handleStt(ws: WebSocket, options: FixtureOptions): void {
 function handleTts(ws: WebSocket, options: FixtureOptions): void {
   if (options.ttsMalformedFirst) ws.send('<<not-json>>');
   const fragments: string[] = [];
+
+  // Idle-timeout simulation: close the socket after a quiet window, resetting on
+  // every inbound frame (keepalive spaces included).
+  let idle: ReturnType<typeof setTimeout> | undefined;
+  const bumpIdle = (): void => {
+    if (!options.ttsInactivityMs) return;
+    if (idle) clearTimeout(idle);
+    idle = setTimeout(() => {
+      if (ws.readyState === ws.OPEN) ws.close(1000, 'inactivity');
+    }, options.ttsInactivityMs);
+    idle.unref?.();
+  };
+  bumpIdle();
+  ws.on('close', () => {
+    if (idle) clearTimeout(idle);
+  });
+
   ws.on('message', (data) => {
+    bumpIdle();
     const msg = JSON.parse(data.toString()) as { text?: string; flush?: boolean };
     const text = msg.text ?? '';
     if (text === '' && !msg.flush) {

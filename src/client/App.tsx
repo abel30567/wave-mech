@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { createConversationClient } from './realtime/client.js';
+import { browserReport, formatTranscriptReport } from './transcript.js';
 import type { ConversationClient, ConversationView, ConversationClientOptions } from '../shared/realtime.js';
 import './style.css';
 
-type Bootstrap = { protocol: number; mode: 'live' | 'fixture'; speechConfigured: boolean; fermiConfigured: boolean; speechMessage: string };
+type Bootstrap = { protocol: number; mode: 'live' | 'fixture'; speechConfigured: boolean; fermiConfigured: boolean; speechMessage: string; configuredModel?: string; buildId?: string };
 const initialView: ConversationView = {
   connection: 'offline', phase: 'ended', messages: [], partial: '', muted: false,
   audioAvailable: false, canSendText: false, canResumeAudio: false,
@@ -25,6 +26,8 @@ export default function App() {
   const [view, setView] = useState<ConversationView>(initialView);
   const [notice, setNotice] = useState('');
   const [draft, setDraft] = useState('');
+  const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'fallback'>('idle');
+  const [copyFallback, setCopyFallback] = useState('');
   const client = useRef<ConversationClient | undefined>(undefined);
   const generation = useRef(0);
   const conversation = useRef<HTMLDivElement>(null);
@@ -48,7 +51,8 @@ export default function App() {
     if (!setup) { void refreshAccess().catch(() => setNotice('The workspace is unavailable.')); return; }
     const revision = ++generation.current;
     void client.current?.end();
-    setNotice(''); setDraft(''); setView({ ...initialView, connection: 'connecting', phase: 'loading-audio' });
+    setNotice(''); setDraft(''); setCopyStatus('idle'); setCopyFallback('');
+    setView({ ...initialView, connection: 'connecting', phase: 'loading-audio' });
     const testFactory = (window as unknown as { __waveTestAudioFactory?: ConversationClientOptions['audioFactory'] }).__waveTestAudioFactory;
     const next = createConversationClient({
       url: `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/session`,
@@ -64,10 +68,28 @@ export default function App() {
   }
   function end() {
     generation.current++;
-    const current = client.current; client.current = undefined;
-    void current?.end();
-    setView(previous => ({ ...initialView, messages: previous.messages }));
+    // Keep the ended client's bounded diagnostic log available to the copy button.
+    void client.current?.end();
+    setView(previous => ({ ...previous, connection: 'offline', phase: 'ended', partial: '', muted: false,
+      audioAvailable: false, canSendText: false, canResumeAudio: false, notice: undefined, tool: undefined }));
     setNotice('');
+  }
+  async function copyTranscript() {
+    const revision = generation.current;
+    const report = formatTranscriptReport({
+      messages: view.messages, diagnostics: client.current?.diagnostics?.() ?? { entries: [], dropped: 0 },
+      capturedAt: Date.now(), mode: setup?.mode, configuredModel: setup?.configuredModel,
+      reportedModel: view.model, buildId: setup?.buildId, browser: browserReport(),
+    });
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(report);
+      if (generation.current !== revision) return;
+      setCopyStatus('copied'); setCopyFallback('');
+    } catch {
+      if (generation.current !== revision) return;
+      setCopyStatus('fallback'); setCopyFallback(report);
+    }
   }
   function submit(event: React.FormEvent) {
     event.preventDefault();
@@ -111,17 +133,26 @@ export default function App() {
               : <button className="primary-button" disabled={!view.audioAvailable || !setup?.speechConfigured} onClick={() => client.current?.mute(!view.muted)}>
                 <Microphone size={18} muted={!view.muted} />{view.muted ? 'Unmute microphone' : view.phase === 'loading-audio' ? 'Preparing audio…' : 'Mute microphone'}
               </button>}
-            <button className="quiet-button" disabled={!client.current} onClick={end}>End session</button>
+            <button className="quiet-button" disabled={!active} onClick={end}>End session</button>
             {view.phase === 'recording' && <button className="manual-fallback" onClick={() => void client.current?.finishTurn()}>Finish now</button>}
           </div>
         </div>
         <div className="session-notes"><span className="note-symbol" aria-hidden="true">⌁</span><p>Keep this page open for hands-free listening. Mute or end the session whenever you want.</p></div>
       </section>
       <section className="conversation-panel" aria-label="Conversation">
-        <div className="conversation-heading"><h2>Your conversation</h2><span>{setup?.mode === 'fixture' ? 'Synthetic test' : 'Claude Code'}</span></div>
+        <div className="conversation-heading"><h2>Your conversation</h2><div className="conversation-actions">
+          <span>{setup?.mode === 'fixture' ? 'Synthetic test' : 'Claude Code'}</span>
+          <button className="copy-button" disabled={!setup} onClick={() => void copyTranscript()}>Copy transcript</button>
+        </div></div>
+        <div className="copy-feedback" role="status" aria-live="polite">{copyStatus === 'copied' ? 'Copied conversation and diagnostics. Review before sharing.' : copyStatus === 'fallback' ? 'Clipboard unavailable. Select and copy the report below.' : ''}</div>
+        {copyFallback && <div className="copy-fallback">
+          <label htmlFor="transcript-export">Conversation and diagnostics — review before sharing</label>
+          <textarea id="transcript-export" readOnly value={copyFallback} onFocus={event => event.currentTarget.select()} />
+          <button className="quiet-button" onClick={() => { setCopyFallback(''); setCopyStatus('idle'); }}>Hide report</button>
+        </div>}
         <div className="capability-row" aria-label="Tool connection status">
-          <span className={view.capabilities?.web ? 'available' : ''}>{view.capabilities ? view.capabilities.web ? 'Web tools available' : 'Web tools unavailable' : 'Web tools checking'}</span>
-          <span className={fermi === 'connected' ? 'available' : ''}>{fermi === 'connected' ? 'Fermi connected' : fermi === 'pending' ? 'Fermi checking' : 'Fermi unavailable'}</span>
+          <span className={active && view.capabilities?.web ? 'available' : ''}>{!active ? 'Web tools not connected' : view.capabilities ? view.capabilities.web ? 'Web tools available' : 'Web tools unavailable' : 'Web tools checking'}</span>
+          <span className={active && fermi === 'connected' ? 'available' : ''}>{!active ? 'Fermi not connected' : fermi === 'connected' ? 'Fermi connected' : fermi === 'pending' ? 'Fermi checking' : 'Fermi unavailable'}</span>
         </div>
         {setup?.mode === 'fixture' && <div className="fixture-banner">Test mode: synthetic provider responses, not live inference.</div>}
         {setup && !setup.speechConfigured && <div className="setup-banner"><strong>Voice setup needed</strong><p>{setup.speechMessage}</p></div>}
@@ -137,7 +168,7 @@ export default function App() {
           <textarea id="message-input" rows={2} maxLength={12000} value={draft} onChange={event => setDraft(event.target.value)} disabled={!view.canSendText} placeholder="Or type your thought here…" />
           <button className="send-button" disabled={!view.canSendText || !draft.trim()} type="submit">Send<span aria-hidden="true">↗</span></button>
         </form>
-        <p className="conversation-footnote">Read-only tools when connected. Skill creation and consequential actions are disabled.</p>
+        <p className="conversation-footnote">Fermi actions you request run automatically when connected. Fermi’s service restrictions still apply.</p>
       </section>
     </main>
     <footer className="app-footer"><span>Voice, with a little more agency.</span><span>Hands-free preview</span></footer>

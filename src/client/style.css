@@ -48,7 +48,16 @@ a { color: inherit; }
 .conversation-panel { min-height: 680px; display: flex; flex-direction: column; background: #fcfdff; border: 1px solid #d2e0ea; border-radius: 22px; box-shadow: 0 12px 32px #24456008; overflow: hidden; }
 .conversation-heading { min-height: 78px; display: flex; align-items: center; justify-content: space-between; gap: 15px; padding: 22px 28px; border-bottom: 1px solid #e5edf2; }
 .conversation-heading h2 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.3px; }
-.conversation-heading > span { font-size: 12px; color: var(--muted); background: #edf3f7; padding: 6px 11px; border-radius: 7px; }
+.conversation-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px; }
+.conversation-actions > span { font-size: 12px; color: var(--muted); background: #edf3f7; padding: 6px 11px; border-radius: 7px; }
+.copy-button { min-height: 44px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 8px; background: white; color: #244d89; font-size: 12px; font-weight: 650; white-space: nowrap; }
+.copy-button:hover:not(:disabled) { background: #e9f0fa; }
+.copy-button:disabled { color: #8da0af; }
+.copy-feedback:not(:empty) { padding: 10px 22px; color: #416078; font-size: 12px; line-height: 1.5; }
+.copy-fallback { padding: 0 22px 14px; }
+.copy-fallback label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.copy-fallback textarea { display: block; width: 100%; height: 180px; resize: vertical; border: 1px solid var(--line); border-radius: 8px; padding: 10px; color: #172b40; background: white; font-size: 13px; }
+.copy-fallback .quiet-button { margin: 5px 0 0 auto; }
 .conversation { flex: 1; height: 410px; max-height: 57vh; min-height: 290px; overflow-y: auto; overscroll-behavior: contain; padding: 28px; }
 .empty-conversation { height: 100%; min-height: 275px; display: flex; flex-direction: column; justify-content: center; text-align: center; color: var(--muted); padding-bottom: 24px; }
 .empty-symbol { font-family: Georgia, serif; font-size: 75px; height: 65px; line-height: 1; color: #d2e0ed; }

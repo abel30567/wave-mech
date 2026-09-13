@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createSpeech } from './index.js';
+import { createSpeech, type SpeechTuning } from './index.js';
 import { startFixture, type Fixture, type FixtureOptions } from './fixtures/eleven-labs.js';
 import type { SpeechOptions, SpeechTokenKind } from '../../shared/contracts.js';
+
+const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 const cleanups: Array<() => void | Promise<void>> = [];
 
@@ -22,6 +24,7 @@ interface Harness {
 async function makeHarness(
   fixtureOptions: FixtureOptions = {},
   overrides: Partial<SpeechOptions> = {},
+  tuning: SpeechTuning = {},
 ): Promise<Harness> {
   const fixture = await startFixture(fixtureOptions);
   const partials: string[] = [];
@@ -41,7 +44,7 @@ async function makeHarness(
     endpoints: { stt: fixture.sttEndpoint, tts: fixture.ttsEndpoint },
     timeoutMs: 1000,
     ...overrides,
-  });
+  }, tuning);
 
   cleanups.push(() => session.close());
   cleanups.push(() => fixture.close());
@@ -252,6 +255,40 @@ describe('speech synthesis (TTS)', () => {
     const h = await makeHarness({ ttsNeverFinal: true }, { timeoutMs: 150 });
     h.session.writeText('stuck');
     await expect(h.session.finishSpeech()).rejects.toThrow(/finish_timeout/);
+  });
+});
+
+describe('synthesis idle keepalive (long tool waits)', () => {
+  it('keeps the TTS socket open across an idle tool wait via single-space keepalives', async () => {
+    // The server drops the socket after 80 ms of silence; the adapter pings every
+    // 20 ms so a 250 ms "tool wait" between the preamble and the answer cannot
+    // expire it. The whole response synthesizes on ONE socket.
+    const h = await makeHarness({ ttsInactivityMs: 80 }, {}, { ttsKeepAliveMs: 20 });
+    h.session.writeText('preamble ');
+    await delay(250); // model is waiting on a long Fermi tool call — no text sent
+    h.session.writeText('answer ');
+    await h.session.finishSpeech();
+
+    expect(h.audio.map((value) => decode(value.audio)).join('')).toBe('preamble answer ');
+    // A single TTS socket/token served the whole response; it was never dropped
+    // and reopened, and no idle-close surfaced as an error.
+    expect(h.tokenCalls.filter((k) => k === 'tts_websocket')).toHaveLength(1);
+    expect(h.errors).toEqual([]);
+  });
+
+  it('reports the dropped socket honestly when idle exceeds the keepalive window', async () => {
+    // With keepalives effectively disabled (interval far longer than the idle
+    // window), the same tool wait lets the server close the socket. The adapter
+    // must surface that drop as an error and must not synthesize phantom audio —
+    // this is exactly the failure the keepalive above prevents.
+    const h = await makeHarness({ ttsInactivityMs: 60 }, {}, { ttsKeepAliveMs: 10_000 });
+    h.session.writeText('preamble ');
+    await delay(150); // exceeds the 60 ms idle window with no keepalive
+    // The drop is reported, not swallowed.
+    expect(h.errors).toContain('speech_socket_closed');
+    // The lost preamble is never faked as delivered audio.
+    await h.session.finishSpeech().catch(() => undefined);
+    expect(h.audio).toEqual([]);
   });
 });
 

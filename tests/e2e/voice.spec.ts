@@ -323,6 +323,67 @@ test.describe('hands-free conversation', () => {
   });
 });
 
+test.describe('copy conversation diagnostics', () => {
+  test('copies real tool failures after End and clears history for a new session', async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.addInitScript({ content: CONTROLLED_AUDIO_SCRIPT });
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+        writeText: async (text: string) => { (window as any).__copiedReport = text; },
+      } });
+    });
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Start session', exact: true }).click();
+    await waitListening(page);
+    await page.getByLabel('Type a message', { exact: true }).fill('Run the debug fixture.');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expect(page.getByRole('log')).toContainText('Turn 1:');
+    await waitListening(page);
+    await page.getByRole('button', { name: 'End session', exact: true }).click();
+    const copy = page.getByRole('button', { name: 'Copy transcript', exact: true });
+    await expect(copy).toBeEnabled();
+    await copy.click();
+    await expect(page.getByText('Copied conversation and diagnostics. Review before sharing.')).toBeVisible();
+    const report = await page.evaluate(() => (window as any).__copiedReport as string);
+    for (const term of ['Run the debug fixture.', 'CONVERSATION', 'DIAGNOSTICS', 'mcp__fermi__execute', 'toolu_debug_1', 'authentication', 'synthetic test']) expect(report).toContain(term);
+    expect(report).toContain('"status":"failed"');
+    expect(report).not.toContain('SECRET_SENTINEL');
+    const box = await copy.boundingBox();
+    expect(box && box.x >= 0 && box.x + box.width <= 390).toBeTruthy();
+    await page.screenshot({ path: 'artifacts/copy-transcript-mobile.png', fullPage: true });
+    await page.getByRole('button', { name: 'Start session', exact: true }).click();
+    await waitListening(page);
+    await copy.click();
+    const next = await page.evaluate(() => (window as any).__copiedReport as string);
+    expect(next).not.toContain('Run the debug fixture.');
+    expect(next).not.toContain('toolu_debug_1');
+    await page.getByRole('button', { name: 'End session', exact: true }).click();
+  });
+
+  test('provides a selectable report when clipboard permission is denied', async ({ page }) => {
+    await page.addInitScript({ content: CONTROLLED_AUDIO_SCRIPT });
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: {
+        writeText: async () => { throw new DOMException('Denied', 'NotAllowedError'); },
+      } });
+    });
+    await page.goto('/');
+    await page.getByRole('button', { name: 'Start session', exact: true }).click();
+    await waitListening(page);
+    await speechTurn(page, 1);
+    await page.getByRole('button', { name: 'End session', exact: true }).click();
+    await page.getByRole('button', { name: 'Copy transcript', exact: true }).click();
+    await expect(page.getByText('Clipboard unavailable. Select and copy the report below.')).toBeVisible();
+    const report = page.getByLabel('Conversation and diagnostics — review before sharing', { exact: true });
+    await expect(report).toHaveValue(/Turn 1:/);
+    await report.focus();
+    expect(await report.evaluate((element: HTMLTextAreaElement) => element.selectionStart === 0 && element.selectionEnd === element.value.length)).toBe(true);
+    await page.screenshot({ path: 'artifacts/copy-transcript-fallback.png', fullPage: true });
+    await page.getByRole('button', { name: 'Hide report', exact: true }).click();
+    await expect(report).toHaveCount(0);
+  });
+});
+
 // ===========================================================================
 // Production VAD / audio smoke — no injected factory
 // ===========================================================================

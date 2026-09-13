@@ -63,9 +63,13 @@ interface FakeSourceNode {
   buffer: FakeAudioBuffer | null;
   onended: (() => void) | null;
   responseId?: number;
+  seconds?: number;
+  endAt?: number;
+  /** The `when` argument passed to start(), i.e. the scheduled start time. */
+  startAt?: number;
   connect(): void;
   disconnect(): void;
-  start(): void;
+  start(when?: number): void;
   stop(): void;
 }
 
@@ -76,6 +80,8 @@ class FakeAudioContext {
   readonly sampleRate: number;
   onstatechange: (() => void) | null = null;
   readonly live = new Set<FakeSourceNode>();
+  /** Every source node created, in order, retained after cancel for assertions. */
+  readonly created: FakeSourceNode[] = [];
   private readonly listeners: Array<() => void> = [];
 
   constructor(options?: { sampleRate?: number }) {
@@ -91,13 +97,18 @@ class FakeAudioContext {
       onended: null,
       connect(): void {},
       disconnect(): void {},
-      start(): void {
+      start(when?: number): void {
+        // Record the scheduled start time so tests can assert new speech is not
+        // delayed behind a stale playback fence and that survivor schedules are
+        // preserved across a targeted cancel.
+        node.startAt = when;
         ctx.live.add(node);
       },
       stop(): void {
         ctx.live.delete(node);
       },
     };
+    this.created.push(node);
     return node;
   }
   addEventListener(_type: 'statechange', fn: () => void): void {
@@ -343,5 +354,69 @@ describe('createHandsFreeAudio output', () => {
     // A subsequent stale finish for the same generation is not re-played.
     audio.cancelOutput(3);
     await expect(audio.finishOutput(3, 0)).resolves.toBe('interrupted');
+  });
+});
+
+// Regression coverage for the speech-breakup repair: a targeted cancel must not
+// leave the playback fence (nextStartTime) stranded in the future, and uneven
+// PCM arrival must not open silent underrun gaps. These assert on the scheduled
+// start time each source is given, which the fake now records.
+describe('createHandsFreeAudio output scheduling (breakup repair)', () => {
+  const MARGIN = 0.06; // must match PREBUFFER_MARGIN_SECONDS in audio.ts
+
+  it('does not delay new speech after a targeted cancel leaves no surviving source', async () => {
+    const { audio, ctx } = await build();
+    audio.enqueueOutput(outputBase64(16000), 16000, 1, 0); // 1 s, response 1
+
+    // Playback advances partway through response 1, then it is cancelled (barge-in
+    // on the only scheduled response).
+    ctx.currentTime = 0.5;
+    audio.cancelOutput(1);
+    expect(ctx.live.size).toBe(0);
+
+    // New speech arrives. Before the repair, nextStartTime was left at ~1.0 (the
+    // end of the now-cancelled response) so this was scheduled ~0.5 s in the
+    // future — audible dead air. It must now start near the playback clock,
+    // strictly before the stale fence.
+    audio.enqueueOutput(outputBase64(16000), 16000, 2, 0);
+    const second = ctx.created[1];
+    expect(second.startAt).toBeLessThan(1.0);
+    expect(second.startAt).toBeCloseTo(0.5 + MARGIN);
+  });
+
+  it('preserves a surviving response schedule and appends new audio after it', async () => {
+    const { audio, ctx } = await build();
+    audio.enqueueOutput(outputBase64(16000), 16000, 1, 0); // response 1, 1 s
+    audio.enqueueOutput(outputBase64(16000), 16000, 2, 0); // response 2 (survivor)
+    const survivor = ctx.created[1];
+    const survivorStart = survivor.startAt!; // == MARGIN + 1
+
+    audio.cancelOutput(1); // cancel response 1; response 2 survives
+    expect(ctx.live.size).toBe(1);
+    // The survivor's already-scheduled start time is untouched.
+    expect(survivor.startAt).toBe(survivorStart);
+
+    // Further audio for the survivor appends contiguously after its end, not
+    // reset back to the clock (which would overlap the still-playing survivor).
+    audio.enqueueOutput(outputBase64(16000), 16000, 2, 1);
+    const appended = ctx.created[2];
+    expect(appended.startAt).toBeCloseTo(survivorStart + 1);
+  });
+
+  it('keeps jittered PCM arrival contiguous with a bounded pre-buffer margin', async () => {
+    const { audio, ctx } = await build();
+    // 0.1 s buffers. The first starts with headroom rather than exactly at 0.
+    audio.enqueueOutput(outputBase64(1600), 16000, 1, 0);
+    const a = ctx.created[0];
+    expect(a.startAt).toBeCloseTo(MARGIN);
+
+    // The next frame arrives late (0.12 s of wall-clock, past 0.1 s of playback),
+    // but the margin kept the schedule ahead of the clock, so it lands
+    // contiguously — zero silent underrun gap.
+    ctx.currentTime = 0.12;
+    audio.enqueueOutput(outputBase64(1600), 16000, 1, 1);
+    const b = ctx.created[1];
+    expect(b.startAt).toBeCloseTo(a.startAt! + 0.1);
+    expect(b.startAt! - (a.startAt! + 0.1)).toBeCloseTo(0);
   });
 });
