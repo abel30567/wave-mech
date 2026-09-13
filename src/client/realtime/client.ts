@@ -372,8 +372,8 @@ class Client implements ConversationClient {
   /**
    * Send `finish` only once the finalizing turn is ready (server acknowledged
    * `record`) and every captured frame through lastSeq has actually been
-   * transmitted. The intent is retained (finishSent stays false) while offline,
-   * before readiness, or with frames still unsent, and is re-driven on ack,
+   * transmitted and acknowledged. The intent is retained while offline,
+   * before readiness, or with frames still outstanding, and is re-driven on ack,
    * readiness and reconnect.
    */
   private maybeSendFinish(): void {
@@ -381,7 +381,7 @@ class Client implements ConversationClient {
     if (!fin || !fin.finished || fin.finishSent) return;
     if (!fin.ready || !this.socketOpen()) return;
     this.trySendAudio();
-    if (fin.out.hasUnsent) return; // captured audio still unsent
+    if (!fin.out.fullyAcked) return; // finish only after contiguous server receipt
     this.send({ type: 'finish', turnId: fin.turnId, lastSeq: fin.out.lastSeq });
     fin.finishSent = true;
   }

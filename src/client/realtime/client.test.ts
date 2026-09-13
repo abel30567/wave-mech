@@ -117,6 +117,8 @@ describe('conversation client: hands-free turn', () => {
 
     audio.onSpeechEnd();
     await tick();
+    expect(socket.commands().some((command) => command.type === 'finish')).toBe(false);
+    socket.receive({ type: 'audio_ack', turnId: 1, seq: 2 });
     expect(socket.commands()).toContainEqual({ type: 'finish', turnId: 1, lastSeq: 2 });
     expect(h.last().phase).toBe('thinking');
   });
@@ -341,8 +343,10 @@ describe('conversation client: responses and barge-in', () => {
     expect(socket.commands()).toContainEqual({ type: 'record', turnId: 1 });
 
     socket.receive({ type: 'input_ready', turnId: 1 });
-    // The buffered tail is transmitted and finish follows once ready.
+    // Readiness permits transmission, but finalization still needs receipt.
     expect(socket.audioFrames().map((f) => f.seq)).toEqual([1]);
+    expect(socket.commands().some((command) => command.type === 'finish')).toBe(false);
+    socket.receive({ type: 'audio_ack', turnId: 1, seq: 1 });
     expect(socket.commands()).toContainEqual({ type: 'finish', turnId: 1, lastSeq: 1 });
   });
 });
@@ -429,8 +433,12 @@ describe('conversation client: pending-input lifecycle', () => {
     expect(h.last().phase).toBe('thinking');
 
     socket.receive({ type: 'input_ready', turnId: 1 });
-    // Captured audio is transmitted first, then finish covers every sample.
+    // Captured audio is transmitted first; finish waits for every sample's ACK.
     expect(socket.audioFrames().map((f) => f.seq)).toEqual([1, 2]);
+    expect(socket.commands().some((command) => command.type === 'finish')).toBe(false);
+    socket.receive({ type: 'audio_ack', turnId: 1, seq: 1 });
+    expect(socket.commands().some((command) => command.type === 'finish')).toBe(false);
+    socket.receive({ type: 'audio_ack', turnId: 1, seq: 2 });
     expect(socket.commands()).toContainEqual({ type: 'finish', turnId: 1, lastSeq: 2 });
     expect(socket.commands().filter((c) => c.type === 'finish')).toHaveLength(1);
   });
@@ -446,7 +454,9 @@ describe('conversation client: pending-input lifecycle', () => {
     audio.onPcm(frame());
     audio.onSpeechEnd();
     await tick();
-    // Frames precede the finish, and finish declares the full lastSeq.
+    // Frame receipt, not just send(), precedes the finish barrier.
+    expect(socket.commands().some((command) => command.type === 'finish')).toBe(false);
+    socket.receive({ type: 'audio_ack', turnId: 1, seq: 2 });
     const commands = socket.commands();
     const finish = commands.find((c) => c.type === 'finish');
     expect(finish).toEqual({ type: 'finish', turnId: 1, lastSeq: 2 });
@@ -470,15 +480,17 @@ describe('conversation client: pending-input lifecycle', () => {
     first.receive({ type: 'audio_ack', turnId: 1, seq: 1 });
     audio.onSpeechEnd();
     await vi.advanceTimersByTimeAsync(0);
-    expect(first.commands()).toContainEqual({ type: 'finish', turnId: 1, lastSeq: 3 });
+    expect(first.commands().some((command) => command.type === 'finish')).toBe(false);
 
     first.drop();
     await vi.advanceTimersByTimeAsync(750);
     const second = h.sockets[1];
     second.open();
     second.receive(snapshot({ sessionId: 'sess-2', lastTurnId: 1, input: { turnId: 1, lastSeq: 1, committed: false } }));
-    // Unacked frames replay and the finish intent is re-driven after them.
+    // Unacked frames replay; the retained finish waits for their receipt.
     expect(second.audioFrames().map((f) => f.seq)).toEqual([2, 3]);
+    expect(second.commands().some((command) => command.type === 'finish')).toBe(false);
+    second.receive({ type: 'audio_ack', turnId: 1, seq: 3 });
     expect(second.commands()).toContainEqual({ type: 'finish', turnId: 1, lastSeq: 3 });
   });
 
@@ -505,8 +517,10 @@ describe('conversation client: pending-input lifecycle', () => {
     const second = h.sockets[1];
     second.open();
     second.receive(snapshot({ sessionId: 'sess-3', lastTurnId: 1, input: { turnId: 1, lastSeq: 0, committed: false } }));
-    // The unsent tail is retransmitted and the retained finish is delivered.
+    // The unsent tail is retransmitted; its ACK releases the retained finish.
     expect(second.audioFrames().map((f) => f.seq)).toEqual([1]);
+    expect(second.commands().some((command) => command.type === 'finish')).toBe(false);
+    second.receive({ type: 'audio_ack', turnId: 1, seq: 1 });
     expect(second.commands()).toContainEqual({ type: 'finish', turnId: 1, lastSeq: 1 });
   });
 });

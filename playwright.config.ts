@@ -40,4 +40,10 @@ export default defineConfig({
     reuseExistingServer: false,
     timeout: 15000,
   },
+  projects: [
+    { name: 'chromium', use: { browserName: 'chromium' } },
+    // WebKit is not tested: @ricky0123/vad-web WASM and AudioWorklet
+    // support varies across WebKit builds, and Playwright's WebKit on
+    // Linux does not reliably provide the fake-device media flags.
+  ],
 });
