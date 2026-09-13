@@ -112,4 +112,27 @@ a { color: inherit; }
   .composer { margin-inline: 15px; }
   .app-footer { font-size: 10px; }
 }
+.is-listening .station-core { color: #255fda; background: #f4f8ff; }
+.is-listening .station-ring { border-color: #93b3e6; }
+.capability-row { display: flex; flex-wrap: wrap; gap: 8px; padding: 11px 27px; border-bottom: 1px solid #e5edf2; }
+.capability-row span { font-size: 11px; padding: 4px 8px; border-radius: 5px; color: #62798d; background: #edf3f7; }
+.capability-row .available { color: #216353; background: #e5f1ec; }
+.manual-fallback { border: 0; background: transparent; color: #5c7590; font-size: 12px; padding: 5px 12px; text-decoration: underline; }
+.tool-failed { color: #874332; }
+@media (max-width: 700px) {
+  .in-session .intro { display: none; }
+  .in-session .voice-panel { padding: 0; }
+  .in-session .voice-station { display: grid; grid-template-columns: 54px 1fr; gap: 5px 13px; text-align: left; padding: 10px 0; }
+  .in-session .station-ring { grid-row: 1 / 3; width: 50px; height: 50px; margin: 0; box-shadow: none; align-self: center; }
+  .in-session .station-core { width: 42px; height: 42px; }
+  .in-session .station-core svg { width: 23px; height: 23px; }
+  .in-session .station-status { margin: 0; font-size: 15px; }
+  .in-session .station-help { margin: 0; min-height: 0; max-width: none; font-size: 11px; }
+  .in-session .session-controls { grid-column: 1 / -1; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-top: 8px; }
+  .in-session .primary-button { min-width: 0; min-height: 40px; padding: 10px 14px; font-size: 12px; }
+  .in-session .quiet-button { margin: 0; font-size: 12px; }
+  .in-session .conversation-panel { margin-top: 10px; }
+  .in-session .conversation { min-height: 230px; height: 42vh; max-height: 55vh; }
+  .capability-row { padding: 9px 19px; }
+}
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; } }

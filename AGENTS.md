@@ -13,6 +13,7 @@ A Linux-compatible web application: browser microphone → ElevenLabs STT → pe
 - Use `.js` import specifiers in Node TypeScript source. Keep code strict-TypeScript compatible. Browser worklets must bundle with Vite (use `?worker&url` or a verified equivalent).
 - No production credentials or authenticated external actions for synthetic tests. Use fixture subprocesses, local WebSockets, and synthetic PCM.
 - General fleet model: claude-opus-4-8 or grok-4.6; security-specific fleet work: claude-opus-4-6. Verify actual model rather than silently substituting.
+- Delegated work must use Fermi cloud execution, not local GPT subagents or auto-fanout review skills. Do not spawn further agents. For the targeted repair wave, `docs/p2-repair-brief.md` defines the defects and the precise ownership exceptions (including client browser tests); reuse those findings rather than repeating a broad review.
 - Return source commit/branch, test commands and actual outcomes, and limitations. An artifact or agent completion claim is not proof tests passed.
 - Commit only on the assigned feature branch, never main. Concise one-sentence commit subject with `Co-Authored-By: Claude Code <noreply@anthropic.com>` trailer. Do not merge, create additional agents, or change infrastructure.
 

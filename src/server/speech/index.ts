@@ -19,6 +19,10 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 // Deliberately small: the caller drives one manual turn at a time, so a large
 // backlog means the peer is unhealthy rather than merely slow.
 const MAX_QUEUED_FRAMES = 256;
+// Independent per-recognition ceiling (~120s of mono PCM16 @ 16 kHz). acceptAudio
+// refuses frames past this rather than silently reporting success, so the
+// coordinator's own bound is not the only line of defence.
+const MAX_RECOGNITION_BYTES = 16_000 * 2 * 120;
 
 interface Pending<T> {
   resolve(value: T): void;
@@ -162,6 +166,10 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
   let stt: SpeechSocket | undefined;
   let pendingCommit: Pending<string> | undefined;
   let lastAudio: Uint8Array | undefined;
+  let acceptedBytes = 0;
+  // Recognition epoch: bumped on abort/close so a socket that opens (or a final
+  // frame that arrives) after cancellation can never feed a replacement turn.
+  let sttGeneration = 0;
 
   const handleSttFrame = (raw: string): void => {
     const event = parseSttEvent(raw);
@@ -191,6 +199,8 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
   const startRecognition = async (): Promise<void> => {
     if (closed) throw new Error('speech_closed');
     if (stt?.isActive) return; // reuse the socket for the next manual turn
+    acceptedBytes = 0;
+    const generation = sttGeneration;
     const socket = new SpeechSocket(handleSttFrame, (message) => {
       settleCommit(new Error(message));
       options.onError(message);
@@ -198,15 +208,22 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
     });
     stt = socket;
     const token = await options.getToken('realtime_scribe');
-    if (closed) {
+    if (closed || generation !== sttGeneration || stt !== socket) {
       socket.teardown();
-      throw new Error('speech_closed');
+      throw new Error(closed ? 'speech_closed' : 'speech_recognition_aborted');
     }
     try {
       await socket.open(withSttToken(sttEndpoint, token), timeoutMs);
     } catch (error) {
       if (stt === socket) stt = undefined;
       throw error;
+    }
+    // A cancellation may have landed while the socket was opening; never let an
+    // orphaned-but-open socket become the active recognition.
+    if (closed || generation !== sttGeneration || stt !== socket) {
+      socket.teardown();
+      if (stt === socket) stt = undefined;
+      throw new Error(closed ? 'speech_closed' : 'speech_recognition_aborted');
     }
   };
 
@@ -218,6 +235,42 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
     lastAudio = new Uint8Array(pcm);
   };
 
+  /**
+   * Streaming-path audio ingest. Unlike writeAudio it reports whether the frame
+   * was actually accepted so the coordinator only ACKs real progress. It refuses
+   * — never silently succeeds — when closed, without an active socket, while a
+   * commit is settling, past the per-recognition ceiling, or when the socket
+   * cannot enqueue.
+   */
+  const acceptAudio = (pcm: Uint8Array): boolean => {
+    if (closed || !stt || !stt.isActive) return false;
+    if (pendingCommit) return false;
+    if (!pcm || !pcm.byteLength) return false;
+    if (stt.overflowed) return false;
+    if (acceptedBytes + pcm.byteLength > MAX_RECOGNITION_BYTES) return false;
+    // Flush the previously held frame; hold the current one for the commit.
+    if (lastAudio) stt.send(sttChunkFrame(Buffer.from(lastAudio).toString('base64')));
+    if (stt.overflowed) return false; // the flush just overflowed the socket
+    lastAudio = new Uint8Array(pcm);
+    acceptedBytes += pcm.byteLength;
+    return true;
+  };
+
+  /**
+   * Discard the unfinished recognition without committing. The socket is torn
+   * down so no server-side accumulated audio can leak into the next turn, and
+   * the epoch is bumped so a late final/open cannot resolve a replacement.
+   */
+  const abortRecognition = (): void => {
+    if (closed) return;
+    sttGeneration++;
+    settleCommit(new Error('speech_recognition_aborted'));
+    lastAudio = undefined;
+    acceptedBytes = 0;
+    stt?.teardown();
+    stt = undefined;
+  };
+
   const commitRecognition = (): Promise<string> => {
     if (closed) return Promise.reject(new Error('speech_closed'));
     if (!stt) return Promise.reject(new Error('speech_no_active_turn'));
@@ -225,6 +278,7 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
     if (!lastAudio) return Promise.resolve('');
     const audio = Buffer.from(lastAudio).toString('base64');
     lastAudio = undefined;
+    acceptedBytes = 0;
     return new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => {
         pendingCommit = undefined;
@@ -240,6 +294,9 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
   let ttsStarting: Promise<void> | undefined;
   let pendingFinish: Pending<void> | undefined;
   let textBuffer = '';
+  // Synthesis epoch: bumped on cancel/close so a socket that finishes opening —
+  // or an audio frame that arrives — after cancellation cannot feed a replacement.
+  let ttsGeneration = 0;
 
   const settleFinish = (error: Error): void => {
     if (!pendingFinish) return;
@@ -275,6 +332,7 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
 
   const ensureTts = (): void => {
     if (tts || ttsStarting) return;
+    const generation = ttsGeneration;
     const socket = new SpeechSocket(handleTtsFrame, (message) => {
       settleFinish(new Error(message));
       options.onError(message);
@@ -284,13 +342,20 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
     socket.send(ttsInitFrame());
     ttsStarting = (async () => {
       const token = await options.getToken('tts_websocket');
-      if (closed) {
+      if (closed || generation !== ttsGeneration || tts !== socket) {
         socket.teardown();
         return;
       }
       await socket.open(withTtsToken(ttsEndpoint, options.voiceId, token), timeoutMs);
+      // Cancellation may have landed while opening; drop the orphaned socket.
+      if (closed || generation !== ttsGeneration || tts !== socket) {
+        socket.teardown();
+        if (tts === socket) teardownTts();
+      }
     })().catch((error) => {
       if (tts === socket) teardownTts();
+      // A cancellation that raced the open is expected, not a synthesis failure.
+      if (closed || generation !== ttsGeneration) return;
       settleFinish(error instanceof Error ? error : new Error('speech_synthesis_failed'));
       options.onError('speech_synthesis_failed');
     });
@@ -327,10 +392,26 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
     });
   };
 
+  /**
+   * Abandon the in-flight synthesis for a barged-in/superseded response. The
+   * socket is torn down and the epoch bumped so late audio or a socket that was
+   * still opening cannot bleed into the replacement response.
+   */
+  const cancelSpeech = (): void => {
+    if (closed) return;
+    ttsGeneration++;
+    settleFinish(new Error('speech_cancelled'));
+    textBuffer = '';
+    teardownTts();
+  };
+
   const close = (): void => {
     if (closed) return;
     closed = true;
+    sttGeneration++;
+    ttsGeneration++;
     lastAudio = undefined;
+    acceptedBytes = 0;
     textBuffer = '';
     settleCommit(new Error('speech_closed'));
     settleFinish(new Error('speech_closed'));
@@ -342,6 +423,9 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
   return {
     startRecognition,
     writeAudio,
+    acceptAudio,
+    abortRecognition,
+    cancelSpeech,
     commitRecognition,
     writeText,
     finishSpeech,

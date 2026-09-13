@@ -1,233 +1,145 @@
 import { useEffect, useRef, useState } from 'react';
-import { createCapture } from './audio/capture.js';
-import { createPlayback } from './audio/playback.js';
-import type { CaptureSession, ClientMessage, PlaybackSession, ServerMessage } from '../shared/contracts.js';
+import { createConversationClient } from './realtime/client.js';
+import type { ConversationClient, ConversationView, ConversationClientOptions } from '../shared/realtime.js';
 import './style.css';
 
-type Phase = 'offline' | 'connecting' | 'ready' | 'opening' | 'recording' | 'responding';
-interface Message { id: number; role: 'user' | 'assistant'; text: string }
-
-function Microphone({ size = 28 }: { size?: number }) {
+type Bootstrap = { protocol: number; mode: 'live' | 'fixture'; speechConfigured: boolean; fermiConfigured: boolean; speechMessage: string };
+const initialView: ConversationView = {
+  connection: 'offline', phase: 'ended', messages: [], partial: '', muted: false,
+  audioAvailable: false, canSendText: false, canResumeAudio: false,
+};
+function Microphone({ size = 28, muted = false }: { size?: number; muted?: boolean }) {
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
     <rect x="8" y="2" width="8" height="13" rx="4" stroke="currentColor" strokeWidth="1.7" />
     <path d="M5 10v2a7 7 0 0 0 14 0v-2M12 19v3M8 22h8" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+    {muted && <path d="m3 3 18 18" stroke="currentColor" strokeWidth="2" />}
   </svg>;
+}
+function toolLabel(name: string) {
+  const labels: Record<string, string> = { WebSearch: 'Searching the web', WebFetch: 'Reading a web page', ToolSearch: 'Finding a tool', mcp__fermi__skill_search: 'Finding a Fermi skill', mcp__fermi__skill_load: 'Loading a Fermi skill', mcp__fermi__memory_recall: 'Reading Fermi memory' };
+  return labels[name] ?? name.replace(/^mcp__.*?__/, '').replaceAll('_', ' ');
 }
 
 export default function App() {
-  const [phase, setPhase] = useState<Phase>('offline');
-  const phaseRef = useRef<Phase>('offline');
-  const [speechAvailable, setSpeechAvailable] = useState(false);
-  const [mode, setMode] = useState<'live' | 'fixture'>('live');
+  const [setup, setSetup] = useState<Bootstrap>();
+  const [view, setView] = useState<ConversationView>(initialView);
   const [notice, setNotice] = useState('');
-  const [partial, setPartial] = useState('');
-  const [tool, setTool] = useState('');
   const [draft, setDraft] = useState('');
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [finishing, setFinishing] = useState(false);
-  const finishingRef = useRef(false);
-  const [speechSetup, setSpeechSetup] = useState('');
-  const connection = useRef<WebSocket | null>(null);
-  const capture = useRef<CaptureSession | null>(null);
-  const playback = useRef<PlaybackSession | null>(null);
+  const client = useRef<ConversationClient | undefined>(undefined);
   const generation = useRef(0);
-  const nextMessage = useRef(1);
-  const assistantId = useRef(0);
   const conversation = useRef<HTMLDivElement>(null);
 
-  function transition(value: Phase) { phaseRef.current = value; setPhase(value); }
-  function send(message: ClientMessage) {
-    if (connection.current?.readyState === WebSocket.OPEN) connection.current.send(JSON.stringify(message));
+  async function refreshAccess() {
+    const response = await fetch('/api/bootstrap', { credentials: 'same-origin', cache: 'no-store' });
+    if (!response.ok) throw new Error('Local access requires authorization. Reload the page to sign in.');
+    const value = await response.json() as Bootstrap;
+    if (value.protocol !== 2) throw new Error('The server needs the hands-free update.');
+    setSetup(value);
   }
-
-  function release() {
-    generation.current++;
-    transition('offline');
-    finishingRef.current = false;
-    setFinishing(false);
-    setPartial('');
-    setTool('');
-    const oldCapture = capture.current;
-    capture.current = null;
-    void oldCapture?.stop().catch(() => {});
-    playback.current?.stop();
-    playback.current = null;
-    const socket = connection.current;
-    connection.current = null;
-    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'end' }));
-    socket?.close();
-  }
-
   useEffect(() => {
-    fetch('/api/bootstrap').then((response) => response.json()).then((status) => {
-      setMode(status.mode);
-      if (!status.speechConfigured) setSpeechSetup(status.speechMessage);
-    }).catch(() => setNotice('The local server is unavailable. Start it and refresh this page.'));
-    return () => { release(); };
+    void refreshAccess().catch(() => setNotice('The workspace is unavailable. Refresh to reconnect or sign in.'));
+    return () => { generation.current++; void client.current?.end(); };
   }, []);
-
   useEffect(() => {
     conversation.current?.scrollTo({ top: conversation.current.scrollHeight, behavior: 'instant' });
-  }, [messages, partial]);
+  }, [view.messages, view.partial]);
 
-  async function start() {
-    if (phaseRef.current !== 'offline') return;
-    const current = ++generation.current;
+  function start() {
+    if (!setup) { void refreshAccess().catch(() => setNotice('The workspace is unavailable.')); return; }
+    const revision = ++generation.current;
+    void client.current?.end();
+    setNotice(''); setDraft(''); setView({ ...initialView, connection: 'connecting', phase: 'loading-audio' });
+    const testFactory = (window as unknown as { __waveTestAudioFactory?: ConversationClientOptions['audioFactory'] }).__waveTestAudioFactory;
+    const next = createConversationClient({
+      url: `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/session`,
+      speechAvailable: setup.speechConfigured,
+      refreshAccess,
+      audioFactory: setup.mode === 'fixture' ? testFactory : undefined,
+      onChange: state => { if (generation.current === revision) setView(state); },
+    });
+    client.current = next;
+    void next.start().catch(() => {
+      if (generation.current === revision) setNotice('The conversation could not start. Check audio permission and your connection.');
+    });
+  }
+  function end() {
+    generation.current++;
+    const current = client.current; client.current = undefined;
+    void current?.end();
+    setView(previous => ({ ...initialView, messages: previous.messages }));
     setNotice('');
-    setMessages([]);
-    transition('connecting');
-    try {
-      // Called directly by a user gesture so the browser can permit playback.
-      const audio = await createPlayback();
-      if (current !== generation.current) { audio.stop(); return; }
-      playback.current = audio;
-      const response = await fetch('/api/bootstrap');
-      if (!response.ok) throw new Error('Local session initialization failed.');
-      const status = await response.json();
-      if (current !== generation.current) return;
-      setMode(status.mode);
-      setSpeechSetup(status.speechConfigured ? '' : status.speechMessage);
-      const socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/session`);
-      connection.current = socket;
-      socket.onopen = () => { if (current === generation.current) send({ type: 'start' }); };
-      socket.onmessage = (incoming) => {
-        if (current !== generation.current) return;
-        let event: ServerMessage;
-        try { event = JSON.parse(incoming.data); } catch { return; }
-        switch (event.type) {
-          case 'ready': setSpeechAvailable(event.speechAvailable); transition('ready'); break;
-          case 'recording': transition('recording'); break;
-          case 'partial': setPartial(event.text); break;
-          case 'user': {
-            setPartial(''); setTool(''); transition('responding');
-            const user = nextMessage.current++;
-            const assistant = nextMessage.current++;
-            assistantId.current = assistant;
-            setMessages((existing) => [...existing, { id: user, role: 'user', text: event.text }, { id: assistant, role: 'assistant', text: '' }]);
-            break;
-          }
-          case 'text': setMessages((existing) => existing.map((message) => message.id === assistantId.current ? { ...message, text: message.text + event.text } : message)); break;
-          case 'audio':
-            try { playback.current?.enqueue(event.audio, event.sampleRate); }
-            catch { setNotice('Audio playback failed. Start a new session to try again.'); release(); }
-            break;
-          case 'tool': setTool(event.status === 'running' ? `Reading with ${event.name.replace(/^mcp__.*?__/, '')}…` : ''); break;
-          case 'response_done':
-            void (playback.current?.drain() ?? Promise.resolve()).then(() => {
-              if (current === generation.current) send({ type: 'playback_done' });
-            });
-            break;
-          case 'idle': transition('ready'); setTool(''); break;
-          case 'error': setNotice(event.message); if (event.fatal) release(); break;
-          case 'ended': release(); break;
-        }
-      };
-      socket.onerror = () => {
-        if (current === generation.current) { setNotice('The local connection failed. Start a new session.'); release(); }
-      };
-      socket.onclose = () => {
-        if (current === generation.current) { setNotice('Session ended. Start a new session when you are ready.'); release(); }
-      };
-    } catch {
-      if (current === generation.current) {
-        setNotice('The session could not start. Check browser audio permission and the local server.');
-        release();
-      }
-    }
   }
-
-  async function record() {
-    if (phaseRef.current !== 'ready' || !speechAvailable) return;
-    const current = generation.current;
-    setNotice('');
-    transition('opening');
-    try {
-      const microphone = await createCapture((chunk) => {
-        if (current !== generation.current || phaseRef.current !== 'recording') return;
-        const socket = connection.current;
-        if (socket?.readyState !== WebSocket.OPEN) return;
-        if (socket.bufferedAmount > 65536) {
-          setNotice('The audio connection is too slow. Start a new session.');
-          release();
-          return;
-        }
-        socket.send(chunk);
-      });
-      if (current !== generation.current) { await microphone.stop(); return; }
-      capture.current = microphone;
-      send({ type: 'record' });
-    } catch {
-      if (current === generation.current) {
-        transition('ready');
-        setNotice('Microphone access is unavailable. Allow it in your browser or type a message instead.');
-      }
-    }
-  }
-
-  async function finish() {
-    if (phaseRef.current !== 'recording' || finishingRef.current) return;
-    const current = generation.current;
-    finishingRef.current = true; setFinishing(true);
-    const microphone = capture.current;
-    capture.current = null;
-    try { await microphone?.stop(); }
-    finally {
-      finishingRef.current = false; setFinishing(false);
-      if (current === generation.current) { transition('responding'); send({ type: 'finish' }); }
-    }
-  }
-
   function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (phaseRef.current !== 'ready' || !draft.trim()) return;
-    setNotice(''); transition('responding');
-    send({ type: 'text', text: draft.trim() }); setDraft('');
+    if (!view.canSendText || !draft.trim()) return;
+    client.current?.sendText(draft.trim()); setDraft(''); setNotice('');
   }
-
-  const labels: Record<Phase, string> = {
-    offline: 'Not connected', connecting: 'Opening a local session', ready: 'Ready for your next thought',
-    opening: 'Opening your microphone', recording: 'Listening to you', responding: 'Working on your reply',
+  const active = view.connection !== 'offline' && view.connection !== 'expired';
+  const phaseLabels: Record<ConversationView['phase'], string> = {
+    'loading-audio': 'Preparing your microphone', listening: 'Listening', recording: 'Listening to your thought',
+    thinking: 'Thinking', speaking: 'Speaking', paused: 'Audio paused', muted: 'Microphone muted', ended: 'Not connected',
   };
+  const status = view.connection === 'reconnecting' ? 'Reconnecting — keeping your conversation'
+    : view.connection === 'expired' ? 'Session expired'
+    : view.muted ? 'Microphone muted' : view.canResumeAudio ? 'Audio paused' : phaseLabels[view.phase];
+  const help = !active ? 'Start once, then speak naturally.'
+    : view.connection === 'reconnecting' ? 'Short connection interruptions do not reset the conversation.'
+    : view.canResumeAudio ? 'Your browser paused audio. Tap below to resume.'
+    : view.muted ? 'Your microphone is muted. You can still type.'
+    : view.phase === 'recording' ? 'Pause when you finish your thought. No button needed.'
+    : view.phase === 'speaking' ? 'Speak to interrupt, or wait for the reply to finish.'
+    : view.phase === 'thinking' ? 'Your reply is on its way.' : 'Speak when you are ready. I will listen again after replying.';
+  const fermi = view.capabilities?.fermi ?? (setup?.fermiConfigured ? 'pending' : 'unavailable');
+  const tool = view.tool;
+  const displayedNotice = notice || view.notice;
 
-  return <div className="app-shell">
+  return <div className={`app-shell ${active ? 'in-session' : ''}`}>
     <header className="app-header">
       <a className="wordmark" href="/" aria-label="wave-mech home"><span className="brand-mark" aria-hidden="true">≈</span>wave-mech</a>
-      <span className="local-label"><span className={`status-dot ${phase !== 'offline' ? 'connected' : ''}`} />Local voice workspace</span>
+      <span className="local-label"><span className={`status-dot ${view.connection === 'connected' ? 'connected' : ''}`} />Hands-free workspace</span>
     </header>
     <main className="workspace">
       <section className="voice-panel" aria-labelledby="voice-title">
-        <div className="intro"><h1 id="voice-title">Talk it through.</h1><p>A thought, a question, a next step.<br />Give it a voice.</p></div>
-        <div className={`voice-station ${phase === 'recording' ? 'is-recording' : ''}`}>
-          <div className="station-ring"><div className="station-core"><Microphone size={54} /></div></div>
-          <p className="station-status" aria-live="polite">{labels[phase]}</p>
-          <p className="station-help">{phase === 'recording' ? 'Finish your turn when you are done speaking.' : phase === 'responding' ? 'Your next turn opens after the reply finishes.' : 'One thought at a time. You control each turn.'}</p>
-          {phase === 'offline' ? <button className="primary-button" onClick={() => void start()}>Start session</button>
-            : <button className={`primary-button ${phase === 'recording' ? 'finish-button' : ''}`} disabled={finishing || (phase !== 'ready' && phase !== 'recording') || !speechAvailable} onClick={() => void (phase === 'recording' ? finish() : record())}>
-              {finishing ? 'Finishing…' : phase === 'recording' ? 'Finish turn' : <><Microphone size={18} />Record a thought</>}
-            </button>}
-          <button className="quiet-button" disabled={phase === 'offline'} onClick={release}>End session</button>
+        <div className="intro"><h1 id="voice-title">Talk it through.</h1><p>A thought, a question, a next step.<br />Just start talking.</p></div>
+        <div className={`voice-station ${view.phase === 'recording' ? 'is-recording' : ''} ${view.phase === 'listening' ? 'is-listening' : ''}`}>
+          <div className="station-ring"><div className="station-core"><Microphone size={54} muted={view.muted} /></div></div>
+          <p className="station-status" aria-live="polite">{status}</p>
+          <p className="station-help">{help}</p>
+          <div className="session-controls">
+            {!active ? <button className="primary-button" disabled={!setup} onClick={start}>Start session</button>
+              : view.canResumeAudio ? <button className="primary-button" onClick={() => void client.current?.resumeAudio().catch(() => setNotice('Audio still needs permission. Check your browser settings.'))}>Resume audio</button>
+              : <button className="primary-button" disabled={!view.audioAvailable || !setup?.speechConfigured} onClick={() => client.current?.mute(!view.muted)}>
+                <Microphone size={18} muted={!view.muted} />{view.muted ? 'Unmute microphone' : view.phase === 'loading-audio' ? 'Preparing audio…' : 'Mute microphone'}
+              </button>}
+            <button className="quiet-button" disabled={!client.current} onClick={end}>End session</button>
+            {view.phase === 'recording' && <button className="manual-fallback" onClick={() => void client.current?.finishTurn()}>Finish now</button>}
+          </div>
         </div>
-        <div className="session-notes"><span className="note-symbol" aria-hidden="true">⌁</span><p>Manual turns keep the conversation clear. Speak, finish your turn, then listen.</p></div>
+        <div className="session-notes"><span className="note-symbol" aria-hidden="true">⌁</span><p>Keep this page open for hands-free listening. Mute or end the session whenever you want.</p></div>
       </section>
       <section className="conversation-panel" aria-label="Conversation">
-        <div className="conversation-heading"><h2>Your conversation</h2><span>{mode === 'fixture' ? 'Synthetic test' : 'Claude Code'}</span></div>
-        {mode === 'fixture' && <div className="fixture-banner">Test mode: synthetic responses and audio, not live inference.</div>}
-        {speechSetup && <div className="setup-banner"><strong>Voice setup needed</strong><p>{speechSetup}</p></div>}
-        <div className="conversation" ref={conversation} role="log" aria-live="polite" aria-label="Conversation messages">
-          {messages.length === 0 && <div className="empty-conversation"><span className="empty-symbol" aria-hidden="true">“</span><h3>Room for your next idea.</h3><p>Start a session and record a thought,<br />or use the keyboard below.</p></div>}
-          {messages.map((message) => <article key={message.id} className={`message ${message.role}`}><span className="speaker">{message.role === 'user' ? 'You' : 'wave-mech'}</span><p>{message.text || <span className="waiting-text">{tool || 'Thinking…'}</span>}</p></article>)}
-          {partial && <div className="partial"><span>Listening</span><p>{partial}</p></div>}
-          {tool && <p className="tool-note">{tool}</p>}
+        <div className="conversation-heading"><h2>Your conversation</h2><span>{setup?.mode === 'fixture' ? 'Synthetic test' : 'Claude Code'}</span></div>
+        <div className="capability-row" aria-label="Tool connection status">
+          <span className={view.capabilities?.web ? 'available' : ''}>{view.capabilities ? view.capabilities.web ? 'Web tools available' : 'Web tools unavailable' : 'Web tools checking'}</span>
+          <span className={fermi === 'connected' ? 'available' : ''}>{fermi === 'connected' ? 'Fermi connected' : fermi === 'pending' ? 'Fermi checking' : 'Fermi unavailable'}</span>
         </div>
-        {notice && <div className="notice" role="status">{notice}</div>}
+        {setup?.mode === 'fixture' && <div className="fixture-banner">Test mode: synthetic provider responses, not live inference.</div>}
+        {setup && !setup.speechConfigured && <div className="setup-banner"><strong>Voice setup needed</strong><p>{setup.speechMessage}</p></div>}
+        <div className="conversation" ref={conversation} role="log" aria-live="polite" aria-label="Conversation messages">
+          {!view.messages.length && <div className="empty-conversation"><span className="empty-symbol" aria-hidden="true">“</span><h3>Room for your next idea.</h3><p>Start a session and speak naturally,<br />or use the keyboard below.</p></div>}
+          {view.messages.map(message => <article key={`${message.turnId}-${message.role}`} className={`message ${message.role}`}><span className="speaker">{message.role === 'user' ? 'You' : 'wave-mech'}</span><p>{message.text || <span className="waiting-text">{tool?.status === 'running' ? `${toolLabel(tool.name)}…` : 'Thinking…'}</span>}</p></article>)}
+          {view.partial && <div className="partial"><span>Listening</span><p>{view.partial}</p></div>}
+          {tool && <p className={`tool-note ${tool.status === 'failed' || tool.status === 'denied' ? 'tool-failed' : ''}`}>{toolLabel(tool.name)}{tool.status === 'running' ? '…' : tool.status === 'done' ? ' — complete' : ` — ${tool.status}`}</p>}
+        </div>
+        {displayedNotice && <div className="notice" role="status">{displayedNotice}</div>}
         <form className="composer" onSubmit={submit}>
           <label className="visually-hidden" htmlFor="message-input">Type a message</label>
-          <textarea id="message-input" rows={2} maxLength={12000} value={draft} onChange={(event) => setDraft(event.target.value)} disabled={phase !== 'ready'} placeholder="Or type your thought here…" />
-          <button className="send-button" disabled={phase !== 'ready' || !draft.trim()} type="submit">Send<span aria-hidden="true">↗</span></button>
+          <textarea id="message-input" rows={2} maxLength={12000} value={draft} onChange={event => setDraft(event.target.value)} disabled={!view.canSendText} placeholder="Or type your thought here…" />
+          <button className="send-button" disabled={!view.canSendText || !draft.trim()} type="submit">Send<span aria-hidden="true">↗</span></button>
         </form>
-        <p className="conversation-footnote">Read-only tools. No messages sent or files changed by this voice session.</p>
+        <p className="conversation-footnote">Read-only tools when connected. Skill creation and consequential actions are disabled.</p>
       </section>
     </main>
-    <footer className="app-footer"><span>Voice, with a little more agency.</span><span>Personal workspace · P1</span></footer>
+    <footer className="app-footer"><span>Voice, with a little more agency.</span><span>Hands-free preview</span></footer>
   </div>;
 }
