@@ -1,13 +1,14 @@
 import type { ToolAccessOptions } from '../../shared/access-contracts.js';
 
-const ALLOWED_TOOLS = [
-  'WebSearch',
-  'WebFetch',
-  'ToolSearch',
+const BUILTIN_TOOLS = ['WebSearch', 'WebFetch', 'ToolSearch'] as const;
+
+const MCP_ALLOWED_TOOLS = [
   'mcp__fermi__memory_recall',
   'mcp__fermi__skill_search',
   'mcp__fermi__skill_load',
-];
+] as const;
+
+const ALLOWED_TOOLS: readonly string[] = [...BUILTIN_TOOLS, ...MCP_ALLOWED_TOOLS];
 
 const DENIED_TOOLS = [
   'mcp__fermi__secret_resolve',
@@ -22,13 +23,20 @@ function shellQuote(s: string): string {
 export function buildToolArguments(options: ToolAccessOptions): string[] {
   const { fermiUrl, nodeExecutable, hookFile } = options;
 
+  const mcpConfig = {
+    mcpServers: {
+      fermi: {
+        type: 'http',
+        url: fermiUrl,
+        name: 'fermi',
+      },
+    },
+  };
+
   const settings = {
     permissions: {
       allow: [...ALLOWED_TOOLS],
       deny: [...DENIED_TOOLS],
-    },
-    mcpServers: {
-      fermi: { url: fermiUrl },
     },
     hooks: {
       PreToolUse: [
@@ -45,7 +53,15 @@ export function buildToolArguments(options: ToolAccessOptions): string[] {
     },
   };
 
-  return ['--settings', JSON.stringify(settings)];
+  return [
+    '--mcp-config', JSON.stringify(mcpConfig),
+    '--strict-mcp-config',
+    '--tools', BUILTIN_TOOLS.join(','),
+    '--permission-mode', 'dontAsk',
+    '--allowedTools', ALLOWED_TOOLS.join(','),
+    '--deny', DENIED_TOOLS.join(','),
+    '--settings', JSON.stringify(settings),
+  ];
 }
 
 export function permissionHookSource(): string {
