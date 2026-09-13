@@ -50,10 +50,24 @@ export class PreRoll {
 
 export class ProducerBacklog {
   private queue: Uint8Array[] = [];
+  private prefix: Uint8Array[] = [];
   private bytes = 0;
   private over = false;
 
   constructor(private readonly limit: number) {}
+
+  /**
+   * Admit a confirmed-onset pre-roll burst ahead of the live frames. The
+   * pre-roll is already bounded by its own ring (`PREROLL_BYTES`), so it is
+   * delivered as a prefix that dequeues before live frames and is *exempt* from
+   * the live-stall byte limit: an onset burst is a legitimate one-shot flush,
+   * not the consumer stall that `enqueue` overflow detects. Draining the prefix
+   * through the same pump keeps a single ordered delivery path (pre-roll first,
+   * then live) without inflating the live budget.
+   */
+  primePrefix(chunks: Uint8Array[]): void {
+    for (const chunk of chunks) if (chunk.byteLength > 0) this.prefix.push(chunk);
+  }
 
   /**
    * Queue a live frame. Returns false (and latches `overflowed`) when the
@@ -72,6 +86,7 @@ export class ProducerBacklog {
   }
 
   dequeue(): Uint8Array | undefined {
+    if (this.prefix.length > 0) return this.prefix.shift();
     const chunk = this.queue.shift();
     if (chunk) this.bytes -= chunk.byteLength;
     return chunk;
@@ -79,14 +94,16 @@ export class ProducerBacklog {
 
   clear(): void {
     this.queue = [];
+    this.prefix = [];
     this.bytes = 0;
     this.over = false;
   }
 
   get empty(): boolean {
-    return this.queue.length === 0;
+    return this.queue.length === 0 && this.prefix.length === 0;
   }
 
+  /** Bytes counted against the live producer budget (the prefix is exempt). */
   get size(): number {
     return this.bytes;
   }
