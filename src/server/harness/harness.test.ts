@@ -163,4 +163,66 @@ describe('createHarness', () => {
     // Sending after close is rejected.
     await expect(session.send('again')).rejects.toThrow(/closed/i);
   });
+
+  it('reports MCP connection metadata from system/init', async () => {
+    const { session, events } = build('basic', { MCP: '1' });
+    await session.start();
+    await vi.waitFor(() => {
+      const ready = events.find((e) => e.type === 'ready');
+      expect(ready).toBeDefined();
+      expect((ready as Extract<HarnessEvent, { type: 'ready' }>).mcp).toEqual([
+        { name: 'fermi', status: 'connected' },
+        { name: 'offline', status: 'failed' },
+      ]);
+    });
+  });
+
+  it('maps an errored tool_result to failed, not done', async () => {
+    const { session, tools } = build('basic', { TOOL_ERROR: 'failed' });
+    await session.start();
+    await session.send('hi');
+    expect(tools()).toEqual([
+      { type: 'tool', name: 'Read', status: 'running' },
+      { type: 'tool', name: 'Read', status: 'failed' },
+    ]);
+  });
+
+  it('maps a permission-denied tool_result to denied', async () => {
+    const { session, tools } = build('basic', { TOOL_ERROR: 'denied' });
+    await session.start();
+    await session.send('hi');
+    expect(tools().at(-1)).toEqual({ type: 'tool', name: 'Read', status: 'denied' });
+  });
+
+  it('interrupt() with no active turn resolves without a control_request', async () => {
+    const { session } = build('basic');
+    await session.start();
+    // Casting: interrupt is a P2 compatibility method on the adapter.
+    await expect((session as unknown as { interrupt(): Promise<void> }).interrupt()).resolves.toBeUndefined();
+  });
+
+  it('interrupt() acknowledges, settles the turn, and fences late generation text', async () => {
+    const built = build('interrupt', {}, { timeoutMs: 2000 });
+    const session = built.session as unknown as { interrupt(): Promise<void> } & typeof built.session;
+    await session.start();
+    const turn = session.send('go');
+    // Wait until the fixture has streamed its first (pre-interrupt) delta.
+    await vi.waitFor(() => expect(built.texts()).toContain('Partial answer'));
+    await session.interrupt();
+    // The aborted turn settles (resolve or reject is acceptable) rather than hanging.
+    await turn.then(() => undefined, () => undefined);
+    // Late text emitted after the interrupt request must be fenced out.
+    expect(built.texts()).not.toContain('LATE-AFTER-INTERRUPT');
+  });
+
+  it('interrupt() rejects when the control_request is never acknowledged', async () => {
+    const built = build('interrupt', { INTERRUPT_NOACK: '1' }, { timeoutMs: 8000 });
+    const session = built.session as unknown as { interrupt(): Promise<void> } & typeof built.session;
+    await session.start();
+    // The hanging turn is settled by afterEach close(); swallow its rejection.
+    const turn = session.send('go');
+    turn.catch(() => undefined);
+    await vi.waitFor(() => expect(built.texts()).toContain('Partial answer'));
+    await expect(session.interrupt()).rejects.toThrow(/not acknowledged/i);
+  });
 });

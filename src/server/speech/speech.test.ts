@@ -117,6 +117,71 @@ describe('speech recognition (STT)', () => {
   });
 });
 
+describe('streaming audio ingest (acceptAudio)', () => {
+  it('streams accepted frames and commits the final transcript', async () => {
+    const h = await makeHarness();
+    await h.session.startRecognition();
+    expect(h.session.acceptAudio!(pcm('a'))).toBe(true);
+    expect(h.session.acceptAudio!(pcm('b'))).toBe(true);
+    expect(await h.session.commitRecognition()).toBe('a b');
+  });
+
+  it('refuses when there is no active recognition', async () => {
+    const h = await makeHarness();
+    expect(h.session.acceptAudio!(pcm('x'))).toBe(false);
+  });
+
+  it('refuses empty frames and refuses while a commit is settling', async () => {
+    const h = await makeHarness({ sttNoFinal: true }, { timeoutMs: 200 });
+    await h.session.startRecognition();
+    expect(h.session.acceptAudio!(pcm(''))).toBe(false);
+    expect(h.session.acceptAudio!(pcm('data'))).toBe(true);
+    const pending = h.session.commitRecognition();
+    pending.catch(() => undefined);
+    expect(h.session.acceptAudio!(pcm('more'))).toBe(false);
+    await expect(pending).rejects.toThrow(/commit_timeout/);
+  });
+
+  it('refuses frames beyond the per-recognition ceiling', async () => {
+    const h = await makeHarness();
+    await h.session.startRecognition();
+    const overLimit = new Uint8Array(16_000 * 2 * 120 + 2);
+    expect(h.session.acceptAudio!(overLimit)).toBe(false);
+  });
+
+  it('refuses after close', async () => {
+    const h = await makeHarness();
+    await h.session.startRecognition();
+    h.session.close();
+    expect(h.session.acceptAudio!(pcm('x'))).toBe(false);
+  });
+});
+
+describe('recognition abort', () => {
+  it('discards buffered audio and opens a fresh socket for the next turn', async () => {
+    const h = await makeHarness();
+    await h.session.startRecognition();
+    h.session.acceptAudio!(pcm('leak-a'));
+    h.session.acceptAudio!(pcm('leak-b'));
+    h.session.abortRecognition!();
+
+    await h.session.startRecognition();
+    h.session.acceptAudio!(pcm('clean'));
+    expect(await h.session.commitRecognition()).toBe('clean');
+    // A brand new scribe socket/token was established after the abort.
+    expect(h.tokenCalls.filter((k) => k === 'realtime_scribe')).toHaveLength(2);
+  });
+
+  it('rejects a pending commit', async () => {
+    const h = await makeHarness({ sttNoFinal: true }, { timeoutMs: 2000 });
+    await h.session.startRecognition();
+    h.session.acceptAudio!(pcm('data'));
+    const pending = h.session.commitRecognition();
+    h.session.abortRecognition!();
+    await expect(pending).rejects.toThrow(/aborted/);
+  });
+});
+
 describe('speech synthesis (TTS)', () => {
   it('buffers split words without inserting spaces inside them', async () => {
     const h = await makeHarness();
@@ -164,6 +229,31 @@ describe('speech synthesis (TTS)', () => {
     const h = await makeHarness({ ttsNeverFinal: true }, { timeoutMs: 150 });
     h.session.writeText('stuck');
     await expect(h.session.finishSpeech()).rejects.toThrow(/finish_timeout/);
+  });
+});
+
+describe('synthesis cancellation (cancelSpeech)', () => {
+  it('rejects a pending finish', async () => {
+    const h = await makeHarness({ ttsNeverFinal: true }, { timeoutMs: 2000 });
+    h.session.writeText('hello ');
+    const pending = h.session.finishSpeech();
+    h.session.cancelSpeech!();
+    await expect(pending).rejects.toThrow(/cancelled/);
+  });
+
+  it('lets a subsequent response synthesize on a fresh socket', async () => {
+    const h = await makeHarness();
+    h.session.writeText('a');
+    const cancelled = h.session.finishSpeech();
+    h.session.cancelSpeech!(); // cancel while the first socket is still opening
+    await expect(cancelled).rejects.toThrow(/cancelled/);
+
+    h.session.writeText('b');
+    await h.session.finishSpeech();
+    expect(h.audio.map((value) => decode(value.audio)).join('')).toBe('b ');
+    // Fresh synthesis socket/token for the replacement response.
+    expect(h.tokenCalls.filter((k) => k === 'tts_websocket')).toHaveLength(2);
+    expect(h.errors).toEqual([]);
   });
 });
 
