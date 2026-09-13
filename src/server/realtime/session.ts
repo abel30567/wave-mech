@@ -538,9 +538,16 @@ class Conversation implements RetainedConversation {
       try {
         await this.harness.interrupt();
       } catch {
-        // The interrupt could not be confirmed. Do not admit a new turn on an
-        // unconfirmed settlement — surface the failure instead.
-        this.emit({ type: 'error', code: 'interrupt_failed', message: 'Could not stop the response cleanly.', fatal: false });
+        // The interrupt could not be confirmed: the harness has quarantined the
+        // still-live generation and can no longer serve turns. Do NOT announce a
+        // settled cancellation or reopen admission — that would fabricate
+        // continuity over generation that may still complete. Keep the fence
+        // (response stays cancelled/uncleared) and surface a fatal, closed
+        // recovery outcome instead.
+        response.audioInterrupted = true;
+        this.emit({ type: 'error', code: 'interrupt_failed', message: 'Could not stop the response cleanly.', fatal: true });
+        void this.close();
+        return;
       }
     }
     response.inferenceActive = false;
@@ -661,7 +668,16 @@ class Conversation implements RetainedConversation {
 
   /** True when a turn is being recorded, committed, or answered. */
   private isBusy(): boolean {
-    if (this.response && (this.response.inferenceActive || this.response.awaitingPlayback)) return true;
+    const response = this.response;
+    if (response) {
+      // Busy for the whole response lifecycle: inference, TTS synthesis
+      // finalization (the window after inference resolves but before
+      // finishSpeech settles), and playback acknowledgement. Admitting a new
+      // turn during synthesis finalization would retag the previous response's
+      // trailing audio.
+      if (!response.finished && !response.cancelled) return true;
+      if (response.awaitingPlayback) return true;
+    }
     if (this.input && (this.input.status === 'recording' || this.input.status === 'committing')) return true;
     return this.phase === 'interrupting';
   }

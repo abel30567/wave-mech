@@ -110,6 +110,13 @@ class ClaudeCliHarness implements HarnessSession {
   private closeResolve: (() => void) | undefined;
   private killTimer: NodeJS.Timeout | undefined;
   private closing = false;
+  /**
+   * Set once an interrupt (or turn) failed locally without a proven process-side
+   * settlement. The subprocess generation is then unconfirmed: its output stays
+   * fenced and it may never serve another turn, so `send()` rejects rather than
+   * lift the fence over possibly-live old generation.
+   */
+  private quarantined = false;
 
   /** Per-message map of content-block index -> block type (text/thinking/tool_use). */
   private blockTypes = new Map<number, string | undefined>();
@@ -188,6 +195,12 @@ class ClaudeCliHarness implements HarnessSession {
     if (this.closing) {
       return Promise.reject(new Error('Harness is closed.'));
     }
+    if (this.quarantined) {
+      // An unconfirmed cancellation left the previous generation possibly live.
+      // Refuse before touching the fence so old output can never bleed into a
+      // replacement turn; the coordinator must start a fresh harness/session.
+      return Promise.reject(new Error('Harness was quarantined after an unconfirmed cancellation.'));
+    }
     if (!this.child || !this.ready) {
       return Promise.reject(new Error('Harness is not ready; call start() first.'));
     }
@@ -200,7 +213,8 @@ class ClaudeCliHarness implements HarnessSession {
 
     return new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.failPending(new Error('Harness turn timed out.'));
+        // A local timeout is not a proven process-side settlement.
+        this.failPending(new Error('Harness turn timed out.'), { unproven: true });
       }, this.timeoutMs);
       if (typeof timer.unref === 'function') timer.unref();
       this.pending = { resolve, reject, timer, settled: false };
@@ -215,7 +229,7 @@ class ClaudeCliHarness implements HarnessSession {
         message: { role: 'user', content: [{ type: 'text', text }] },
       });
       const ok = this.child?.stdin?.write(`${line}\n`, (error) => {
-        if (error) this.failPending(new Error('Failed to write turn to harness process.'));
+        if (error) this.failPending(new Error('Failed to write turn to harness process.'), { unproven: true });
       });
       if (ok === false) {
         // Backpressure is fine; the callback above still fires on flush/error.
@@ -255,17 +269,24 @@ class ClaudeCliHarness implements HarnessSession {
 
       interrupt.receiptTimer = setTimeout(() => {
         if (interrupt.received) return;
-        this.settleInterrupt(
-          interrupt,
+        // No acknowledgement: the control channel is unhealthy and cancellation
+        // is unproven. Reject the interrupt, fail the turn, and quarantine the
+        // still-live generation rather than assuming it stopped.
+        this.failPending(
           new Error('Harness interrupt was not acknowledged before the timeout.'),
+          { unproven: true },
         );
       }, Math.min(INTERRUPT_RECEIPT_MS, this.timeoutMs));
       if (typeof interrupt.receiptTimer.unref === 'function') interrupt.receiptTimer.unref();
 
       interrupt.settleTimer = setTimeout(() => {
-        // Acknowledged but the turn never settled: force the pending turn to
-        // fail so we never continue past an unconfirmed settlement.
-        this.failPending(new Error('Harness interrupt did not settle the turn before the timeout.'));
+        // Acknowledged but the turn never terminally settled. This is a local
+        // timeout, not proven settlement: reject the interrupt and quarantine
+        // the process so old generation output can never resurface.
+        this.failPending(
+          new Error('Harness interrupt did not settle the turn before the timeout.'),
+          { unproven: true },
+        );
       }, this.timeoutMs);
       if (typeof interrupt.settleTimer.unref === 'function') interrupt.settleTimer.unref();
 
@@ -276,7 +297,8 @@ class ClaudeCliHarness implements HarnessSession {
       });
       this.child?.stdin?.write(`${line}\n`, (error) => {
         if (error) {
-          this.settleInterrupt(interrupt, new Error('Failed to write interrupt to harness process.'));
+          // The interrupt never reached the process: unproven cancellation.
+          this.failPending(new Error('Failed to write interrupt to harness process.'), { unproven: true });
         }
       });
     });
@@ -289,12 +311,14 @@ class ClaudeCliHarness implements HarnessSession {
     this.closePromise = new Promise<void>((resolve) => {
       this.closeResolve = resolve;
 
-      // Settle any outstanding start/turn work first.
+      // Settle any outstanding start/turn work first. Reject a pending interrupt
+      // explicitly before failing the turn so it never resolves as a successful
+      // cancellation on the way out.
       this.settleStart(new Error('Harness closed before it became ready.'));
-      this.failPending(new Error('Harness closed before the turn completed.'));
       if (this.pendingInterrupt) {
         this.settleInterrupt(this.pendingInterrupt, new Error('Harness closed before the interrupt settled.'));
       }
+      this.failPending(new Error('Harness closed before the turn completed.'));
 
       const child = this.child;
       if (!child || child.exitCode !== null || child.signalCode !== null) {
@@ -417,8 +441,11 @@ class ClaudeCliHarness implements HarnessSession {
     }
     if (response?.subtype === 'error') {
       const message = typeof response.error === 'string' ? response.error : 'Harness rejected the interrupt.';
+      // The process refused to cancel: its current generation keeps running.
+      // Reject the interrupt, fail the turn, and quarantine so that old output
+      // can neither surface nor be attributed to a replacement turn.
       this.settleInterrupt(interrupt, new Error(message));
-      this.failPending(new Error(message));
+      this.failPending(new Error(message), { unproven: true });
       return;
     }
     // Acknowledged. The turn still has to settle; that settlement (or the
@@ -565,15 +592,64 @@ class ClaudeCliHarness implements HarnessSession {
     pending.resolve();
   }
 
-  private failPending(error: Error): void {
+  /**
+   * Fail the pending turn. `unproven` marks a local failure (turn/interrupt
+   * timeout, failed write, explicit interrupt rejection) that is NOT proven
+   * process-side settlement: cancellation cannot be assumed, so any outstanding
+   * interrupt is rejected and the subprocess is quarantined. A proven
+   * settlement (a real result/error line/exit from the process) instead
+   * completes an outstanding interrupt successfully.
+   */
+  private failPending(error: Error, opts: { unproven?: boolean } = {}): void {
+    const interrupt = this.pendingInterrupt;
+    if (opts.unproven) {
+      if (interrupt && !interrupt.settled) this.settleInterrupt(interrupt, error);
+      this.quarantineProcess();
+    } else if (interrupt) {
+      // The aborted turn has genuinely settled: the interrupt is complete.
+      this.settleInterrupt(interrupt, undefined);
+    }
     const pending = this.pending;
     if (!pending || pending.settled) return;
     pending.settled = true;
     if (pending.timer) clearTimeout(pending.timer);
     this.pending = undefined;
-    // The aborted turn has settled: the interrupt is complete.
-    if (this.pendingInterrupt) this.settleInterrupt(this.pendingInterrupt, undefined);
     pending.reject(error);
+  }
+
+  /**
+   * Tear down a subprocess whose current generation was never confirmed to have
+   * stopped. The stream fence stays raised so any straggler output is dropped,
+   * and the harness is marked unusable so a replacement `send()` cannot lift the
+   * fence over still-live old generation.
+   */
+  private quarantineProcess(): void {
+    if (this.quarantined) return;
+    this.quarantined = true;
+    this.suppressStream = true;
+    this.ready = false;
+    const child = this.child;
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
+    try {
+      child.stdin?.end();
+    } catch {
+      // stdin may already be gone.
+    }
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      // already dead
+    }
+    const timer = setTimeout(() => {
+      if (this.child && this.child.exitCode === null && this.child.signalCode === null) {
+        try {
+          this.child.kill('SIGKILL');
+        } catch {
+          // already dead
+        }
+      }
+    }, CLOSE_GRACE_MS);
+    if (typeof timer.unref === 'function') timer.unref();
   }
 
   /** Resolve or reject an outstanding interrupt exactly once, clearing timers. */

@@ -280,6 +280,72 @@ describe('createConversation — interruption', () => {
     await b.conv.handle({ type: 'interrupt', responseId: 999 });
     expect(only(b.events, 'response_cancelled')).toHaveLength(0);
   });
+
+  it('does not announce cancellation or reopen admission when the interrupt is refused', async () => {
+    const b = await build({
+      scenario: 'interrupt',
+      harnessEnv: { INTERRUPT_REJECT: '1' },
+      harnessTimeoutMs: 2000,
+    });
+    b.attach();
+    await b.conv.start();
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'go' });
+    await vi.waitFor(() => expect(only(b.events, 'text').some((e) => e.text.includes('Partial answer'))).toBe(true));
+
+    await b.conv.handle({ type: 'interrupt', responseId: 1 });
+    // A failed settlement must NOT be dressed up as a clean cancellation.
+    await vi.waitFor(() => expect(only(b.events, 'ended')).toHaveLength(1));
+    expect(only(b.events, 'response_cancelled')).toHaveLength(0);
+    const fatal = only(b.events, 'error').find((e) => e.code === 'interrupt_failed');
+    expect(fatal?.fatal).toBe(true);
+    // Late old-generation text never surfaced.
+    expect(only(b.events, 'text').some((e) => e.text.includes('LATE-AFTER-INTERRUPT'))).toBe(false);
+    // Admission is not reopened: a replacement turn is refused (session closed).
+    await b.conv.handle({ type: 'text', turnId: 2, text: 'replacement' });
+    expect(only(b.events, 'user').some((u) => u.text === 'replacement')).toBe(false);
+  });
+
+  it('surfaces a fatal outcome without reopening admission when an acknowledged interrupt never settles', async () => {
+    const b = await build({
+      scenario: 'interrupt',
+      harnessEnv: { INTERRUPT_NO_RESULT: '1' },
+      harnessTimeoutMs: 600,
+    });
+    b.attach();
+    await b.conv.start();
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'go' });
+    await vi.waitFor(() => expect(only(b.events, 'text').some((e) => e.text.includes('Partial answer'))).toBe(true));
+
+    await b.conv.handle({ type: 'interrupt', responseId: 1 });
+    await vi.waitFor(() => expect(only(b.events, 'ended')).toHaveLength(1), { timeout: 3000 });
+    expect(only(b.events, 'response_cancelled')).toHaveLength(0);
+    expect(only(b.events, 'error').some((e) => e.code === 'interrupt_failed' && e.fatal)).toBe(true);
+  });
+});
+
+describe('createConversation — synthesis finalization stays busy', () => {
+  it('remains busy through deferred TTS finalization so a second input cannot retag trailing audio', async () => {
+    const b = await build({ scenario: 'basic', fixtureOptions: { ttsDeferFinalMs: 400 } });
+    b.attach();
+    await b.conv.start();
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'first' });
+    // Wait until inference streamed text; finishSpeech is now in flight (busy)
+    // because the fixture defers the final audio frame.
+    await vi.waitFor(() => expect(only(b.events, 'text').length).toBeGreaterThan(0));
+    await vi.waitFor(() => expect(b.conv.snapshot().phase === 'thinking' || b.conv.snapshot().phase === 'speaking').toBe(true));
+
+    // A new typed turn during synthesis finalization must be refused as busy,
+    // not admitted (which would mislabel the first response's trailing audio).
+    await b.conv.handle({ type: 'text', turnId: 2, text: 'second' });
+    expect(only(b.events, 'notice').some((n) => n.code === 'busy')).toBe(true);
+
+    await vi.waitFor(() => expect(only(b.events, 'response_done')).toHaveLength(1), { timeout: 3000 });
+    expect(only(b.events, 'response_done')[0].responseId).toBe(1);
+    // Every audio frame belongs to the first response.
+    expect(only(b.events, 'audio').every((a) => a.responseId === 1 && a.turnId === 1)).toBe(true);
+    // The second turn never produced a user echo or a second response.
+    expect(only(b.events, 'user').some((u) => u.text === 'second')).toBe(false);
+  });
 });
 
 describe('createConversation — abort, ping, and lifecycle', () => {

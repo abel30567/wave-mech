@@ -22,6 +22,8 @@ export interface FixtureOptions {
   ttsError?: string;
   /** Drop the final audio frame so finish waits (timeout coverage). */
   ttsNeverFinal?: boolean;
+  /** Delay the audio + final frames on EOS by N ms (deferred-finalization race). */
+  ttsDeferFinalMs?: number;
 }
 
 export interface Fixture {
@@ -103,11 +105,20 @@ function handleTts(ws: WebSocket, options: FixtureOptions): void {
     const text = msg.text ?? '';
     if (text === '' && !msg.flush) {
       // Only the documented EOS signal completes the synthesis stream.
-      for (const fragment of fragments) {
-        send(ws, { audio: Buffer.from(fragment, 'utf8').toString('base64'), isFinal: false });
-      }
-      if (!options.ttsNeverFinal) send(ws, { audio: null, isFinal: true });
+      const captured = fragments.slice();
       fragments.length = 0;
+      const finalize = (): void => {
+        if (ws.readyState !== ws.OPEN) return;
+        for (const fragment of captured) {
+          send(ws, { audio: Buffer.from(fragment, 'utf8').toString('base64'), isFinal: false });
+        }
+        if (!options.ttsNeverFinal) send(ws, { audio: null, isFinal: true });
+      };
+      if (options.ttsDeferFinalMs && options.ttsDeferFinalMs > 0) {
+        setTimeout(finalize, options.ttsDeferFinalMs).unref?.();
+      } else {
+        finalize();
+      }
       return;
     }
     if (text.trim().length === 0) return; // initializer space
