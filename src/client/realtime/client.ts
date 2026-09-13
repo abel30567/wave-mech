@@ -26,8 +26,19 @@ type ViewPhase = ConversationView['phase'];
 
 interface InputTurn {
   turnId: number;
+  /** The server has acknowledged `record` for this turn (input_ready). */
   ready: boolean;
+  /** Finalization has been requested (speech ended or finishTurn called). */
   finished: boolean;
+  /** The `finish` command has actually been transmitted for this turn. */
+  finishSent: boolean;
+  /** `record` has been transmitted for this turn. */
+  recordSent: boolean;
+  /**
+   * A barge-in turn whose `record` is withheld until the interrupted response
+   * settles; captured audio is buffered (bounded) in the meantime.
+   */
+  deferredRecord: boolean;
   out: OutstandingAudio;
 }
 
@@ -69,6 +80,9 @@ class Client implements ConversationClient {
   private input: InputTurn | null = null;
   private finishedInput: InputTurn | null = null;
   private currentResponseId: number | null = null;
+  // A response whose drain was paused mid-flight; its playback_done obligation
+  // is retained across pause/resume until genuine drain or explicit skip.
+  private pendingCompletion: { responseId: number; lastSeq: number } | null = null;
 
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private stallSoft: ReturnType<typeof setTimeout> | undefined;
@@ -91,28 +105,14 @@ class Client implements ConversationClient {
     this.connection = 'connecting';
     this.emit();
 
-    // Audio is created first, synchronously within the user gesture, before any
-    // unrelated await so the browser permits microphone/playback access.
-    this.audioCreating = this.audioFactory({
-      onSpeechStart: this.onSpeechStart,
-      onSpeechEnd: this.onSpeechEnd,
-      onMisfire: this.onMisfire,
-      onPcm: this.onPcm,
-      onState: this.onAudioState,
-      onError: this.onAudioError,
-      onDiscontinuity: this.onDiscontinuity,
-    });
-    try {
-      this.audio = await this.audioCreating;
-      this.audioAvailable = true;
-    } catch {
-      this.audio = null;
+    // Audio initialization is *started* inside the user gesture so the browser
+    // permits microphone/playback access, but the connection does not wait for
+    // it: an unanswered permission prompt or a slow WASM load must never block
+    // typed chat. When speech is unavailable, audio/VAD is skipped entirely.
+    if (this.options.speechAvailable) {
+      this.beginAudio();
+    } else {
       this.audioAvailable = false;
-      this.notice = 'Microphone unavailable. You can still type a message.';
-    }
-    if (this.ended) {
-      await this.audio?.close();
-      return;
     }
 
     // refreshAccess re-establishes the same-origin bootstrap before connecting.
@@ -123,6 +123,43 @@ class Client implements ConversationClient {
     }
     if (this.ended) return;
     this.connect(false);
+  }
+
+  /**
+   * Kick off asynchronous audio creation without awaiting it. If End wins the
+   * race, the resolved resources are disposed rather than attached; a creation
+   * failure degrades to typed-only chat.
+   */
+  private beginAudio(): void {
+    const creating = this.audioFactory({
+      onSpeechStart: this.onSpeechStart,
+      onSpeechEnd: this.onSpeechEnd,
+      onMisfire: this.onMisfire,
+      onPcm: this.onPcm,
+      onState: this.onAudioState,
+      onError: this.onAudioError,
+      onDiscontinuity: this.onDiscontinuity,
+    });
+    this.audioCreating = creating;
+    void creating.then(
+      (audio) => {
+        if (this.ended) {
+          // Late initialization after End: dispose, never attach.
+          void audio.close();
+          return;
+        }
+        this.audio = audio;
+        this.audioAvailable = true;
+        this.emit();
+      },
+      () => {
+        if (this.ended) return;
+        this.audio = null;
+        this.audioAvailable = false;
+        this.notice = 'Microphone unavailable. You can still type a message.';
+        this.emit();
+      },
+    );
   }
 
   sendText(text: string): void {
@@ -166,7 +203,18 @@ class Client implements ConversationClient {
   async resumeAudio(): Promise<void> {
     if (this.ended || !this.audio) return;
     await this.audio.resume();
+    if (this.ended) return;
     this.outputPaused = false;
+    const pending = this.pendingCompletion;
+    if (pending) {
+      // Re-establish the retained completion waiter; acknowledge only on a
+      // genuine drain or explicit skip once playback resumes.
+      this.pendingCompletion = null;
+      this.setPhase('speaking');
+      this.emit();
+      void this.completeResponse(pending.responseId, pending.lastSeq);
+      return;
+    }
     if (!this.input && this.currentResponseId === null) this.setPhase(this.restingPhase());
     this.emit();
   }
@@ -206,10 +254,16 @@ class Client implements ConversationClient {
     if (this.input) return; // never admit an overlapping input turn
     if (this.phase === 'speaking' && this.currentResponseId !== null) {
       // Barge-in: drop playback immediately and ask the server to interrupt,
-      // keeping the shared context open for the new turn.
+      // keeping the shared context open for the new turn. The server is still
+      // busy, so the replacement `record` is withheld and its speech buffered
+      // until the interrupted response is authoritatively settled; sending
+      // record now would be rejected as the wire order does not serialize the
+      // asynchronous cancellation.
       this.audio?.cancelOutput();
       this.send({ type: 'interrupt', responseId: this.currentResponseId });
       this.notice = undefined;
+      this.startInputTurn({ deferRecord: true });
+      return;
     }
     this.startInputTurn();
   };
@@ -267,20 +321,44 @@ class Client implements ConversationClient {
 
   // --- input turn handling --------------------------------------------------
 
-  private startInputTurn(): void {
+  private startInputTurn(opts?: { deferRecord?: boolean }): void {
     this.finishedInput = null;
     const turnId = ++this.turnCounter;
     this.input = {
       turnId,
       ready: false,
       finished: false,
+      finishSent: false,
+      recordSent: false,
+      deferredRecord: opts?.deferRecord === true,
       out: new OutstandingAudio(TRANSPORT_AUDIO_BYTES, turnId),
     };
     this.partial = '';
     this.setPhase('recording');
-    this.send({ type: 'record', turnId });
-    this.armStall();
+    if (!this.input.deferredRecord) this.sendRecord(this.input);
     this.emit();
+  }
+
+  /** Transmit `record` for a turn and arm its stall watchdog, once. */
+  private sendRecord(turn: InputTurn): void {
+    if (turn.recordSent) return;
+    turn.recordSent = true;
+    turn.deferredRecord = false;
+    this.send({ type: 'record', turnId: turn.turnId });
+    if (this.input === turn) this.armStall();
+  }
+
+  /**
+   * Admit a barge-in turn's withheld `record` once the interrupted response has
+   * settled. Handles the case where speech already ended (the turn moved to the
+   * finalizing slot) while cancellation was still pending.
+   */
+  private admitDeferredRecord(): void {
+    const turn = this.input ?? this.finishedInput;
+    if (!turn?.deferredRecord) return;
+    this.sendRecord(turn);
+    this.trySendAudio();
+    this.maybeSendFinish();
   }
 
   private trySendAudio(): void {
@@ -289,6 +367,23 @@ class Client implements ConversationClient {
     for (const frame of input.out.takeSendable()) {
       this.socket!.send(encodeAudio(frame));
     }
+  }
+
+  /**
+   * Send `finish` only once the finalizing turn is ready (server acknowledged
+   * `record`) and every captured frame through lastSeq has actually been
+   * transmitted. The intent is retained (finishSent stays false) while offline,
+   * before readiness, or with frames still unsent, and is re-driven on ack,
+   * readiness and reconnect.
+   */
+  private maybeSendFinish(): void {
+    const fin = this.finishedInput;
+    if (!fin || !fin.finished || fin.finishSent) return;
+    if (!fin.ready || !this.socketOpen()) return;
+    this.trySendAudio();
+    if (fin.out.hasUnsent) return; // captured audio still unsent
+    this.send({ type: 'finish', turnId: fin.turnId, lastSeq: fin.out.lastSeq });
+    fin.finishSent = true;
   }
 
   private async finishInput(): Promise<void> {
@@ -303,13 +398,16 @@ class Client implements ConversationClient {
       /* ignore flush faults; we still finalize what we captured */
     }
     if (this.ended) return;
+    // Preserve the finalization intent: move to the finalizing slot and defer
+    // the actual `finish` until readiness and contiguous transmission. This
+    // survives speech ending before input_ready, before its audio drains, or
+    // while offline (reconnect re-drives it).
     this.finishedInput = input;
     this.input = null;
-    this.trySendAudio();
-    if (this.socketOpen()) this.send({ type: 'finish', turnId: input.turnId, lastSeq: input.out.lastSeq });
     this.clearStall();
     this.partial = '';
     this.setPhase('thinking');
+    this.maybeSendFinish();
     this.emit();
   }
 
@@ -352,17 +450,27 @@ class Client implements ConversationClient {
     const audio = this.audio;
     const result = audio ? await audio.finishOutput(responseId, lastSeq) : 'played';
     if (this.ended) return;
+    if (result === 'paused') {
+      // Retain the completion obligation across pause/resume: withhold the
+      // acknowledgement, keep the response current, and never advertise
+      // listening while the server still awaits playback. resumeAudio()
+      // re-establishes this waiter.
+      this.outputPaused = true;
+      this.pendingCompletion = { responseId, lastSeq };
+      this.setPhase('paused');
+      this.emit();
+      return;
+    }
     if (result === 'played') {
       this.send({ type: 'playback_done', responseId, lastSeq });
-    } else if (result === 'interrupted') {
+    } else {
       // Explicit cancellation/fallback is acknowledged as skipped, never a
       // silent clock stall.
       this.send({ type: 'playback_done', responseId, lastSeq, skipped: true });
-    } else {
-      // Paused: withhold acknowledgement and expose a resume affordance.
-      this.outputPaused = true;
     }
+    this.pendingCompletion = null;
     if (this.currentResponseId === responseId) this.currentResponseId = null;
+    this.admitDeferredRecord();
     if (!this.input && this.currentResponseId === null) this.setPhase(this.restingPhase());
     this.emit();
   }
@@ -387,7 +495,12 @@ class Client implements ConversationClient {
       if (isReconnect) {
         // Requeue only unacknowledged audio; accepted frames are never replayed.
         this.input?.out.resetForResend();
-        this.finishedInput?.out.resetForResend();
+        if (this.finishedInput) {
+          this.finishedInput.out.resetForResend();
+          // A `finish` sent on the dropped connection may not have been
+          // received; re-drive it after the requeued frames are retransmitted.
+          this.finishedInput.finishSent = false;
+        }
       }
     };
     socket.onmessage = (event: MessageEvent): void => {
@@ -442,13 +555,18 @@ class Client implements ConversationClient {
         return;
       case 'state':
         return; // local phase is authoritative for the view
-      case 'input_ready':
-        if (this.input?.turnId === event.turnId) {
-          this.input.ready = true;
-          this.armStall();
+      case 'input_ready': {
+        const turn = this.input ?? this.finishedInput;
+        if (turn?.turnId === event.turnId) {
+          turn.ready = true;
+          if (this.input === turn) this.armStall();
           this.trySendAudio();
+          // Speech may have ended before readiness arrived; flush the retained
+          // finish now that the turn is acknowledged.
+          this.maybeSendFinish();
         }
         return;
+      }
       case 'audio_ack': {
         const turn = this.input ?? this.finishedInput;
         if (turn?.turnId === event.turnId) {
@@ -456,6 +574,7 @@ class Client implements ConversationClient {
           if (this.input) this.armStall();
           else this.clearStall();
           this.trySendAudio();
+          this.maybeSendFinish();
         }
         return;
       }
@@ -472,6 +591,9 @@ class Client implements ConversationClient {
         return;
       case 'user':
         this.messages.push({ turnId: event.turnId, role: 'user', text: event.text });
+        // The server has committed this input; release the finalizing slot so a
+        // later reconnect never re-sends its finish.
+        if (this.finishedInput?.turnId === event.turnId) this.finishedInput = null;
         this.partial = '';
         this.emit();
         return;
@@ -482,13 +604,19 @@ class Client implements ConversationClient {
         this.tool = undefined;
         this.emit();
         return;
-      case 'audio':
+      case 'audio': {
         if (this.isStaleResponse(event.responseId)) return;
         this.adoptResponse(event.responseId);
         this.audio?.enqueueOutput(event.audio, event.sampleRate, event.responseId, event.seq);
-        if (!this.input) this.setPhase('speaking');
-        this.emit();
+        // Only emit when the audio frame actually changes visible state (the
+        // first frame that flips us into `speaking`). Subsequent audio-only
+        // frames must not clone/redraw the whole transcript.
+        if (!this.input && this.phase !== 'speaking') {
+          this.setPhase('speaking');
+          this.emit();
+        }
         return;
+      }
       case 'response_done':
         if (this.isStaleResponse(event.responseId)) return;
         this.adoptResponse(event.responseId);
@@ -496,7 +624,11 @@ class Client implements ConversationClient {
         return;
       case 'response_cancelled':
         this.audio?.cancelOutput(event.responseId);
+        if (this.pendingCompletion?.responseId === event.responseId) this.pendingCompletion = null;
         if (this.currentResponseId === event.responseId) this.currentResponseId = null;
+        // Authoritative settlement of the interrupted response: admit any
+        // barge-in `record` that was withheld while cancellation was pending.
+        this.admitDeferredRecord();
         if (!this.input && this.currentResponseId === null) this.setPhase(this.restingPhase());
         this.emit();
         return;
@@ -541,6 +673,8 @@ class Client implements ConversationClient {
       if (snapshot.input.turnId === this.input.turnId) {
         this.input.out.ack(snapshot.input.lastSeq);
         this.input.ready = true;
+        this.input.recordSent = true;
+        this.input.deferredRecord = false;
         if (snapshot.input.committed) {
           this.finishedInput = this.input;
           this.input = null;
@@ -551,13 +685,35 @@ class Client implements ConversationClient {
         this.clearStall();
       }
     }
+    // Reconcile a finalizing turn whose speech ended before the drop; retain the
+    // finish intent and re-drive it against the reattached session.
+    if (this.finishedInput && snapshot.input && snapshot.input.turnId === this.finishedInput.turnId) {
+      this.finishedInput.out.ack(snapshot.input.lastSeq);
+      this.finishedInput.ready = true;
+      this.finishedInput.recordSent = true;
+      this.finishedInput.deferredRecord = false;
+      if (snapshot.input.committed) {
+        // The server already accepted the whole turn; no finish to re-send.
+        this.finishedInput.finishSent = true;
+      }
+    }
     if (snapshot.response && !snapshot.response.finished) {
       this.currentResponseId = snapshot.response.responseId;
     }
 
     this.connection = 'connected';
-    if (!this.input && this.currentResponseId === null) this.setPhase(this.restingPhase());
-    if (this.input) this.trySendAudio();
+    // Now that the socket is confirmed, drive any withheld record/audio/finish.
+    this.admitDeferredRecord();
+    this.trySendAudio();
+    this.maybeSendFinish();
+    if (
+      !this.input &&
+      !this.finishedInput &&
+      this.currentResponseId === null &&
+      this.pendingCompletion === null
+    ) {
+      this.setPhase(this.restingPhase());
+    }
     this.emit();
   }
 
