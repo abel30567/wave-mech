@@ -6,12 +6,17 @@
 /.claude/
 
 # Local project instructions and planning notes
-/CLAUDE.md
+**/CLAUDE.md
 /plan/
 
 # Generated files
 node_modules/
 dist/
+/public/vad/
 coverage/
+playwright-report/
+test-results/
+artifacts/
+.wave-mech/
 *.log
 .DS_Store
