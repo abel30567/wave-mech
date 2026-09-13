@@ -1,7 +1,7 @@
 export type HarnessEvent =
-  | { type: 'ready'; sessionId?: string; tools?: string[]; mcp?: Array<{ name: string; status: string }> }
+  | { type: 'ready'; sessionId?: string; tools?: string[]; mcp?: Array<{ name: string; status: string }>; model?: string }
   | { type: 'text'; text: string }
-  | { type: 'tool'; name: string; status: 'running' | 'done' | 'failed' | 'denied' }
+  | { type: 'tool'; name: string; status: 'running' | 'done' | 'failed' | 'denied' | 'pending' | 'cancelled'; callId?: string; durationMs?: number; reason?: string; statusCode?: number }
   | { type: 'error'; message: string };
 
 export interface HarnessOptions {
@@ -69,7 +69,7 @@ export type ServerMessage =
   | { type: 'user'; text: string }
   | { type: 'text'; text: string }
   | { type: 'audio'; audio: string; sampleRate: number }
-  | { type: 'tool'; name: string; status: 'running' | 'done' | 'failed' | 'denied' }
+  | { type: 'tool'; name: string; status: 'running' | 'done' | 'failed' | 'denied' | 'pending' | 'cancelled' }
   | { type: 'response_done' }
   | { type: 'idle' }
   | { type: 'error'; message: string; fatal?: boolean }
