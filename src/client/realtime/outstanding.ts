@@ -80,6 +80,11 @@ export class OutstandingAudio {
     return this.nextSeq - 1;
   }
 
+  /** True while frames remain captured-but-not-yet-transmitted. */
+  get hasUnsent(): boolean {
+    return this.unsent.length > 0;
+  }
+
   get ack_watermark(): number {
     return this.ackedSeq;
   }

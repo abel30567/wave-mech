@@ -5,24 +5,36 @@ import { FakeSocket, makeFakeAudio } from './fixtures/fakes.js';
 
 const tick = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
-function setup(options?: { failCreate?: boolean }) {
+function setup(options?: { failCreate?: boolean; speechAvailable?: boolean }) {
   const sockets: FakeSocket[] = [];
   const views: ConversationView[] = [];
   const { factory, control } = makeFakeAudio({ failCreate: options?.failCreate });
+  let audioFactoryCalls = 0;
   const refreshAccess = vi.fn(async () => {});
   const client = createConversationClient({
     url: 'wss://local/session',
-    speechAvailable: true,
+    speechAvailable: options?.speechAvailable ?? true,
     refreshAccess,
     onChange: (view) => views.push(view),
-    audioFactory: factory,
+    audioFactory: (opts) => {
+      audioFactoryCalls += 1;
+      return factory(opts);
+    },
     socketFactory: (url) => {
       const socket = new FakeSocket(url);
       sockets.push(socket);
       return socket as unknown as WebSocket;
     },
   });
-  return { client, sockets, views, control, refreshAccess, last: () => views[views.length - 1] };
+  return {
+    client,
+    sockets,
+    views,
+    control,
+    refreshAccess,
+    audioFactoryCalls: () => audioFactoryCalls,
+    last: () => views[views.length - 1],
+  };
 }
 
 const snapshot = (over: Partial<ConversationSnapshot> = {}): { type: 'snapshot'; snapshot: ConversationSnapshot } => ({
@@ -282,17 +294,56 @@ describe('conversation client: responses and barge-in', () => {
     expect(h.last().canResumeAudio).toBe(false);
   });
 
-  it('clears playback, interrupts, and opens a new turn on barge-in', async () => {
+  it('clears playback and interrupts on barge-in but defers record until settlement', async () => {
     const h = setup();
     const socket = await connected(h);
     socket.receive({ type: 'audio', turnId: 2, responseId: 5, seq: 1, audio: 'AAA=', sampleRate: 16000 });
     expect(h.last().phase).toBe('speaking');
 
-    h.control().options.onSpeechStart();
+    const audio = h.control().options;
+    audio.onSpeechStart();
+    // Playback is dropped and interrupt is sent immediately...
     expect(h.control().cancels.length).toBeGreaterThan(0);
     expect(socket.commands()).toContainEqual({ type: 'interrupt', responseId: 5 });
-    expect(socket.commands().some((c) => c.type === 'record')).toBe(true);
     expect(h.last().phase).toBe('recording');
+    // ...but the replacement record is withheld while the server is still busy.
+    expect(socket.commands().some((c) => c.type === 'record')).toBe(false);
+
+    // Replacement speech captured meanwhile is buffered (bounded), not sent.
+    audio.onPcm(frame());
+    expect(socket.audioFrames()).toHaveLength(0);
+
+    // The server settles the interrupted response; only now is record admitted.
+    socket.receive({ type: 'response_cancelled', responseId: 5 });
+    expect(socket.commands()).toContainEqual({ type: 'record', turnId: 1 });
+
+    // Buffered replacement speech flushes once the server acknowledges record.
+    socket.receive({ type: 'input_ready', turnId: 1 });
+    expect(socket.audioFrames().map((f) => f.seq)).toEqual([1]);
+    expect(socket.audioFrames().every((f) => f.turnId === 1)).toBe(true);
+  });
+
+  it('admits a deferred barge-in record when speech ends before cancellation settles', async () => {
+    const h = setup();
+    const socket = await connected(h);
+    socket.receive({ type: 'audio', turnId: 2, responseId: 5, seq: 1, audio: 'AAA=', sampleRate: 16000 });
+    const audio = h.control().options;
+
+    audio.onSpeechStart(); // barge-in: record deferred
+    audio.onPcm(frame());
+    audio.onSpeechEnd(); // speech ends while cancellation is still pending
+    await tick();
+    // No record/finish leak out before the server settles.
+    expect(socket.commands().some((c) => c.type === 'record')).toBe(false);
+    expect(socket.commands().some((c) => c.type === 'finish')).toBe(false);
+
+    socket.receive({ type: 'response_cancelled', responseId: 5 });
+    expect(socket.commands()).toContainEqual({ type: 'record', turnId: 1 });
+
+    socket.receive({ type: 'input_ready', turnId: 1 });
+    // The buffered tail is transmitted and finish follows once ready.
+    expect(socket.audioFrames().map((f) => f.seq)).toEqual([1]);
+    expect(socket.commands()).toContainEqual({ type: 'finish', turnId: 1, lastSeq: 1 });
   });
 });
 
@@ -357,5 +408,201 @@ describe('conversation client: mute, text, and cleanup', () => {
     expect(control().closeCount).toBe(1);
     // Never connected, since end won the race.
     expect(sockets).toHaveLength(0);
+  });
+});
+
+describe('conversation client: pending-input lifecycle', () => {
+  it('withholds finish until input_ready, then flushes buffered audio and finishes once', async () => {
+    const h = setup();
+    const socket = await connected(h);
+    const audio = h.control().options;
+
+    audio.onSpeechStart();
+    audio.onPcm(frame());
+    audio.onPcm(frame());
+    // Speech ends before the server acknowledges the turn.
+    audio.onSpeechEnd();
+    await tick();
+    // Nothing captured is sent and finish is withheld until readiness.
+    expect(socket.audioFrames()).toHaveLength(0);
+    expect(socket.commands().some((c) => c.type === 'finish')).toBe(false);
+    expect(h.last().phase).toBe('thinking');
+
+    socket.receive({ type: 'input_ready', turnId: 1 });
+    // Captured audio is transmitted first, then finish covers every sample.
+    expect(socket.audioFrames().map((f) => f.seq)).toEqual([1, 2]);
+    expect(socket.commands()).toContainEqual({ type: 'finish', turnId: 1, lastSeq: 2 });
+    expect(socket.commands().filter((c) => c.type === 'finish')).toHaveLength(1);
+  });
+
+  it('never emits finish while captured audio is still unsent', async () => {
+    const h = setup();
+    const socket = await connected(h);
+    const audio = h.control().options;
+    audio.onSpeechStart();
+    // Ready, but capture some audio and finalize in the same synchronous burst.
+    socket.receive({ type: 'input_ready', turnId: 1 });
+    audio.onPcm(frame());
+    audio.onPcm(frame());
+    audio.onSpeechEnd();
+    await tick();
+    // Frames precede the finish, and finish declares the full lastSeq.
+    const commands = socket.commands();
+    const finish = commands.find((c) => c.type === 'finish');
+    expect(finish).toEqual({ type: 'finish', turnId: 1, lastSeq: 2 });
+    expect(socket.audioFrames().map((f) => f.seq)).toEqual([1, 2]);
+  });
+
+  it('redelivers unacked audio and re-drives finish after a reconnect (lost ack)', async () => {
+    vi.useFakeTimers();
+    const h = setup();
+    await h.client.start();
+    const first = h.sockets[0];
+    first.open();
+    first.receive(snapshot({ sessionId: 'sess-2' }));
+    const audio = h.control().options;
+    audio.onSpeechStart();
+    first.receive({ type: 'input_ready', turnId: 1 });
+    audio.onPcm(frame());
+    audio.onPcm(frame());
+    audio.onPcm(frame());
+    // Only seq 1 is acknowledged; acks for 2 and 3 are lost.
+    first.receive({ type: 'audio_ack', turnId: 1, seq: 1 });
+    audio.onSpeechEnd();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(first.commands()).toContainEqual({ type: 'finish', turnId: 1, lastSeq: 3 });
+
+    first.drop();
+    await vi.advanceTimersByTimeAsync(750);
+    const second = h.sockets[1];
+    second.open();
+    second.receive(snapshot({ sessionId: 'sess-2', lastTurnId: 1, input: { turnId: 1, lastSeq: 1, committed: false } }));
+    // Unacked frames replay and the finish intent is re-driven after them.
+    expect(second.audioFrames().map((f) => f.seq)).toEqual([2, 3]);
+    expect(second.commands()).toContainEqual({ type: 'finish', turnId: 1, lastSeq: 3 });
+  });
+
+  it('preserves the finish intent when speech ends while offline', async () => {
+    vi.useFakeTimers();
+    const h = setup();
+    await h.client.start();
+    const first = h.sockets[0];
+    first.open();
+    first.receive(snapshot({ sessionId: 'sess-3' }));
+    const audio = h.control().options;
+    audio.onSpeechStart();
+    first.receive({ type: 'input_ready', turnId: 1 });
+    audio.onPcm(frame()); // seq 1 sent
+
+    first.drop(); // endpoint goes offline
+    audio.onSpeechEnd(); // speech ends while there is no socket
+    await vi.advanceTimersByTimeAsync(0);
+    // The finish is not lost; it is retained rather than dropped.
+    expect(first.commands().some((c) => c.type === 'finish')).toBe(false);
+    expect(h.last().phase).toBe('thinking');
+
+    await vi.advanceTimersByTimeAsync(750);
+    const second = h.sockets[1];
+    second.open();
+    second.receive(snapshot({ sessionId: 'sess-3', lastTurnId: 1, input: { turnId: 1, lastSeq: 0, committed: false } }));
+    // The unsent tail is retransmitted and the retained finish is delivered.
+    expect(second.audioFrames().map((f) => f.seq)).toEqual([1]);
+    expect(second.commands()).toContainEqual({ type: 'finish', turnId: 1, lastSeq: 1 });
+  });
+});
+
+describe('conversation client: paused completion', () => {
+  it('retains the playback obligation across pause and acknowledges only on resume drain', async () => {
+    const h = setup();
+    const socket = await connected(h);
+    socket.receive({ type: 'audio', turnId: 2, responseId: 7, seq: 1, audio: 'AAA=', sampleRate: 16000 });
+    socket.receive({ type: 'response_done', turnId: 2, responseId: 7, lastAudioSeq: 1 });
+    h.control().settleFinish('paused');
+    await tick();
+    // Paused: no acknowledgement, and never advertises listening.
+    expect(socket.commands().filter((c) => c.type === 'playback_done')).toHaveLength(0);
+    expect(h.last().phase).toBe('paused');
+    expect(h.last().canResumeAudio).toBe(true);
+
+    // Resume re-establishes the completion waiter; playback_done follows the
+    // genuine drain, carrying the retained responseId/lastSeq.
+    await h.client.resumeAudio();
+    expect(h.last().canResumeAudio).toBe(false);
+    h.control().settleFinish('played');
+    await tick();
+    expect(socket.commands()).toContainEqual({ type: 'playback_done', responseId: 7, lastSeq: 1 });
+    expect(h.last().phase).toBe('listening');
+  });
+});
+
+describe('conversation client: audio availability and independence', () => {
+  it('skips audio/VAD entirely when speech is unavailable but still connects for text', async () => {
+    const h = setup({ speechAvailable: false });
+    await h.client.start();
+    expect(h.audioFactoryCalls()).toBe(0);
+    expect(h.sockets).toHaveLength(1);
+    const socket = h.sockets[0];
+    socket.open();
+    socket.receive(snapshot());
+    await tick();
+    expect(h.last().audioAvailable).toBe(false);
+    expect(h.last().canSendText).toBe(true);
+  });
+
+  it('connects for typed chat while the microphone permission is still pending', async () => {
+    const sockets: FakeSocket[] = [];
+    const { factory } = makeFakeAudio();
+    let releaseAudio!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseAudio = resolve;
+    });
+    const views: ConversationView[] = [];
+    const client = createConversationClient({
+      url: 'wss://local/session',
+      speechAvailable: true,
+      refreshAccess: async () => {},
+      onChange: (view) => views.push(view),
+      audioFactory: async (opts) => {
+        await gate; // an unanswered permission prompt / slow WASM load
+        return factory(opts);
+      },
+      socketFactory: (url) => {
+        const socket = new FakeSocket(url);
+        sockets.push(socket);
+        return socket as unknown as WebSocket;
+      },
+    });
+
+    await client.start();
+    // The connection did not wait for the still-pending microphone.
+    expect(sockets).toHaveLength(1);
+    sockets[0].open();
+    sockets[0].receive({
+      type: 'snapshot',
+      snapshot: { sessionId: 's', mode: 'fixture', phase: 'idle', speechAvailable: true, lastTurnId: 0, messages: [] },
+    });
+    await tick();
+    client.sendText('hello there');
+    expect(sockets[0].commands()).toContainEqual({ type: 'text', turnId: 1, text: 'hello there' });
+
+    releaseAudio();
+    await client.end();
+  });
+});
+
+describe('conversation client: transcript rendering', () => {
+  it('does not re-emit or clone the transcript on audio-only frames after the first', async () => {
+    const h = setup();
+    const socket = await connected(h);
+    socket.receive({ type: 'audio', turnId: 2, responseId: 5, seq: 1, audio: 'AAA=', sampleRate: 16000 });
+    expect(h.last().phase).toBe('speaking');
+    const emissionsAfterFirst = h.views.length;
+
+    socket.receive({ type: 'audio', turnId: 2, responseId: 5, seq: 2, audio: 'AAA=', sampleRate: 16000 });
+    socket.receive({ type: 'audio', turnId: 2, responseId: 5, seq: 3, audio: 'AAA=', sampleRate: 16000 });
+    // No view change was pushed for the audio-only frames...
+    expect(h.views.length).toBe(emissionsAfterFirst);
+    // ...but the audio was still enqueued for playback.
+    expect(h.control().enqueued.map((e) => e.seq)).toEqual([1, 2, 3]);
   });
 });
