@@ -19,9 +19,22 @@ const SESSION_ID = process.env.SESSION_ID ?? 'fixture-session';
 //   MCP           "1" -> report mcp_servers connection metadata on init
 //   TOOL_ERROR    "failed" | "denied" -> emit an errored tool_result
 //   INTERRUPT_NOACK "1" -> ignore control_request (exercise receipt timeout)
+//   INTERRUPT_REJECT "1" -> reply to control_request with a control_response
+//                    error (the process refuses to cancel), then keep emitting
+//                    old-generation output and a late result
+//   INTERRUPT_NO_RESULT "1" -> acknowledge the control_request but never emit a
+//                    terminal result (exercise the settle timeout)
+//   INTERRUPT_LATE_RESULT "1" -> with INTERRUPT_NO_RESULT, additionally emit a
+//                    late old-generation delta + result after LATE_MS, proving
+//                    the harness never attributes it to a replacement turn
+//   LATE_MS        delay before late old-generation output (default 40)
 const REPORT_MCP = process.env.MCP === '1';
 const TOOL_ERROR = process.env.TOOL_ERROR ?? '';
 const INTERRUPT_NOACK = process.env.INTERRUPT_NOACK === '1';
+const INTERRUPT_REJECT = process.env.INTERRUPT_REJECT === '1';
+const INTERRUPT_NO_RESULT = process.env.INTERRUPT_NO_RESULT === '1';
+const INTERRUPT_LATE_RESULT = process.env.INTERRUPT_LATE_RESULT === '1';
+const LATE_MS = Number(process.env.LATE_MS ?? '40');
 
 // Serialize all raw writes through a queue so fragmented byte slices from
 // different emit() calls never interleave.
@@ -172,9 +185,35 @@ async function handleTurn(userText) {
 async function onControlRequest(requestId) {
   if (SCENARIO !== 'interrupt') return;
   if (INTERRUPT_NOACK) return; // never acknowledge -> exercise receipt timeout
+
+  if (INTERRUPT_REJECT) {
+    // The process refuses to cancel. Its generation keeps running: emit a late
+    // delta and a whole-turn result that must never surface or be attributed to
+    // a replacement turn.
+    await emit({ type: 'control_response', response: { subtype: 'error', request_id: requestId, error: 'interrupt refused' } });
+    await streamEvent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'LATE-AFTER-INTERRUPT' } });
+    await streamEvent({ type: 'content_block_stop', index: 0 });
+    await streamEvent({ type: 'message_stop' });
+    await emit({ type: 'result', subtype: 'success', is_error: false, result: 'Old generation answer', session_id: SESSION_ID });
+    return;
+  }
+
   // A late delta arrives from the aborted generation; the harness must fence it.
   await streamEvent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'LATE-AFTER-INTERRUPT' } });
   await emit({ type: 'control_response', response: { subtype: 'success', request_id: requestId } });
+
+  if (INTERRUPT_NO_RESULT) {
+    // Acknowledged, but the turn never terminally settles on its own.
+    if (INTERRUPT_LATE_RESULT) {
+      await new Promise((r) => setTimeout(r, LATE_MS));
+      await streamEvent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'LATE-OLD-GENERATION' } });
+      await streamEvent({ type: 'content_block_stop', index: 0 });
+      await streamEvent({ type: 'message_stop' });
+      await emit({ type: 'result', subtype: 'success', is_error: false, result: 'Old late answer', session_id: SESSION_ID });
+    }
+    return;
+  }
+
   await streamEvent({ type: 'content_block_stop', index: 0 });
   await streamEvent({ type: 'message_stop' });
   await emit({ type: 'result', subtype: 'success', is_error: false, result: 'Partial answer', session_id: SESSION_ID });

@@ -155,6 +155,29 @@ describe('streaming audio ingest (acceptAudio)', () => {
     h.session.close();
     expect(h.session.acceptAudio!(pcm('x'))).toBe(false);
   });
+
+  it('refuses rather than silently dropping frames when the outbound buffer overflows', async () => {
+    const h = await makeHarness();
+    await h.session.startRecognition();
+    // A tight synchronous burst of large frames cannot drain between sends, so
+    // the socket's outbound buffer overflows deterministically.
+    const big = new Uint8Array(5000);
+    let refused = false;
+    for (let i = 0; i < 600; i++) {
+      if (!h.session.acceptAudio!(big)) {
+        refused = true;
+        break;
+      }
+    }
+    // The adapter reported the truth (false) instead of ACKing a frame that
+    // could not be enqueued.
+    expect(refused).toBe(true);
+    expect(h.errors).toContain('speech_buffer_overflow');
+    // Once overflowed/detached it keeps refusing without dereferencing a torn
+    // socket (never throws).
+    expect(() => h.session.acceptAudio!(big)).not.toThrow();
+    expect(h.session.acceptAudio!(big)).toBe(false);
+  });
 });
 
 describe('recognition abort', () => {

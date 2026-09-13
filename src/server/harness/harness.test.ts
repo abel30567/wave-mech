@@ -225,4 +225,73 @@ describe('createHarness', () => {
     await vi.waitFor(() => expect(built.texts()).toContain('Partial answer'));
     await expect(session.interrupt()).rejects.toThrow(/not acknowledged/i);
   });
+
+  it('quarantines after an unacknowledged interrupt so a replacement send is refused', async () => {
+    const built = build('interrupt', { INTERRUPT_NOACK: '1' }, { timeoutMs: 400 });
+    const session = built.session as unknown as { interrupt(): Promise<void> } & typeof built.session;
+    await session.start();
+    const turn = session.send('go');
+    turn.catch(() => undefined);
+    await vi.waitFor(() => expect(built.texts()).toContain('Partial answer'));
+    // A short timeout collides the receipt and turn timers; either way the
+    // interrupt rejects (never resolves as a clean cancel) and quarantines.
+    await expect(session.interrupt()).rejects.toThrow();
+    // The turn itself fails locally rather than resolving as a clean cancel.
+    await expect(turn).rejects.toThrow();
+    // A replacement send must not lift the fence over possibly-live generation.
+    await expect(session.send('replacement')).rejects.toThrow(/quarantined/i);
+  });
+
+  it('rejects and quarantines when an acknowledged interrupt never settles the turn (ACK / no result)', async () => {
+    const built = build('interrupt', { INTERRUPT_NO_RESULT: '1' }, { timeoutMs: 500 });
+    const session = built.session as unknown as { interrupt(): Promise<void> } & typeof built.session;
+    await session.start();
+    const turn = session.send('go');
+    turn.catch(() => undefined);
+    await vi.waitFor(() => expect(built.texts()).toContain('Partial answer'));
+    // Acknowledged but no terminal result: a local settle timeout is not proven
+    // cancellation, so the interrupt rejects rather than resolving as success.
+    await expect(session.interrupt()).rejects.toThrow();
+    await expect(turn).rejects.toThrow();
+    // The fence stays raised: the fixture's post-ACK delta never surfaces.
+    expect(built.texts()).not.toContain('LATE-AFTER-INTERRUPT');
+    await expect(session.send('replacement')).rejects.toThrow(/quarantined/i);
+  });
+
+  it('rejects, fences, and quarantines when the process explicitly refuses the interrupt', async () => {
+    const built = build('interrupt', { INTERRUPT_REJECT: '1' }, { timeoutMs: 2000 });
+    const session = built.session as unknown as { interrupt(): Promise<void> } & typeof built.session;
+    await session.start();
+    const turn = session.send('go');
+    turn.catch(() => undefined);
+    await vi.waitFor(() => expect(built.texts()).toContain('Partial answer'));
+    // The refusal rejects the interrupt and the turn; the late old-generation
+    // result must NOT resolve the turn as a clean completion.
+    await expect(session.interrupt()).rejects.toThrow(/interrupt refused/i);
+    await expect(turn).rejects.toThrow(/interrupt refused/i);
+    // Give the fixture's late old-generation output time to arrive over stdout.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(built.texts()).not.toContain('LATE-AFTER-INTERRUPT');
+    await expect(session.send('replacement')).rejects.toThrow(/quarantined/i);
+  });
+
+  it('never surfaces late old-generation deltas after an unconfirmed interrupt', async () => {
+    // ACK arrives, then the settle timeout quarantines before the deferred late
+    // result would arrive: no old-generation text or result may resurface.
+    const built = build(
+      'interrupt',
+      { INTERRUPT_NO_RESULT: '1', INTERRUPT_LATE_RESULT: '1', LATE_MS: '400' },
+      { timeoutMs: 250 },
+    );
+    const session = built.session as unknown as { interrupt(): Promise<void> } & typeof built.session;
+    await session.start();
+    const turn = session.send('go');
+    turn.catch(() => undefined);
+    await vi.waitFor(() => expect(built.texts()).toContain('Partial answer'));
+    await expect(session.interrupt()).rejects.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    expect(built.texts()).not.toContain('LATE-AFTER-INTERRUPT');
+    expect(built.texts()).not.toContain('LATE-OLD-GENERATION');
+    await expect(session.send('replacement')).rejects.toThrow(/quarantined/i);
+  });
 });

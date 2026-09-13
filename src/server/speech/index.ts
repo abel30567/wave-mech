@@ -243,14 +243,20 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
    * cannot enqueue.
    */
   const acceptAudio = (pcm: Uint8Array): boolean => {
-    if (closed || !stt || !stt.isActive) return false;
+    // Bind the active socket locally: a flush below can overflow and detach the
+    // socket mid-call, and we must never dereference a torn-down `stt`.
+    const socket = stt;
+    if (closed || !socket || !socket.isActive) return false;
     if (pendingCommit) return false;
     if (!pcm || !pcm.byteLength) return false;
-    if (stt.overflowed) return false;
+    if (socket.overflowed) return false;
     if (acceptedBytes + pcm.byteLength > MAX_RECOGNITION_BYTES) return false;
     // Flush the previously held frame; hold the current one for the commit.
-    if (lastAudio) stt.send(sttChunkFrame(Buffer.from(lastAudio).toString('base64')));
-    if (stt.overflowed) return false; // the flush just overflowed the socket
+    if (lastAudio) socket.send(sttChunkFrame(Buffer.from(lastAudio).toString('base64')));
+    // The flush may have overflowed the socket or detached it via onFailure. Do
+    // not claim the current frame was accepted when it could not be enqueued —
+    // a truthful false lets the coordinator withhold the ACK and ask for a repeat.
+    if (socket.overflowed || stt !== socket) return false;
     lastAudio = new Uint8Array(pcm);
     acceptedBytes += pcm.byteLength;
     return true;
