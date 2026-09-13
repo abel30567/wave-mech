@@ -1,14 +1,15 @@
 # wave-mech development
 
-A Linux-compatible web application: browser microphone → ElevenLabs STT → persistent Claude Code CLI → ElevenLabs TTS → playback. P1 has manual turns and typed fallback, not barge-in or reconnect/resume. No direct inference APIs. Keep long-lived credentials out of source, browser, model context and logs. Consequential tools stay disabled.
+A Linux-compatible web application: browser microphone → ElevenLabs STT → persistent Claude Code CLI → ElevenLabs TTS → playback. P1 is the existing manual-turn baseline. The approved P2 work adds hands-free foreground conversation, mobile recovery and explicit read-only tools. Read `docs/p2-worker-contract.md` and the shared realtime contracts before implementing P2. No direct inference APIs. Keep long-lived credentials out of source, browser, model context and logs. Consequential tools and skill creation stay disabled.
 
 ## Working agreement
 
 - Use the pinned Node version and `npm ci`. Commands: `npm run check`, `npm test`, `npm run build`; browser tests are added by the integrator.
 - Implement the assigned feature AND its tests in the same job. Do not weaken shared tests/configuration or add a new orchestration platform.
 - Work only in your assigned directories. Shared contracts are in `src/shared/contracts.ts`; request changes rather than editing that file or package/lock/CI files.
-- Main session owns the server entry/coordinator, UI shell, secure token broker, shared contracts and combined browser test.
-- Harness worker owns `src/server/harness/`; audio worker owns `src/server/speech/` and `src/client/audio/`. Keep unit tests and fixtures within owned directories.
+- Main session owns server entry/registry, UI shell, credential integration, dependencies/assets, shared contracts and combined browser tests.
+- P2 client worker owns `src/client/realtime/`; P2 server worker owns `src/server/realtime/`, `src/server/harness/` and `src/server/speech/`; security worker owns `src/server/security/`. Keep tests/fixtures in owned directories. Do not edit another worker's files.
+- The legacy adapter interfaces below remain compatible during integration; new exports and authoritative P2 semantics are in `docs/p2-worker-contract.md`.
 - Use `.js` import specifiers in Node TypeScript source. Keep code strict-TypeScript compatible. Browser worklets must bundle with Vite (use `?worker&url` or a verified equivalent).
 - No production credentials or authenticated external actions for synthetic tests. Use fixture subprocesses, local WebSockets, and synthetic PCM.
 - General fleet model: claude-opus-4-8 or grok-4.6; security-specific fleet work: claude-opus-4-6. Verify actual model rather than silently substituting.

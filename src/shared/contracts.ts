@@ -1,7 +1,7 @@
 export type HarnessEvent =
-  | { type: 'ready'; sessionId?: string; tools?: string[] }
+  | { type: 'ready'; sessionId?: string; tools?: string[]; mcp?: Array<{ name: string; status: string }> }
   | { type: 'text'; text: string }
-  | { type: 'tool'; name: string; status: 'running' | 'done' }
+  | { type: 'tool'; name: string; status: 'running' | 'done' | 'failed' | 'denied' }
   | { type: 'error'; message: string };
 
 export interface HarnessOptions {
@@ -16,6 +16,7 @@ export interface HarnessOptions {
 export interface HarnessSession {
   start(): Promise<void>;
   send(text: string): Promise<void>;
+  interrupt?(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -34,6 +35,9 @@ export interface SpeechOptions {
 export interface SpeechSession {
   startRecognition(): Promise<void>;
   writeAudio(pcm: Uint8Array): void;
+  acceptAudio?(pcm: Uint8Array): boolean;
+  abortRecognition?(): void;
+  cancelSpeech?(): void;
   commitRecognition(): Promise<string>;
   writeText(text: string): void;
   finishSpeech(): Promise<void>;
@@ -65,7 +69,7 @@ export type ServerMessage =
   | { type: 'user'; text: string }
   | { type: 'text'; text: string }
   | { type: 'audio'; audio: string; sampleRate: number }
-  | { type: 'tool'; name: string; status: 'running' | 'done' }
+  | { type: 'tool'; name: string; status: 'running' | 'done' | 'failed' | 'denied' }
   | { type: 'response_done' }
   | { type: 'idle' }
   | { type: 'error'; message: string; fatal?: boolean }

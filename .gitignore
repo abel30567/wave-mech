@@ -12,6 +12,7 @@
 # Generated files
 node_modules/
 dist/
+/public/vad/
 coverage/
 playwright-report/
 test-results/
