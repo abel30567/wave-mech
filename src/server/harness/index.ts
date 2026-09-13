@@ -33,6 +33,11 @@ const DEFAULT_ARGS = [
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const CLOSE_GRACE_MS = 2_000;
+// Bounded receipt window for a control_request. The CLI acknowledges an
+// interrupt with a control_response well before the aborted turn settles, so a
+// missing acknowledgement means the control channel — not just the turn — is
+// unhealthy and cancellation must be reported as failed rather than assumed.
+const INTERRUPT_RECEIPT_MS = 5_000;
 
 /** Loose view of a CLI NDJSON line. The concrete schema is owned by the CLI. */
 interface CliMessage {
@@ -40,12 +45,25 @@ interface CliMessage {
   subtype?: string;
   session_id?: string;
   tools?: unknown;
+  mcp_servers?: unknown;
   parent_tool_use_id?: string | null;
   event?: CliStreamEvent;
   message?: { role?: string; content?: unknown };
+  request_id?: string;
+  response?: { subtype?: string; request_id?: string; error?: unknown };
   is_error?: boolean;
   error?: unknown;
   result?: unknown;
+}
+
+interface PendingInterrupt {
+  requestId: string;
+  resolve: () => void;
+  reject: (error: Error) => void;
+  receiptTimer: NodeJS.Timeout | undefined;
+  settleTimer: NodeJS.Timeout | undefined;
+  received: boolean;
+  settled: boolean;
 }
 
 interface CliStreamEvent {
@@ -77,6 +95,16 @@ class ClaudeCliHarness implements HarnessSession {
   private ready = false;
 
   private pending: Pending | undefined;
+
+  /** Outstanding CLI control_request interrupt, if any. */
+  private pendingInterrupt: PendingInterrupt | undefined;
+  private controlSeq = 0;
+  /**
+   * Generation fence: while an interrupt is settling, streamed text/tool events
+   * belong to the turn being cancelled and must not surface. Reset when a new
+   * turn is admitted so the replacement generation streams normally.
+   */
+  private suppressStream = false;
 
   private closePromise: Promise<void> | undefined;
   private closeResolve: (() => void) | undefined;
@@ -177,8 +205,10 @@ class ClaudeCliHarness implements HarnessSession {
       if (typeof timer.unref === 'function') timer.unref();
       this.pending = { resolve, reject, timer, settled: false };
 
-      // Reset per-turn parsing state so a prior turn cannot leak indices.
+      // Reset per-turn parsing state so a prior turn cannot leak indices, and
+      // lift any interrupt fence so this fresh generation streams normally.
       this.blockTypes.clear();
+      this.suppressStream = false;
 
       const line = JSON.stringify({
         type: 'user',
@@ -193,6 +223,65 @@ class ClaudeCliHarness implements HarnessSession {
     });
   }
 
+  /**
+   * Interrupt the in-flight turn using the CLI's supported streaming
+   * `control_request` interrupt. Cancellation is only real once the CLI both
+   * acknowledges the request (bounded receipt) and settles the whole turn;
+   * rejecting the local send Promise alone would leave the model generating.
+   * With no active inference there is nothing to cancel, so it resolves.
+   */
+  interrupt(): Promise<void> {
+    if (this.closing) return Promise.resolve();
+    if (!this.child || !this.ready) return Promise.resolve();
+    if (!this.pending) return Promise.resolve();
+    if (this.pendingInterrupt) return Promise.resolve();
+
+    // Fence the generation being cancelled: any text/tool events that arrive
+    // between now and settlement belong to the aborted turn.
+    this.suppressStream = true;
+    const requestId = `interrupt-${++this.controlSeq}`;
+
+    return new Promise<void>((resolve, reject) => {
+      const interrupt: PendingInterrupt = {
+        requestId,
+        resolve,
+        reject,
+        receiptTimer: undefined,
+        settleTimer: undefined,
+        received: false,
+        settled: false,
+      };
+      this.pendingInterrupt = interrupt;
+
+      interrupt.receiptTimer = setTimeout(() => {
+        if (interrupt.received) return;
+        this.settleInterrupt(
+          interrupt,
+          new Error('Harness interrupt was not acknowledged before the timeout.'),
+        );
+      }, Math.min(INTERRUPT_RECEIPT_MS, this.timeoutMs));
+      if (typeof interrupt.receiptTimer.unref === 'function') interrupt.receiptTimer.unref();
+
+      interrupt.settleTimer = setTimeout(() => {
+        // Acknowledged but the turn never settled: force the pending turn to
+        // fail so we never continue past an unconfirmed settlement.
+        this.failPending(new Error('Harness interrupt did not settle the turn before the timeout.'));
+      }, this.timeoutMs);
+      if (typeof interrupt.settleTimer.unref === 'function') interrupt.settleTimer.unref();
+
+      const line = JSON.stringify({
+        type: 'control_request',
+        request_id: requestId,
+        request: { subtype: 'interrupt' },
+      });
+      this.child?.stdin?.write(`${line}\n`, (error) => {
+        if (error) {
+          this.settleInterrupt(interrupt, new Error('Failed to write interrupt to harness process.'));
+        }
+      });
+    });
+  }
+
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
@@ -203,6 +292,9 @@ class ClaudeCliHarness implements HarnessSession {
       // Settle any outstanding start/turn work first.
       this.settleStart(new Error('Harness closed before it became ready.'));
       this.failPending(new Error('Harness closed before the turn completed.'));
+      if (this.pendingInterrupt) {
+        this.settleInterrupt(this.pendingInterrupt, new Error('Harness closed before the interrupt settled.'));
+      }
 
       const child = this.child;
       if (!child || child.exitCode !== null || child.signalCode !== null) {
@@ -268,6 +360,9 @@ class ClaudeCliHarness implements HarnessSession {
       case 'assistant':
         // Completed assistant message duplicates already-streamed deltas.
         return;
+      case 'control_response':
+        this.handleControlResponse(msg);
+        return;
       case 'result':
         this.handleResult(msg);
         return;
@@ -284,16 +379,59 @@ class ClaudeCliHarness implements HarnessSession {
     const tools = Array.isArray(msg.tools)
       ? msg.tools.filter((t): t is string => typeof t === 'string')
       : undefined;
+    const mcp = this.readMcpServers(msg.mcp_servers);
     const event: HarnessEvent = { type: 'ready' };
     if (typeof msg.session_id === 'string') event.sessionId = msg.session_id;
     if (tools) event.tools = tools;
+    if (mcp) event.mcp = mcp;
     this.emit(event);
     this.settleStart(undefined);
+  }
+
+  /** Extract MCP connection metadata from system/init when the CLI reports it. */
+  private readMcpServers(value: unknown): Array<{ name: string; status: string }> | undefined {
+    if (!Array.isArray(value)) return undefined;
+    const servers: Array<{ name: string; status: string }> = [];
+    for (const entry of value) {
+      if (entry && typeof entry === 'object') {
+        const name = (entry as { name?: unknown }).name;
+        const status = (entry as { status?: unknown }).status;
+        if (typeof name === 'string') {
+          servers.push({ name, status: typeof status === 'string' ? status : 'unknown' });
+        }
+      }
+    }
+    return servers.length > 0 ? servers : undefined;
+  }
+
+  private handleControlResponse(msg: CliMessage): void {
+    const interrupt = this.pendingInterrupt;
+    if (!interrupt) return;
+    const response = msg.response;
+    const requestId = response?.request_id ?? msg.request_id;
+    if (requestId !== interrupt.requestId) return;
+    interrupt.received = true;
+    if (interrupt.receiptTimer) {
+      clearTimeout(interrupt.receiptTimer);
+      interrupt.receiptTimer = undefined;
+    }
+    if (response?.subtype === 'error') {
+      const message = typeof response.error === 'string' ? response.error : 'Harness rejected the interrupt.';
+      this.settleInterrupt(interrupt, new Error(message));
+      this.failPending(new Error(message));
+      return;
+    }
+    // Acknowledged. The turn still has to settle; that settlement (or the
+    // bounded settle timer) is what finally resolves the interrupt.
+    if (!this.pending) this.settleInterrupt(interrupt, undefined);
   }
 
   private handleStreamEvent(msg: CliMessage): void {
     // Ignore anything originating from a nested sub-agent turn.
     if (msg.parent_tool_use_id != null) return;
+    // Fence a generation that is being interrupted: its late deltas belong to
+    // the aborted turn, not to any replacement.
+    if (this.suppressStream) return;
     const ev = msg.event;
     if (!ev) return;
 
@@ -346,7 +484,12 @@ class ClaudeCliHarness implements HarnessSession {
         if (typeof id === 'string') {
           const name = this.toolNames.get(id) ?? 'tool';
           this.toolNames.delete(id);
-          this.emit({ type: 'tool', name, status: 'done' });
+          // An errored tool result is a failure — a denial when the CLI/hook
+          // blocked it — never a successful `done`.
+          const status = (block as { is_error?: unknown }).is_error === true
+            ? (this.isDenial(block) ? 'denied' : 'failed')
+            : 'done';
+          this.emit({ type: 'tool', name, status });
         }
       }
     }
@@ -366,6 +509,17 @@ class ClaudeCliHarness implements HarnessSession {
     const message = this.readMessage(msg) ?? 'Harness reported an error.';
     this.emit({ type: 'error', message });
     this.failPending(new Error(message));
+  }
+
+  /** Recognize a permission/policy denial in an errored tool result's content. */
+  private isDenial(block: unknown): boolean {
+    const content = (block as { content?: unknown }).content;
+    const text = typeof content === 'string'
+      ? content
+      : Array.isArray(content)
+        ? content.map((c) => (c && typeof c === 'object' ? String((c as { text?: unknown }).text ?? '') : '')).join(' ')
+        : '';
+    return /\b(denied|permission|not allowed|blocked)\b/i.test(text);
   }
 
   private readMessage(msg: CliMessage): string | undefined {
@@ -406,6 +560,8 @@ class ClaudeCliHarness implements HarnessSession {
     pending.settled = true;
     if (pending.timer) clearTimeout(pending.timer);
     this.pending = undefined;
+    // A turn that finishes on its own also completes a pending interrupt.
+    if (this.pendingInterrupt) this.settleInterrupt(this.pendingInterrupt, undefined);
     pending.resolve();
   }
 
@@ -415,7 +571,20 @@ class ClaudeCliHarness implements HarnessSession {
     pending.settled = true;
     if (pending.timer) clearTimeout(pending.timer);
     this.pending = undefined;
+    // The aborted turn has settled: the interrupt is complete.
+    if (this.pendingInterrupt) this.settleInterrupt(this.pendingInterrupt, undefined);
     pending.reject(error);
+  }
+
+  /** Resolve or reject an outstanding interrupt exactly once, clearing timers. */
+  private settleInterrupt(interrupt: PendingInterrupt, error: Error | undefined): void {
+    if (interrupt.settled) return;
+    interrupt.settled = true;
+    if (interrupt.receiptTimer) clearTimeout(interrupt.receiptTimer);
+    if (interrupt.settleTimer) clearTimeout(interrupt.settleTimer);
+    if (this.pendingInterrupt === interrupt) this.pendingInterrupt = undefined;
+    if (error) interrupt.reject(error);
+    else interrupt.resolve();
   }
 
   private settleStart(error: Error | undefined): void {
