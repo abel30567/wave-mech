@@ -21,6 +21,9 @@ import { createLiveProvider, type LiveProvider, type SidebandHandle } from './pr
 
 const MAX_TRANSCRIPT_ENTRIES = 500;
 const CLOSURE_TIMEOUT_MS = 15_000;
+const MAX_DELEGATION_QUEUE = 10;
+const DELEGATION_INPUT_TIMEOUT_MS = 3_000;
+const MAX_COMMENTARY_CHUNK_BYTES = 500;
 
 export type HarnessFactory = (options: HarnessOptions) => HarnessSession;
 
@@ -56,6 +59,9 @@ interface ActiveTrialSession {
   pendingDelegation: string | null;
   delegationQueue: string[];
   processedDelegationIds: Set<string>;
+  pendingResult: string | null;
+  sendSettling: boolean;
+  inputWaiters: Array<() => void>;
   transcript: GptLiveTranscriptEntry[];
   cumulativeVoiceSeconds: number;
   connectedTimeEstimate: number;
@@ -240,6 +246,9 @@ export class GptLiveManager {
         pendingDelegation: null,
         delegationQueue: [],
         processedDelegationIds: new Set(),
+        pendingResult: null,
+        sendSettling: false,
+        inputWaiters: [],
         transcript: [],
         cumulativeVoiceSeconds: 0,
         connectedTimeEstimate: 0,
@@ -373,12 +382,8 @@ export class GptLiveManager {
   private handleHarnessResult(sessionId: string, text: string): void {
     if (!this.active || this.active.sessionId !== sessionId) return;
     const session = this.active;
-    if (!session.pendingDelegation || !session.provider) return;
-
-    const commentary = text.slice(0, 500);
-    session.provider.sendCommentary(commentary, session.pendingDelegation);
-    session.pendingDelegation = null;
-    void this.drainDelegationQueue(sessionId);
+    if (!session.pendingDelegation) return;
+    session.pendingResult = text;
   }
 
   private pushTranscript(session: ActiveTrialSession, entry: GptLiveTranscriptEntry): void {
@@ -389,16 +394,17 @@ export class GptLiveManager {
   }
 
   handleDelegationCreated(delegationId: string, offsetMs: number): void {
-    if (!this.active) return;
+    if (!this.active || this.active.closing) return;
     const session = this.active;
 
     if (session.processedDelegationIds.has(delegationId)) return;
+    if (session.processedDelegationIds.size > 1000) return;
     session.processedDelegationIds.add(delegationId);
 
     session.callbacks.onDelegationCreated(delegationId, offsetMs);
 
-    if (session.pendingDelegation) {
-      if (session.delegationQueue.length < 10) {
+    if (session.pendingDelegation || session.sendSettling) {
+      if (session.delegationQueue.length < MAX_DELEGATION_QUEUE) {
         session.delegationQueue.push(delegationId);
       }
       return;
@@ -411,19 +417,25 @@ export class GptLiveManager {
   private async drainDelegationQueue(sessionId: string): Promise<void> {
     if (!this.active || this.active.sessionId !== sessionId) return;
     const session = this.active;
+    if (session.closing) return;
 
-    const next = session.delegationQueue.shift();
-    if (!next) return;
-
-    session.pendingDelegation = next;
-    void this.processDelegation(sessionId, next);
+    while (session.delegationQueue.length > 0) {
+      const next = session.delegationQueue.shift()!;
+      if (session.processedDelegationIds.has(next) && session.pendingResult !== null) {
+        continue;
+      }
+      session.pendingDelegation = next;
+      await this.processDelegation(sessionId, next);
+      return;
+    }
+    session.pendingDelegation = null;
   }
 
   private async processDelegation(sessionId: string, delegationId: string): Promise<void> {
     if (!this.active || this.active.sessionId !== sessionId) return;
     const session = this.active;
 
-    if (!session.harness || !session.harnessReady) {
+    if (!session.harness || !session.harnessReady || session.closing) {
       session.pendingDelegation = null;
       void this.drainDelegationQueue(sessionId);
       return;
@@ -432,9 +444,8 @@ export class GptLiveManager {
     let userContext = this.assembleUserContext(session);
 
     if (!userContext) {
-      await new Promise(resolve => setTimeout(resolve, 500));
-      if (!this.active || this.active.sessionId !== sessionId) return;
-      userContext = this.assembleUserContext(session);
+      userContext = await this.waitForInput(session, DELEGATION_INPUT_TIMEOUT_MS);
+      if (!this.active || this.active.sessionId !== sessionId || session.closing) return;
     }
 
     if (!userContext) {
@@ -450,32 +461,101 @@ export class GptLiveManager {
       );
     }
 
+    session.sendSettling = true;
+    session.pendingResult = null;
     try {
       await session.harness.send(userContext);
-    } catch {
-      session.callbacks.onError('Backend delegation processing failed.');
+    } catch (err) {
+      session.sendSettling = false;
+      try { session.callbacks.onError('Backend delegation processing failed.'); } catch { /* safe */ }
       session.pendingDelegation = null;
       void this.drainDelegationQueue(sessionId);
+      return;
     }
+
+    // send() resolved — the turn is complete. Deliver stored result as commentary.
+    session.sendSettling = false;
+    if (!this.active || this.active.sessionId !== sessionId) return;
+    const resultText = session.pendingResult;
+    session.pendingResult = null;
+
+    if (resultText && session.provider && session.pendingDelegation) {
+      try {
+        this.sendChunkedCommentary(session.provider, resultText, session.pendingDelegation);
+      } catch { /* provider send error is non-fatal */ }
+    }
+
+    session.pendingDelegation = null;
+    void this.drainDelegationQueue(sessionId);
+  }
+
+  private sendChunkedCommentary(provider: LiveProvider, text: string, delegationId: string): void {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const chunks = splitUtf8Chunks(trimmed, MAX_COMMENTARY_CHUNK_BYTES);
+    for (const chunk of chunks) {
+      provider.sendCommentary(chunk, delegationId);
+    }
+  }
+
+  private waitForInput(session: ActiveTrialSession, timeoutMs: number): Promise<string> {
+    const existing = this.assembleUserContext(session);
+    if (existing) return Promise.resolve(existing);
+
+    return new Promise<string>((resolve) => {
+      let resolved = false;
+      const timer = setTimeout(() => {
+        if (resolved) return;
+        resolved = true;
+        const idx = session.inputWaiters.indexOf(notify);
+        if (idx >= 0) session.inputWaiters.splice(idx, 1);
+        resolve(this.assembleUserContext(session));
+      }, timeoutMs);
+      if (typeof timer.unref === 'function') timer.unref();
+
+      const notify = () => {
+        if (resolved) return;
+        const ctx = this.assembleUserContext(session);
+        if (!ctx) return;
+        resolved = true;
+        clearTimeout(timer);
+        const idx = session.inputWaiters.indexOf(notify);
+        if (idx >= 0) session.inputWaiters.splice(idx, 1);
+        resolve(ctx);
+      };
+      session.inputWaiters.push(notify);
+    });
   }
 
   private assembleUserContext(session: ActiveTrialSession): string {
     const userEntries = session.transcript.filter(t => t.role === 'user');
-    const recent = userEntries.slice(-5);
-    const text = recent.map(t => t.text).join(' ').trim();
+    if (userEntries.length === 0) return '';
+    const parts: string[] = [];
+    let byteLen = 0;
+    for (let i = userEntries.length - 1; i >= 0 && byteLen < 2000; i--) {
+      const t = userEntries[i].text;
+      if (!t) continue;
+      parts.unshift(t);
+      byteLen += Buffer.byteLength(t, 'utf8');
+    }
+    const text = parts.join('').trim();
     return text.length > 2000 ? text.slice(-2000) : text;
   }
 
   handleInputTranscript(delta: string): void {
     if (!this.active) return;
+    const session = this.active;
     const entry: GptLiveTranscriptEntry = {
       role: 'user',
       text: delta,
       source: 'voice-model',
       timestampMs: Date.now(),
     };
-    this.pushTranscript(this.active, entry);
-    this.active.callbacks.onTranscriptDelta(entry);
+    this.pushTranscript(session, entry);
+    session.callbacks.onTranscriptDelta(entry);
+    for (const waiter of session.inputWaiters.slice()) {
+      try { waiter(); } catch { /* safe */ }
+    }
   }
 
   handleOutputTranscript(delta: string): void {
@@ -611,6 +691,22 @@ function sanitizeErrorMessage(message: string): string {
     if (pattern.test(message)) return safeMessage;
   }
   return 'Session creation failed.';
+}
+
+export function splitUtf8Chunks(text: string, maxBytes: number): string[] {
+  const buf = Buffer.from(text, 'utf8');
+  if (buf.length <= maxBytes) return [text];
+  const chunks: string[] = [];
+  let offset = 0;
+  while (offset < buf.length) {
+    let end = Math.min(offset + maxBytes, buf.length);
+    // Don't split inside a multi-byte UTF-8 character: back up to a leading byte.
+    while (end > offset && (buf[end] & 0xc0) === 0x80) end--;
+    if (end === offset) end = Math.min(offset + maxBytes, buf.length);
+    chunks.push(buf.subarray(offset, end).toString('utf8'));
+    offset = end;
+  }
+  return chunks;
 }
 
 export function createGptLiveManager(
