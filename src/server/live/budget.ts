@@ -1,7 +1,7 @@
 import { readFile, writeFile, rename, mkdir } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
-import { GPT_LIVE_MAX_BUDGET_USD, GPT_LIVE_PRICE_PER_MINUTE } from '../../shared/gpt-live-trial.js';
+import { GPT_LIVE_MAX_BUDGET_USD, GPT_LIVE_MAX_SESSION_SECONDS, GPT_LIVE_PRICE_PER_MINUTE } from '../../shared/gpt-live-trial.js';
 
 export interface BudgetLedger {
   cumulativeUsageUsd: number;
@@ -19,6 +19,10 @@ export interface BudgetReservation {
   closureConfirmed: boolean;
 }
 
+function isFiniteNonNegative(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
 function emptyLedger(): BudgetLedger {
   return {
     cumulativeUsageUsd: 0,
@@ -30,6 +34,7 @@ function emptyLedger(): BudgetLedger {
 export class GptLiveBudget {
   private ledger: BudgetLedger;
   private readonly budgetCapUsd: number;
+  private corrupt = false;
 
   constructor(
     private readonly filePath: string,
@@ -43,8 +48,19 @@ export class GptLiveBudget {
     try {
       const content = await readFile(this.filePath, 'utf8');
       const parsed = JSON.parse(content) as BudgetLedger;
-      if (typeof parsed.cumulativeUsageUsd !== 'number' || !Array.isArray(parsed.reservations)) {
+      if (!isFiniteNonNegative(parsed.cumulativeUsageUsd) || !Array.isArray(parsed.reservations)) {
+        this.corrupt = true;
         throw new Error('Invalid budget ledger format.');
+      }
+      for (const r of parsed.reservations) {
+        if (!isFiniteNonNegative(r.reservedUsd)) {
+          this.corrupt = true;
+          throw new Error('Corrupt reservation in budget ledger.');
+        }
+        if (r.actualUsd !== null && !isFiniteNonNegative(r.actualUsd)) {
+          this.corrupt = true;
+          throw new Error('Corrupt actual usage in budget ledger.');
+        }
       }
       this.ledger = parsed;
     } catch (error) {
@@ -59,8 +75,9 @@ export class GptLiveBudget {
   reconcileOrphans(): number {
     let orphanCount = 0;
     for (const reservation of this.ledger.reservations) {
-      if (!reservation.finalized && !reservation.closureConfirmed) {
+      if (!reservation.finalized) {
         reservation.finalized = true;
+        reservation.closureConfirmed = false;
         reservation.actualUsd = reservation.reservedUsd;
         this.ledger.cumulativeUsageUsd += reservation.reservedUsd;
         orphanCount++;
@@ -72,7 +89,13 @@ export class GptLiveBudget {
     return orphanCount;
   }
 
+  get hasUncertainClosure(): boolean {
+    if (this.corrupt) return true;
+    return this.ledger.reservations.some(r => r.finalized && !r.closureConfirmed);
+  }
+
   canReserve(durationSeconds: number): boolean {
+    if (this.hasUncertainClosure) return false;
     const cost = (durationSeconds / 60) * GPT_LIVE_PRICE_PER_MINUTE;
     const pendingReservations = this.ledger.reservations
       .filter(r => !r.finalized)
@@ -112,20 +135,44 @@ export class GptLiveBudget {
     );
     if (!reservation) return;
 
-    const actualCost = (voiceSeconds / 60) * GPT_LIVE_PRICE_PER_MINUTE;
-    reservation.actualUsd = actualCost;
-    reservation.finalized = true;
-    reservation.closureConfirmed = closureConfirmed;
+    const validSeconds = isFiniteNonNegative(voiceSeconds)
+      && voiceSeconds <= GPT_LIVE_MAX_SESSION_SECONDS;
 
-    if (closureConfirmed) {
+    reservation.finalized = true;
+
+    if (closureConfirmed && validSeconds) {
+      const actualCost = (voiceSeconds / 60) * GPT_LIVE_PRICE_PER_MINUTE;
+      reservation.actualUsd = actualCost;
+      reservation.closureConfirmed = true;
       this.ledger.cumulativeUsageUsd += actualCost;
     } else {
+      reservation.actualUsd = reservation.reservedUsd;
+      reservation.closureConfirmed = false;
       this.ledger.cumulativeUsageUsd += reservation.reservedUsd;
     }
     this.ledger.lastUpdated = new Date().toISOString();
   }
 
+  confirmClosure(sessionId: string, voiceSeconds: number): boolean {
+    const reservation = this.ledger.reservations.find(
+      r => r.sessionId === sessionId && r.finalized && !r.closureConfirmed,
+    );
+    if (!reservation) return false;
+    if (!isFiniteNonNegative(voiceSeconds) || voiceSeconds > GPT_LIVE_MAX_SESSION_SECONDS) {
+      return false;
+    }
+    const actualCost = (voiceSeconds / 60) * GPT_LIVE_PRICE_PER_MINUTE;
+    const previousCharge = reservation.actualUsd ?? reservation.reservedUsd;
+    this.ledger.cumulativeUsageUsd -= previousCharge;
+    this.ledger.cumulativeUsageUsd += actualCost;
+    reservation.actualUsd = actualCost;
+    reservation.closureConfirmed = true;
+    this.ledger.lastUpdated = new Date().toISOString();
+    return true;
+  }
+
   get remainingUsd(): number {
+    if (this.hasUncertainClosure) return 0;
     const pendingReservations = this.ledger.reservations
       .filter(r => !r.finalized)
       .reduce((sum, r) => sum + r.reservedUsd, 0);

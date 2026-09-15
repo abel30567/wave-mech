@@ -13,6 +13,7 @@ export interface HarnessOptions {
   env?: Record<string, string | undefined>;
   timeoutMs?: number;
   onEvent(event: HarnessEvent): void;
+  onResult?(text: string): void;
 }
 
 export interface HarnessSession {

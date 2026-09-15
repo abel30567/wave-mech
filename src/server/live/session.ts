@@ -3,7 +3,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import type { HarnessEvent, HarnessOptions } from '../../shared/contracts.js';
+import type { HarnessEvent, HarnessOptions, HarnessSession } from '../../shared/contracts.js';
 import {
   GPT_LIVE_VOICE_MODEL,
   GPT_LIVE_BACKEND_MODEL,
@@ -22,6 +22,8 @@ import { createLiveProvider, type LiveProvider, type SidebandHandle } from './pr
 const MAX_TRANSCRIPT_ENTRIES = 500;
 const CLOSURE_TIMEOUT_MS = 15_000;
 
+export type HarnessFactory = (options: HarnessOptions) => HarnessSession;
+
 export interface GptLiveManagerOptions {
   enabled: boolean;
   apiKeyFile: string;
@@ -31,6 +33,7 @@ export interface GptLiveManagerOptions {
   configuredModel: string;
   nodeExecutable: string;
   providerFactory?: (apiKey: string) => LiveProvider;
+  harnessFactory?: HarnessFactory;
 }
 
 export interface GptLiveSessionCallbacks {
@@ -122,7 +125,7 @@ export class GptLiveManager {
   }
 
   get hasActiveSession(): boolean {
-    return this.active !== null;
+    return this.active !== null || this.slotTaken;
   }
 
   validateSessionRequest(ownerId: string, sdp: string): string | null {
@@ -169,6 +172,7 @@ export class GptLiveManager {
         command: process.env.WAVE_CLAUDE_BIN ?? 'claude',
         env: harnessEnvironmentOverrides(),
         onEvent: (event: HarnessEvent) => this.handleHarnessEvent(sessionId, event),
+        onResult: (text: string) => this.handleHarnessResult(sessionId, text),
         args: [
           '-p', '--model', this.options.configuredModel,
           '--input-format', 'stream-json', '--output-format', 'stream-json',
@@ -191,7 +195,8 @@ export class GptLiveManager {
         cwd: workspace,
       };
 
-      harness = createHarness(harnessOptions);
+      const makeHarness = this.options.harnessFactory ?? createHarness;
+      harness = makeHarness(harnessOptions);
       await harness.start();
 
       const factory = this.options.providerFactory ?? ((key: string) => createLiveProvider(key));
@@ -291,6 +296,7 @@ export class GptLiveManager {
       );
     } catch {
       session.callbacks.onError('Failed to attach sideband connection.');
+      void this.closeSession(sessionId, 'sideband_failure');
     }
   }
 
@@ -298,7 +304,11 @@ export class GptLiveManager {
     if (!this.active || this.active.sessionId !== sessionId) return;
     const session = this.active;
 
-    session.cumulativeVoiceSeconds = Math.max(session.cumulativeVoiceSeconds, finalSeconds);
+    const validFinalSeconds = typeof finalSeconds === 'number'
+      && Number.isFinite(finalSeconds) && finalSeconds >= 0;
+    if (validFinalSeconds) {
+      session.cumulativeVoiceSeconds = Math.max(session.cumulativeVoiceSeconds, finalSeconds);
+    }
     session.closureConfirmed = true;
     session.closureReason = reason;
 
@@ -307,7 +317,11 @@ export class GptLiveManager {
       session.closureTimer = null;
     }
 
-    this.budget.finalize(sessionId, session.cumulativeVoiceSeconds, true);
+    if (session.closing) {
+      this.budget.confirmClosure(sessionId, session.cumulativeVoiceSeconds);
+    } else {
+      this.budget.finalize(sessionId, session.cumulativeVoiceSeconds, true);
+    }
     void this.budget.save();
 
     void this.finishCleanup(sessionId);
@@ -330,13 +344,6 @@ export class GptLiveManager {
         };
         this.pushTranscript(session, entry);
         session.callbacks.onTranscriptDelta(entry);
-
-        if (session.pendingDelegation && session.provider && event.text.length > 0) {
-          const commentary = event.text.slice(0, 2000);
-          session.provider.sendCommentary(commentary, session.pendingDelegation);
-          session.pendingDelegation = null;
-          void this.drainDelegationQueue(sessionId);
-        }
         break;
       }
       case 'tool':
@@ -351,6 +358,17 @@ export class GptLiveManager {
         session.callbacks.onError('Backend processing encountered an issue.');
         break;
     }
+  }
+
+  private handleHarnessResult(sessionId: string, text: string): void {
+    if (!this.active || this.active.sessionId !== sessionId) return;
+    const session = this.active;
+    if (!session.pendingDelegation || !session.provider) return;
+
+    const commentary = text.slice(0, 500);
+    session.provider.sendCommentary(commentary, session.pendingDelegation);
+    session.pendingDelegation = null;
+    void this.drainDelegationQueue(sessionId);
   }
 
   private pushTranscript(session: ActiveTrialSession, entry: GptLiveTranscriptEntry): void {
@@ -370,7 +388,9 @@ export class GptLiveManager {
     session.callbacks.onDelegationCreated(delegationId, offsetMs);
 
     if (session.pendingDelegation) {
-      session.delegationQueue.push(delegationId);
+      if (session.delegationQueue.length < 10) {
+        session.delegationQueue.push(delegationId);
+      }
       return;
     }
 
@@ -399,12 +419,13 @@ export class GptLiveManager {
       return;
     }
 
-    const userContext = session.transcript
-      .filter(t => t.role === 'user')
-      .slice(-3)
-      .map(t => t.text)
-      .join(' ')
-      .trim();
+    let userContext = this.assembleUserContext(session);
+
+    if (!userContext) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      if (!this.active || this.active.sessionId !== sessionId) return;
+      userContext = this.assembleUserContext(session);
+    }
 
     if (!userContext) {
       session.pendingDelegation = null;
@@ -426,6 +447,13 @@ export class GptLiveManager {
       session.pendingDelegation = null;
       void this.drainDelegationQueue(sessionId);
     }
+  }
+
+  private assembleUserContext(session: ActiveTrialSession): string {
+    const userEntries = session.transcript.filter(t => t.role === 'user');
+    const recent = userEntries.slice(-5);
+    const text = recent.map(t => t.text).join(' ').trim();
+    return text.length > 2000 ? text.slice(-2000) : text;
   }
 
   handleInputTranscript(delta: string): void {
@@ -555,13 +583,23 @@ export class GptLiveManager {
   }
 }
 
+type SafeErrorCategory = 'budget_exhausted' | 'provider_unavailable' | 'session_conflict'
+  | 'invalid_request' | 'not_enabled' | 'internal_error';
+
+const SAFE_ERROR_MAP: Array<[RegExp, SafeErrorCategory, string]> = [
+  [/budget/i, 'budget_exhausted', 'Trial budget exhausted.'],
+  [/not enabled/i, 'not_enabled', 'GPT-Live trial is not enabled.'],
+  [/not configured/i, 'not_enabled', 'GPT-Live API key is not configured.'],
+  [/already active|session is active/i, 'session_conflict', 'A trial session is already active.'],
+  [/another user/i, 'session_conflict', 'Another user owns the active trial session.'],
+  [/invalid.*offer|invalid.*sdp/i, 'invalid_request', 'Invalid session offer.'],
+];
+
 function sanitizeErrorMessage(message: string): string {
-  const redacted = message
-    .replace(/sk-[A-Za-z0-9_-]+/g, '[REDACTED]')
-    .replace(/v=0[\s\S]*?(?=\n\n|\r\n\r\n|$)/g, '[SDP_REDACTED]')
-    .replace(/a=ice-[^\r\n]*/g, '[ICE_REDACTED]')
-    .replace(/Bearer [^\s"]+/g, 'Bearer [REDACTED]');
-  return redacted.length > 200 ? redacted.slice(0, 200) : redacted;
+  for (const [pattern, , safeMessage] of SAFE_ERROR_MAP) {
+    if (pattern.test(message)) return safeMessage;
+  }
+  return 'Session creation failed.';
 }
 
 export function createGptLiveManager(

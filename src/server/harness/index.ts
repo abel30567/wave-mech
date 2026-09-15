@@ -117,6 +117,9 @@ class ClaudeCliHarness implements HarnessSession {
   private blockTypes = new Map<number, string | undefined>();
   private activeTools = new Map<string, ActiveTool>();
   private seenToolIds = new Set<string>();
+  private turnText = '';
+  private turnHadTool = false;
+  private lastTextBeforeTool = '';
 
   constructor(options: HarnessOptions) {
     if (typeof options?.onEvent !== 'function') {
@@ -214,11 +217,12 @@ class ClaudeCliHarness implements HarnessSession {
       if (typeof timer.unref === 'function') timer.unref();
       this.pending = { resolve, reject, timer, settled: false };
 
-      // Reset per-turn parsing state so a prior turn cannot leak indices, and
-      // lift any interrupt fence so this fresh generation streams normally.
       this.blockTypes.clear();
       this.seenToolIds.clear();
       this.suppressStream = false;
+      this.turnText = '';
+      this.turnHadTool = false;
+      this.lastTextBeforeTool = '';
 
       const line = JSON.stringify({
         type: 'user',
@@ -480,6 +484,10 @@ class ClaudeCliHarness implements HarnessSession {
           this.seenToolIds.add(callId);
           const active: ActiveTool = { callId, name, startMs: Date.now() };
           this.activeTools.set(callId, active);
+          if (!this.turnHadTool) {
+            this.lastTextBeforeTool = this.turnText;
+          }
+          this.turnHadTool = true;
           this.emit({ type: 'tool', name, status: 'running', callId });
         }
         return;
@@ -487,8 +495,6 @@ class ClaudeCliHarness implements HarnessSession {
       case 'content_block_delta': {
         const index = typeof ev.index === 'number' ? ev.index : -1;
         const delta = ev.delta;
-        // Only genuine top-level assistant text — never thinking_delta or
-        // input_json_delta (tool arguments).
         if (
           delta?.type === 'text_delta' &&
           this.blockTypes.get(index) === 'text' &&
@@ -496,6 +502,7 @@ class ClaudeCliHarness implements HarnessSession {
           delta.text.length > 0
         ) {
           this.emit({ type: 'text', text: delta.text });
+          this.turnText += delta.text;
         }
         return;
       }
@@ -572,6 +579,14 @@ class ClaudeCliHarness implements HarnessSession {
       this.emit({ type: 'error', message });
       this.failPending(new Error(message));
       return;
+    }
+    if (this.options.onResult && this.turnText.length > 0) {
+      const resultText = this.turnHadTool
+        ? this.turnText.slice(this.lastTextBeforeTool.length).trim()
+        : this.turnText.trim();
+      if (resultText.length > 0) {
+        try { this.options.onResult(resultText); } catch { /* consumer error */ }
+      }
     }
     this.resolvePending();
   }
