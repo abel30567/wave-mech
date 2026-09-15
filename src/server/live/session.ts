@@ -197,7 +197,10 @@ export class GptLiveManager {
       const factory = this.options.providerFactory ?? ((key: string) => createLiveProvider(key));
       provider = factory(this.apiKey!);
 
-      const clientEventRestrictions: string[] = [];
+      const clientEventRestrictions: string[] = [
+        'session.input_audio.mute',
+        'session.input_audio.unmute',
+      ];
 
       const instructions = [
         'You are a voice assistant backed by Claude Code. When a task requires computation, data retrieval, or external actions, delegate to the backend.',
@@ -205,6 +208,9 @@ export class GptLiveManager {
       ].join(' ');
 
       const result = await provider.createSession(sdp, instructions, clientEventRestrictions);
+
+      this.budget.setProviderSessionId(sessionId, result.providerSessionId);
+      await this.budget.save();
 
       const deadline = setTimeout(() => {
         void this.closeSession(sessionId, 'deadline');

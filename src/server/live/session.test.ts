@@ -279,6 +279,36 @@ describe('GptLiveManager', () => {
     await manager.shutdown();
   });
 
+  it('restricts browser client events to mute/unmute only', async () => {
+    const keyFile = path.join(workDir, 'test-api.key');
+    await writeFile(keyFile, 'sk-test-key-12345-abcdef', { mode: 0o600 });
+
+    const { provider, calls } = createMockProvider();
+
+    const manager = new GptLiveManager({
+      enabled: true,
+      apiKeyFile: keyFile,
+      budgetFile: path.join(workDir, 'budget.json'),
+      maxSessionSeconds: 60,
+      configuredModel: 'claude-opus-4-6[1m]',
+      nodeExecutable: process.execPath,
+      providerFactory: () => provider,
+    });
+    await manager.initialize();
+
+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
+
+    const [, , clientEventRestrictions] = calls.createSession[0] as [string, string, string[]];
+    expect(Array.isArray(clientEventRestrictions)).toBe(true);
+    expect(clientEventRestrictions).not.toContain('session.update');
+    expect(clientEventRestrictions).not.toContain('session.instructions.append');
+    expect(clientEventRestrictions).not.toContain('session.close');
+    expect(clientEventRestrictions).toContain('session.input_audio.mute');
+    expect(clientEventRestrictions).toContain('session.input_audio.unmute');
+
+    await manager.shutdown();
+  });
+
   it('prevents duplicate/parallel session starts via synchronous slot', async () => {
     const keyFile = path.join(workDir, 'test-api.key');
     await writeFile(keyFile, 'sk-test-key-12345-abcdef', { mode: 0o600 });
