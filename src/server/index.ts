@@ -287,6 +287,9 @@ sockets.on('connection', (socket: WebSocket, ownerId: string) => {
           const command = parseRealtimeCommand(JSON.parse(raw.toString()));
           if (command.type === 'hello') {
             if (bindings.has(socket)) return;
+            if (gptLive.hasActiveSession) {
+              send(socket, { type: 'error', code: 'session_busy', message: 'A GPT-Live trial session is active. End it first.', fatal: true }); socket.close(4009); return;
+            }
             if (active && active.ownerId !== ownerId) {
               send(socket, { type: 'error', code: 'session_busy', message: 'Another browser owns the active conversation.', fatal: true }); socket.close(4009); return;
             }
