@@ -17,6 +17,10 @@ import { GptLiveBudget } from './budget.js';
 import { createHarness } from '../harness/index.js';
 import { harnessEnvironmentOverrides } from '../harness-environment.js';
 import { buildToolArguments, permissionHookSource } from '../security/access-policy.js';
+import { createLiveProvider, type LiveProvider, type SidebandHandle } from './provider.js';
+
+const MAX_TRANSCRIPT_ENTRIES = 500;
+const CLOSURE_TIMEOUT_MS = 15_000;
 
 export interface GptLiveManagerOptions {
   enabled: boolean;
@@ -26,6 +30,7 @@ export interface GptLiveManagerOptions {
   fermiUrl?: string;
   configuredModel: string;
   nodeExecutable: string;
+  providerFactory?: (apiKey: string) => LiveProvider;
 }
 
 export interface GptLiveSessionCallbacks {
@@ -46,12 +51,17 @@ interface ActiveTrialSession {
   workspace: string | null;
   harnessReady: boolean;
   pendingDelegation: string | null;
+  delegationQueue: string[];
   processedDelegationIds: Set<string>;
   transcript: GptLiveTranscriptEntry[];
   cumulativeVoiceSeconds: number;
+  connectedTimeEstimate: number;
   closureConfirmed: boolean | null;
   closureReason: string | null;
   closing: boolean;
+  provider: LiveProvider | null;
+  sidebandHandle: SidebandHandle | null;
+  closureTimer: ReturnType<typeof setTimeout> | null;
   callbacks: GptLiveSessionCallbacks;
 }
 
@@ -60,6 +70,7 @@ export class GptLiveManager {
   private readonly budget: GptLiveBudget;
   private apiKey: string | null = null;
   private active: ActiveTrialSession | null = null;
+  private slotTaken = false;
 
   constructor(options: GptLiveManagerOptions) {
     this.options = {
@@ -117,8 +128,8 @@ export class GptLiveManager {
   validateSessionRequest(ownerId: string, sdp: string): string | null {
     if (!this.options.enabled) return 'GPT-Live trial is not enabled.';
     if (!this.apiKey) return 'GPT-Live API key is not configured.';
-    if (this.active) {
-      if (this.active.ownerId !== ownerId) return 'Another user owns the active trial session.';
+    if (this.active || this.slotTaken) {
+      if (this.active && this.active.ownerId !== ownerId) return 'Another user owns the active trial session.';
       return 'A trial session is already active.';
     }
     if (!sdp || typeof sdp !== 'string' || sdp.length > 65536) {
@@ -139,12 +150,15 @@ export class GptLiveManager {
     const validationError = this.validateSessionRequest(ownerId, sdp);
     if (validationError) throw new Error(validationError);
 
+    this.slotTaken = true;
+
     const sessionId = randomUUID();
     this.budget.reserve(sessionId, this.options.maxSessionSeconds);
     await this.budget.save();
 
     let workspace: string | null = null;
     let harness: ReturnType<typeof createHarness> | null = null;
+    let provider: LiveProvider | null = null;
 
     try {
       workspace = await mkdtemp(path.join(tmpdir(), 'wave-live-'));
@@ -179,47 +193,124 @@ export class GptLiveManager {
 
       harness = createHarness(harnessOptions);
       await harness.start();
+
+      const factory = this.options.providerFactory ?? ((key: string) => createLiveProvider(key));
+      provider = factory(this.apiKey!);
+
+      const clientEventRestrictions: string[] = [
+        'session.input_audio.mute',
+        'session.input_audio.unmute',
+      ];
+
+      const instructions = [
+        'You are a voice assistant backed by Claude Code. When a task requires computation, data retrieval, or external actions, delegate to the backend.',
+        'Keep spoken responses concise. Do not repeat tool outputs verbatim.',
+      ].join(' ');
+
+      const result = await provider.createSession(sdp, instructions, clientEventRestrictions);
+
+      this.budget.setProviderSessionId(sessionId, result.providerSessionId);
+      await this.budget.save();
+
+      const deadline = setTimeout(() => {
+        void this.closeSession(sessionId, 'deadline');
+      }, this.options.maxSessionSeconds * 1000);
+      if (typeof deadline.unref === 'function') deadline.unref();
+
+      this.active = {
+        sessionId,
+        providerSessionId: result.providerSessionId,
+        ownerId,
+        startedAt: Date.now(),
+        deadline,
+        harness,
+        workspace,
+        harnessReady: true,
+        pendingDelegation: null,
+        delegationQueue: [],
+        processedDelegationIds: new Set(),
+        transcript: [],
+        cumulativeVoiceSeconds: 0,
+        connectedTimeEstimate: 0,
+        closureConfirmed: null,
+        closureReason: null,
+        closing: false,
+        provider,
+        sidebandHandle: null,
+        closureTimer: null,
+        callbacks,
+      };
+
+      void this.attachSideband(sessionId);
+
+      return { sessionId, sdp: result.answerSdp };
     } catch (error) {
       this.budget.finalize(sessionId, 0, false);
       await this.budget.save();
+      if (provider) provider.destroy();
+      if (harness) { try { await harness.close(); } catch { /* ignore */ } }
       if (workspace) await rm(workspace, { recursive: true, force: true });
-      throw error;
+      this.slotTaken = false;
+      const safeMessage = error instanceof Error
+        ? sanitizeErrorMessage(error.message)
+        : 'Session creation failed.';
+      throw new Error(safeMessage);
+    }
+  }
+
+  private async attachSideband(sessionId: string): Promise<void> {
+    if (!this.active || this.active.sessionId !== sessionId) return;
+    const session = this.active;
+    if (!session.provider || !session.providerSessionId) return;
+
+    try {
+      session.sidebandHandle = await session.provider.attachSideband(
+        session.providerSessionId,
+        {
+          onInputTranscript: (delta) => {
+            this.handleInputTranscript(delta);
+          },
+          onOutputTranscript: (delta) => {
+            this.handleOutputTranscript(delta);
+          },
+          onDelegationCreated: (delegationId, offsetMs) => {
+            this.handleDelegationCreated(delegationId, offsetMs);
+          },
+          onUsageUpdate: (seconds) => {
+            this.handleUsageUpdate(seconds);
+          },
+          onSessionClosed: (reason, usage) => {
+            this.handleProviderClosed(sessionId, reason, usage.seconds);
+          },
+          onError: (_code, message) => {
+            if (this.active && this.active.sessionId === sessionId) {
+              session.callbacks.onError('Provider error occurred.');
+            }
+          },
+        },
+      );
+    } catch {
+      session.callbacks.onError('Failed to attach sideband connection.');
+    }
+  }
+
+  private handleProviderClosed(sessionId: string, reason: string, finalSeconds: number): void {
+    if (!this.active || this.active.sessionId !== sessionId) return;
+    const session = this.active;
+
+    session.cumulativeVoiceSeconds = Math.max(session.cumulativeVoiceSeconds, finalSeconds);
+    session.closureConfirmed = true;
+    session.closureReason = reason;
+
+    if (session.closureTimer) {
+      clearTimeout(session.closureTimer);
+      session.closureTimer = null;
     }
 
-    const deadline = setTimeout(() => {
-      void this.closeSession(sessionId, 'deadline');
-    }, this.options.maxSessionSeconds * 1000);
-    if (typeof deadline.unref === 'function') deadline.unref();
+    this.budget.finalize(sessionId, session.cumulativeVoiceSeconds, true);
+    void this.budget.save();
 
-    this.active = {
-      sessionId,
-      providerSessionId: null,
-      ownerId,
-      startedAt: Date.now(),
-      deadline,
-      harness,
-      workspace,
-      harnessReady: true,
-      pendingDelegation: null,
-      processedDelegationIds: new Set(),
-      transcript: [],
-      cumulativeVoiceSeconds: 0,
-      closureConfirmed: null,
-      closureReason: null,
-      closing: false,
-      callbacks,
-    };
-
-    const responseSdp = [
-      'v=0',
-      'o=- 0 0 IN IP4 127.0.0.1',
-      's=wave-mech-trial',
-      't=0 0',
-      'm=audio 0 UDP/TLS/RTP/SAVPF 111',
-      'a=inactive',
-    ].join('\r\n');
-
-    return { sessionId, sdp: responseSdp };
+    void this.finishCleanup(sessionId);
   }
 
   private handleHarnessEvent(sessionId: string, event: HarnessEvent): void {
@@ -237,15 +328,35 @@ export class GptLiveManager {
           source: 'backend',
           timestampMs: Date.now(),
         };
-        session.transcript.push(entry);
+        this.pushTranscript(session, entry);
         session.callbacks.onTranscriptDelta(entry);
+
+        if (session.pendingDelegation && session.provider && event.text.length > 0) {
+          const commentary = event.text.slice(0, 2000);
+          session.provider.sendCommentary(commentary, session.pendingDelegation);
+          session.pendingDelegation = null;
+          void this.drainDelegationQueue(sessionId);
+        }
         break;
       }
       case 'tool':
+        if (session.pendingDelegation && session.provider) {
+          session.provider.sendThinking(
+            'Backend is processing a tool call...',
+            session.pendingDelegation,
+          );
+        }
         break;
       case 'error':
-        session.callbacks.onError(`Backend: ${event.message}`);
+        session.callbacks.onError('Backend processing encountered an issue.');
         break;
+    }
+  }
+
+  private pushTranscript(session: ActiveTrialSession, entry: GptLiveTranscriptEntry): void {
+    session.transcript.push(entry);
+    if (session.transcript.length > MAX_TRANSCRIPT_ENTRIES) {
+      session.transcript.splice(0, session.transcript.length - MAX_TRANSCRIPT_ENTRIES);
     }
   }
 
@@ -258,10 +369,24 @@ export class GptLiveManager {
 
     session.callbacks.onDelegationCreated(delegationId, offsetMs);
 
-    if (session.pendingDelegation) return;
-    session.pendingDelegation = delegationId;
+    if (session.pendingDelegation) {
+      session.delegationQueue.push(delegationId);
+      return;
+    }
 
+    session.pendingDelegation = delegationId;
     void this.processDelegation(session.sessionId, delegationId);
+  }
+
+  private async drainDelegationQueue(sessionId: string): Promise<void> {
+    if (!this.active || this.active.sessionId !== sessionId) return;
+    const session = this.active;
+
+    const next = session.delegationQueue.shift();
+    if (!next) return;
+
+    session.pendingDelegation = next;
+    void this.processDelegation(sessionId, next);
   }
 
   private async processDelegation(sessionId: string, delegationId: string): Promise<void> {
@@ -270,6 +395,7 @@ export class GptLiveManager {
 
     if (!session.harness || !session.harnessReady) {
       session.pendingDelegation = null;
+      void this.drainDelegationQueue(sessionId);
       return;
     }
 
@@ -282,15 +408,23 @@ export class GptLiveManager {
 
     if (!userContext) {
       session.pendingDelegation = null;
+      void this.drainDelegationQueue(sessionId);
       return;
+    }
+
+    if (session.provider) {
+      session.provider.sendThinking(
+        'Processing your request with the backend...',
+        delegationId,
+      );
     }
 
     try {
       await session.harness.send(userContext);
     } catch {
       session.callbacks.onError('Backend delegation processing failed.');
-    } finally {
       session.pendingDelegation = null;
+      void this.drainDelegationQueue(sessionId);
     }
   }
 
@@ -302,7 +436,7 @@ export class GptLiveManager {
       source: 'voice-model',
       timestampMs: Date.now(),
     };
-    this.active.transcript.push(entry);
+    this.pushTranscript(this.active, entry);
     this.active.callbacks.onTranscriptDelta(entry);
   }
 
@@ -314,15 +448,16 @@ export class GptLiveManager {
       source: 'voice-model',
       timestampMs: Date.now(),
     };
-    this.active.transcript.push(entry);
+    this.pushTranscript(this.active, entry);
     this.active.callbacks.onTranscriptDelta(entry);
   }
 
   handleUsageUpdate(seconds: number): void {
     if (!this.active) return;
-    this.active.cumulativeVoiceSeconds = seconds;
-    const estimatedCost = (seconds / 60) * GPT_LIVE_PRICE_PER_MINUTE;
-    this.active.callbacks.onUsageUpdate(seconds, estimatedCost);
+    this.active.cumulativeVoiceSeconds = Math.max(this.active.cumulativeVoiceSeconds, seconds);
+    this.active.connectedTimeEstimate = (Date.now() - this.active.startedAt) / 1000;
+    const estimatedCost = (this.active.cumulativeVoiceSeconds / 60) * GPT_LIVE_PRICE_PER_MINUTE;
+    this.active.callbacks.onUsageUpdate(this.active.cumulativeVoiceSeconds, estimatedCost);
   }
 
   async closeSession(sessionId: string, reason: string): Promise<void> {
@@ -333,17 +468,52 @@ export class GptLiveManager {
 
     clearTimeout(session.deadline);
 
-    const closureConfirmed = reason === 'close_requested' || reason === 'user_ended';
-    session.closureConfirmed = closureConfirmed;
-    session.closureReason = reason;
+    if (session.provider && session.providerSessionId) {
+      try {
+        session.provider.closeSession();
+      } catch { /* best effort */ }
+    }
 
-    this.budget.finalize(
-      sessionId,
-      session.cumulativeVoiceSeconds,
-      closureConfirmed,
-    );
-    await this.budget.save();
+    session.closureTimer = setTimeout(() => {
+      if (!this.active || this.active.sessionId !== sessionId) return;
+      if (session.closureConfirmed !== null) return;
 
+      session.closureConfirmed = false;
+      session.closureReason = reason;
+
+      const conservativeSeconds = Math.max(
+        session.cumulativeVoiceSeconds,
+        session.connectedTimeEstimate,
+      );
+      this.budget.finalize(sessionId, conservativeSeconds, false);
+      void this.budget.save();
+
+      void this.finishCleanup(sessionId);
+    }, CLOSURE_TIMEOUT_MS);
+    if (typeof session.closureTimer.unref === 'function') session.closureTimer.unref();
+
+    if (session.provider && session.providerSessionId) {
+      try {
+        await session.provider.hangup(session.providerSessionId);
+      } catch { /* hangup is best-effort fallback */ }
+    }
+  }
+
+  private async finishCleanup(sessionId: string): Promise<void> {
+    if (!this.active || this.active.sessionId !== sessionId) return;
+    const session = this.active;
+
+    if (session.closureTimer) {
+      clearTimeout(session.closureTimer);
+      session.closureTimer = null;
+    }
+
+    if (session.sidebandHandle) {
+      try { session.sidebandHandle.close(); } catch { /* ignore */ }
+    }
+    if (session.provider) {
+      try { session.provider.destroy(); } catch { /* ignore */ }
+    }
     if (session.harness) {
       try { await session.harness.close(); } catch { /* ignore */ }
     }
@@ -351,8 +521,11 @@ export class GptLiveManager {
       await rm(session.workspace, { recursive: true, force: true });
     }
 
-    session.callbacks.onSessionClosed(reason, closureConfirmed);
+    const confirmed = session.closureConfirmed === true;
+    const closureReason = session.closureReason ?? 'unknown';
+    session.callbacks.onSessionClosed(closureReason, confirmed);
     this.active = null;
+    this.slotTaken = false;
   }
 
   getDiagnostics(): GptLiveDiagnostics {
@@ -380,6 +553,15 @@ export class GptLiveManager {
       await this.closeSession(this.active.sessionId, 'shutdown');
     }
   }
+}
+
+function sanitizeErrorMessage(message: string): string {
+  const redacted = message
+    .replace(/sk-[A-Za-z0-9_-]+/g, '[REDACTED]')
+    .replace(/v=0[\s\S]*?(?=\n\n|\r\n\r\n|$)/g, '[SDP_REDACTED]')
+    .replace(/a=ice-[^\r\n]*/g, '[ICE_REDACTED]')
+    .replace(/Bearer [^\s"]+/g, 'Bearer [REDACTED]');
+  return redacted.length > 200 ? redacted.slice(0, 200) : redacted;
 }
 
 export function createGptLiveManager(

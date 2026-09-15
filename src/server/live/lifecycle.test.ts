@@ -5,6 +5,7 @@ import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { GptLiveManager, type GptLiveSessionCallbacks } from './session.js';
 import { GptLiveBudget } from './budget.js';
+import type { LiveProvider, ProviderEventHandler } from './provider.js';
 
 function tmpDir(): string {
   return path.join(tmpdir(), `wave-live-lifecycle-${randomBytes(4).toString('hex')}`);
@@ -20,7 +21,31 @@ function noopCallbacks(): GptLiveSessionCallbacks {
   };
 }
 
-async function createEnabledManager(workDir: string) {
+function createSimpleProvider(options?: {
+  sessionId?: string;
+  answerSdp?: string;
+  onAttachSideband?: (handler: ProviderEventHandler) => void;
+}): LiveProvider {
+  return {
+    async createSession() {
+      return {
+        providerSessionId: options?.sessionId ?? 'prov-lifecycle',
+        answerSdp: options?.answerSdp ?? 'v=0\r\nlifecycle-answer',
+      };
+    },
+    async attachSideband(_sid, handler) {
+      options?.onAttachSideband?.(handler);
+      return { close() {} };
+    },
+    sendThinking() {},
+    sendCommentary() {},
+    closeSession() {},
+    async hangup() {},
+    destroy() {},
+  };
+}
+
+async function createEnabledManager(workDir: string, providerOpts?: Parameters<typeof createSimpleProvider>[0]) {
   const keyFile = path.join(workDir, 'test-api.key');
   await writeFile(keyFile, 'sk-test-key-12345-abcdefg', { mode: 0o600 });
   const manager = new GptLiveManager({
@@ -30,6 +55,7 @@ async function createEnabledManager(workDir: string) {
     maxSessionSeconds: 60,
     configuredModel: 'claude-opus-4-6[1m]',
     nodeExecutable: process.execPath,
+    providerFactory: () => createSimpleProvider(providerOpts),
   });
   await manager.initialize();
   return manager;
@@ -152,8 +178,46 @@ describe('GptLive lifecycle and race conditions', () => {
     expect(budget.canReserve(300)).toBe(true);
   });
 
-  it('maxRetries is documented as 0 in session manager', async () => {
-    expect(true).toBe(true);
+  it('provider factory receives the loaded API key', async () => {
+    const keyFile = path.join(workDir, 'test-api.key');
+    await writeFile(keyFile, 'sk-test-unique-api-key', { mode: 0o600 });
+
+    let receivedKey: string | null = null;
+    const manager = new GptLiveManager({
+      enabled: true,
+      apiKeyFile: keyFile,
+      budgetFile: path.join(workDir, 'budget.json'),
+      maxSessionSeconds: 60,
+      configuredModel: 'claude-opus-4-6[1m]',
+      nodeExecutable: process.execPath,
+      providerFactory: (key) => {
+        receivedKey = key;
+        return createSimpleProvider();
+      },
+    });
+    await manager.initialize();
+
+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
+    expect(receivedKey).toBe('sk-test-unique-api-key');
+    await manager.shutdown();
+  });
+
+  it('provider session.closed event confirms closure with final usage', async () => {
+    let sidebandHandler: ProviderEventHandler | null = null;
+    const manager = await createEnabledManager(workDir, {
+      onAttachSideband: (handler) => { sidebandHandler = handler; },
+    });
+
+    const callbacks = noopCallbacks();
+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', callbacks);
+
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    sidebandHandler!.onSessionClosed('close_requested', { seconds: 42.5 });
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    expect(manager.hasActiveSession).toBe(false);
+    expect(callbacks.onSessionClosed).toHaveBeenCalledWith('close_requested', true);
   });
 });
 

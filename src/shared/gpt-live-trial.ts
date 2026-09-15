@@ -36,6 +36,7 @@ export interface GptLiveTranscriptEntry {
 
 export interface GptLiveDiagnostics {
   sessionId: string | null;
+  providerSessionId?: string | null;
   voiceModel: string;
   backendModel: string;
   cumulativeVoiceSeconds: number;

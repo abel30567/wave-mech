@@ -155,8 +155,10 @@ const server = createServer(async (request, response) => {
           response.setHeader('Content-Type', 'application/json');
           response.end(JSON.stringify(result));
         } catch (error) {
-          const message = error instanceof Error ? error.message : 'Session creation failed.';
-          response.writeHead(400).end(message);
+          const safeMessage = error instanceof Error && !error.message.match(/sk-|sdp|ice|bearer|key/i)
+            ? error.message
+            : 'Session creation failed.';
+          response.writeHead(400).end(safeMessage);
         }
       })();
     });
@@ -167,6 +169,37 @@ const server = createServer(async (request, response) => {
     if (!ownerId) { response.writeHead(403).end(); return; }
     response.setHeader('Content-Type', 'application/json');
     response.end(JSON.stringify(gptLive.status));
+    return;
+  }
+  if (pathname === '/api/gpt-live/end' && request.method === 'POST') {
+    const ownerId = ownerOf(request);
+    if (!hosts.has(request.headers.host ?? '') || !origins.has(request.headers.origin ?? '') || !validBootstrapCookie(request) || !ownerId) {
+      response.writeHead(403).end('Origin not permitted.'); return;
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    request.on('data', (chunk: Buffer) => { size += chunk.length; if (size <= 4096) chunks.push(chunk); });
+    request.on('end', () => {
+      void (async () => {
+        try {
+          const body = size > 0 ? JSON.parse(Buffer.concat(chunks).toString()) as { sessionId?: string } : {};
+          const sessionId = body.sessionId;
+          if (!sessionId || typeof sessionId !== 'string') { response.writeHead(400).end('Missing sessionId.'); return; }
+          await gptLive.closeSession(sessionId, 'user_ended');
+          response.setHeader('Content-Type', 'application/json');
+          response.end(JSON.stringify({ ended: true }));
+        } catch {
+          response.writeHead(500).end('End request failed.');
+        }
+      })();
+    });
+    return;
+  }
+  if (pathname === '/api/gpt-live/diagnostics' && request.method === 'GET') {
+    const ownerId = ownerOf(request);
+    if (!ownerId) { response.writeHead(403).end(); return; }
+    response.setHeader('Content-Type', 'application/json');
+    response.end(JSON.stringify(gptLive.getDiagnostics()));
     return;
   }
   if (pathname.startsWith('/api/')) { response.writeHead(404).end(); return; }
@@ -254,6 +287,9 @@ sockets.on('connection', (socket: WebSocket, ownerId: string) => {
           const command = parseRealtimeCommand(JSON.parse(raw.toString()));
           if (command.type === 'hello') {
             if (bindings.has(socket)) return;
+            if (gptLive.hasActiveSession) {
+              send(socket, { type: 'error', code: 'session_busy', message: 'A GPT-Live trial session is active. End it first.', fatal: true }); socket.close(4009); return;
+            }
             if (active && active.ownerId !== ownerId) {
               send(socket, { type: 'error', code: 'session_busy', message: 'Another browser owns the active conversation.', fatal: true }); socket.close(4009); return;
             }
