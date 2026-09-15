@@ -291,10 +291,7 @@ export class GptLiveManager {
       if (!creationAttempted) {
         this.budget.releaseUnstartedReservation(sessionId);
       } else {
-        const hasProviderSession = this.budget.snapshot.reservations.some(
-          r => r.sessionId === sessionId && r.providerSessionId !== null,
-        );
-        this.budget.finalize(sessionId, 0, !hasProviderSession);
+        this.budget.finalize(sessionId, 0, false);
       }
       try { await this.budget.save(); } catch { /* save failure already latched */ }
       if (provider) provider.destroy();

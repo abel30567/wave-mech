@@ -54,6 +54,7 @@ describe('createLiveProvider', () => {
       'session.input_audio.unmute',
     ]);
     expect(params.transport).toEqual({ type: 'webrtc', sdp: 'v=0\r\nbrowser-offer' });
+    expect(client.live.create).toHaveBeenCalledWith(params, { timeout: 15_000 });
 
     expect(result.providerSessionId).toBe('live-sess-mock-123');
     expect(result.answerSdp).toBe('v=0\r\nmock-answer-sdp');
@@ -74,6 +75,7 @@ describe('createLiveProvider', () => {
     const provider = createLiveProvider('sk-test', client);
     await provider.hangup('live-sess-xyz');
     expect(hangupCalls).toEqual(['live-sess-xyz']);
+    expect(client.live.sessions.hangup).toHaveBeenCalledWith('live-sess-xyz', { timeout: 5_000 });
   });
 
   it('constructs OpenAI client with correct baseURL and maxRetries:0 when no override', () => {

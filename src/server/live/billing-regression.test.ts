@@ -155,6 +155,28 @@ describe('billing-regression: unknown POST after timeout', () => {
     expect(budget2.canReserve(60)).toBe(false);
   });
 
+  it('a rejected creation request without an ID blocks retries before and after restart', async () => {
+    const manager = await enabledManager(workDir, { createError: new Error('Request timed out') });
+    await expect(manager.createSession('owner', 'v=0\r\noffer', 'http://localhost', noopCallbacks()))
+      .rejects.toThrow('Session creation failed.');
+
+    const ledger = JSON.parse(await readFile(path.join(workDir, 'budget.json'), 'utf8'));
+    expect(ledger.reservations).toHaveLength(1);
+    expect(ledger.reservations[0]).toMatchObject({
+      creationAttempted: true,
+      providerSessionId: null,
+      closureConfirmed: false,
+    });
+    expect(manager.status.budgetRemainingUsd).toBe(0);
+    await expect(manager.createSession('owner', 'v=0\r\nretry', 'http://localhost', noopCallbacks()))
+      .rejects.toThrow('Trial budget exhausted.');
+
+    const restarted = await enabledManager(workDir);
+    expect(restarted.status.budgetRemainingUsd).toBe(0);
+    await expect(restarted.createSession('owner', 'v=0\r\nretry', 'http://localhost', noopCallbacks()))
+      .rejects.toThrow('Trial budget exhausted.');
+  });
+
   it('errors before provider call release the reservation cleanly', async () => {
     const keyFile = path.join(workDir, 'api.key');
     await writeFile(keyFile, 'sk-test-key-short12345', { mode: 0o600 });

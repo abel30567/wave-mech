@@ -572,7 +572,7 @@ describe('GptLiveManager', () => {
     await manager.shutdown();
   });
 
-  it('releases slot on provider creation failure', async () => {
+  it('releases the local slot but blocks paid retries after uncertain provider creation', async () => {
     const keyFile = path.join(workDir, 'test-api.key');
     await writeFile(keyFile, 'sk-test-key-12345-abcdef', { mode: 0o600 });
 
@@ -598,7 +598,7 @@ describe('GptLiveManager', () => {
 
     expect(manager.hasActiveSession).toBe(false);
     const canStart = manager.validateSessionRequest('owner-1', 'v=0\r\nnew-offer');
-    expect(canStart).toBeNull();
+    expect(canStart).toBe('Trial budget exhausted.');
   });
 
   it('closeSession sends session.close and hangup to provider', async () => {

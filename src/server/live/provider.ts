@@ -57,7 +57,7 @@ export function createLiveProvider(apiKey: string, overrideClient?: OpenAI): Liv
         transport: { type: 'webrtc', sdp: offerSdp },
       };
 
-      const result: LiveCreateResponse = await client.live.create(params);
+      const result: LiveCreateResponse = await client.live.create(params, { timeout: 15_000 });
 
       return {
         providerSessionId: result.session.id,
@@ -128,7 +128,7 @@ export function createLiveProvider(apiKey: string, overrideClient?: OpenAI): Liv
     },
 
     async hangup(sessionId) {
-      await client.live.sessions.hangup(sessionId);
+      await client.live.sessions.hangup(sessionId, { timeout: 5_000 });
     },
 
     destroy() {
