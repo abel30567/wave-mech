@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { createConversationClient } from './realtime/client.js';
 import { browserReport, formatTranscriptReport } from './transcript.js';
+import { GptLivePanel } from './live/GptLivePanel.js';
 import type { ConversationClient, ConversationView, ConversationClientOptions } from '../shared/realtime.js';
+import type { GptLiveTrialStatus } from '../shared/gpt-live-trial.js';
 import './style.css';
 
-type Bootstrap = { protocol: number; mode: 'live' | 'fixture'; speechConfigured: boolean; fermiConfigured: boolean; speechMessage: string; configuredModel?: string; buildId?: string };
+type Bootstrap = { protocol: number; mode: 'live' | 'fixture'; speechConfigured: boolean; fermiConfigured: boolean; speechMessage: string; configuredModel?: string; buildId?: string; gptLiveTrial?: GptLiveTrialStatus };
 const initialView: ConversationView = {
   connection: 'offline', phase: 'ended', messages: [], partial: '', muted: false,
   audioAvailable: false, canSendText: false, canResumeAudio: false,
@@ -28,6 +30,7 @@ export default function App() {
   const [draft, setDraft] = useState('');
   const [copyStatus, setCopyStatus] = useState<'idle' | 'copied' | 'fallback'>('idle');
   const [copyFallback, setCopyFallback] = useState('');
+  const [voiceMode, setVoiceMode] = useState<'default' | 'gpt-live'>('default');
   const client = useRef<ConversationClient | undefined>(undefined);
   const generation = useRef(0);
   const conversation = useRef<HTMLDivElement>(null);
@@ -138,6 +141,11 @@ export default function App() {
           </div>
         </div>
         <div className="session-notes"><span className="note-symbol" aria-hidden="true">⌁</span><p>Keep this page open for hands-free listening. Mute or end the session whenever you want.</p></div>
+        {setup?.gptLiveTrial?.enabled && <GptLivePanel
+          trialStatus={setup.gptLiveTrial}
+          defaultModeActive={active}
+          onModeSwitch={setVoiceMode}
+        />}
       </section>
       <section className="conversation-panel" aria-label="Conversation">
         <div className="conversation-heading"><h2>Your conversation</h2><div className="conversation-actions">

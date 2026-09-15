@@ -145,3 +145,23 @@ a { color: inherit; }
   .capability-row { padding: 9px 19px; }
 }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; scroll-behavior: auto !important; } }
+
+.gpt-live-panel { margin-top: 18px; padding: 16px; border: 1px solid #d0dfeb; border-radius: 12px; background: #f8fbff; }
+.gpt-live-header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.gpt-live-badge { display: inline-block; padding: 3px 10px; border-radius: 6px; background: #e8d9f5; color: #5b3a8c; font-size: 11px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; }
+.gpt-live-identity { font-size: 11px; color: var(--muted); }
+.gpt-live-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 10px; }
+.gpt-live-start { background: #6b3fa0; }
+.gpt-live-start:hover:not(:disabled) { background: #553080; }
+.gpt-live-notice { font-size: 12px; color: #685936; background: #f4f1e6; border-radius: 8px; padding: 10px 14px; margin-bottom: 10px; line-height: 1.6; }
+.gpt-live-budget-exhausted { color: #874332; background: #fff1ed; }
+.gpt-live-error { font-size: 12px; color: #874332; background: #fff1ed; border-radius: 8px; padding: 10px 14px; margin-bottom: 10px; }
+.gpt-live-status { display: flex; gap: 16px; font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+.gpt-live-disclosure { font-size: 10px; color: #758b9d; line-height: 1.6; margin-bottom: 10px; }
+.gpt-live-transcript { max-height: 180px; overflow-y: auto; border: 1px solid #e5edf2; border-radius: 8px; padding: 10px; margin-bottom: 10px; font-size: 13px; }
+.gpt-live-msg { margin-bottom: 6px; line-height: 1.5; }
+.gpt-live-msg-source { font-size: 10px; color: #93a8b8; margin-right: 4px; }
+.gpt-live-msg-role { font-weight: 650; margin-right: 6px; }
+.gpt-live-msg-user .gpt-live-msg-role { color: #172b40; }
+.gpt-live-msg-assistant .gpt-live-msg-role { color: #255fda; }
+.gpt-live-text-disabled { font-size: 11px; color: #93a8b8; font-style: italic; }

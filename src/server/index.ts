@@ -9,6 +9,7 @@ import { createHarness } from './harness/index.js';
 import { harnessEnvironmentOverrides } from './harness-environment.js';
 import { createSpeech } from './speech/index.js';
 import { createBrokerTokenProvider, createElevenLabsTokenProvider } from './speech-broker.js';
+import { createGptLiveManager } from './live/index.js';
 import { createConversation } from './realtime/session.js';
 import { buildToolArguments, permissionHookSource } from './security/access-policy.js';
 import { createSessionIdentity, readOwnerCookie, ownerCookieHeader } from './security/identity.js';
@@ -56,6 +57,9 @@ if (fermiUrl) {
     if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash) fermiUrl = undefined;
   } catch { fermiUrl = undefined; }
 }
+
+const gptLive = createGptLiveManager({ fermiUrl: fermiUrl ?? undefined });
+await gptLive.initialize();
 
 interface ActiveSession {
   ownerId: string;
@@ -117,7 +121,53 @@ const server = createServer(async (request, response) => {
       protocol: REALTIME_VERSION, mode: fixtureMode ? 'fixture' : 'live', speechConfigured: Boolean(getSpeechToken), fermiConfigured: Boolean(fermiUrl),
       configuredModel: fixtureMode ? undefined : configuredModel, buildId,
       speechMessage: getSpeechToken ? 'Speech is configured.' : 'Server speech credentials are not configured. Typed conversation is available.',
+      gptLiveTrial: gptLive.isEnabled ? gptLive.status : undefined,
     })); return;
+  }
+  if (pathname === '/api/gpt-live/session' && request.method === 'POST') {
+    const ownerId = ownerOf(request);
+    if (!hosts.has(request.headers.host ?? '') || !origins.has(request.headers.origin ?? '') || !validBootstrapCookie(request) || !ownerId) {
+      response.writeHead(403).end('Origin not permitted.'); return;
+    }
+    const contentLength = Number(request.headers['content-length'] ?? 0);
+    if (contentLength > 65536) { response.writeHead(413).end('Request too large.'); return; }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    request.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size <= 65536) chunks.push(chunk);
+    });
+    request.on('end', () => {
+      void (async () => {
+        try {
+          if (size > 65536) { response.writeHead(413).end('Request too large.'); return; }
+          const body = JSON.parse(Buffer.concat(chunks).toString()) as { sdp?: string };
+          if (!body.sdp || typeof body.sdp !== 'string') { response.writeHead(400).end('Missing SDP offer.'); return; }
+          if (active) { response.writeHead(409).end('A default voice session is active. End it first.'); return; }
+          const origin = request.headers.origin ?? `http://127.0.0.1:${port}`;
+          const result = await gptLive.createSession(ownerId, body.sdp, origin, {
+            onTranscriptDelta: () => {},
+            onDelegationCreated: () => {},
+            onUsageUpdate: () => {},
+            onSessionClosed: () => {},
+            onError: () => {},
+          });
+          response.setHeader('Content-Type', 'application/json');
+          response.end(JSON.stringify(result));
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Session creation failed.';
+          response.writeHead(400).end(message);
+        }
+      })();
+    });
+    return;
+  }
+  if (pathname === '/api/gpt-live/status' && request.method === 'GET') {
+    const ownerId = ownerOf(request);
+    if (!ownerId) { response.writeHead(403).end(); return; }
+    response.setHeader('Content-Type', 'application/json');
+    response.end(JSON.stringify(gptLive.status));
+    return;
   }
   if (pathname.startsWith('/api/')) { response.writeHead(404).end(); return; }
   if (request.method !== 'GET' && request.method !== 'HEAD') { response.writeHead(405).end(); return; }
@@ -259,6 +309,7 @@ let shuttingDown = false;
 async function shutdown() {
   if (shuttingDown) return; shuttingDown = true;
   if (active) await drop(active);
+  await gptLive.shutdown();
   for (const socket of sockets.clients) socket.terminate();
   sockets.close(); fixtures?.close(); await vite?.close(); server.close();
 }
