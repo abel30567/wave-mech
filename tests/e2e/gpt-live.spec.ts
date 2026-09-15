@@ -197,7 +197,7 @@ async function setupGptLiveRoutes(
         backendModel: 'claude-opus-4-6[1m]',
         cumulativeVoiceSeconds: 12.5,
         estimatedCostUsd: 0.0104,
-        closureConfirmed: opts.closureConfirmed ?? true,
+        closureConfirmed: opts.closureConfirmed !== undefined ? opts.closureConfirmed : true,
         closureReason: 'user_ended',
         delegationsProcessed: 1,
         delegationsSkipped: 0,
@@ -513,12 +513,13 @@ test.describe('GPT-Live trial panel', () => {
     await page.goto('/');
 
     const panel = page.locator('[data-testid="gpt-live-panel"]');
-    const startBtn = panel.getByRole('button', { name: 'Start GPT-Live trial' });
-    await expect(startBtn).toBeEnabled();
+    await expect(panel.getByRole('button', { name: 'Start GPT-Live trial' })).toBeEnabled();
 
-    // Double-click Start rapidly
-    await startBtn.click();
-    await startBtn.click({ force: true }).catch(() => {});
+    // Double-click synchronously via DOM to beat React re-render
+    await page.evaluate(() => {
+      const btn = document.querySelector('.gpt-live-start') as HTMLElement;
+      if (btn) { btn.click(); btn.click(); }
+    });
 
     // Wait for session to complete
     await waitForDC(page);
@@ -529,5 +530,6 @@ test.describe('GPT-Live trial panel', () => {
 
     await page.evaluate(() => (window as any).__gptLiveMock.emitSessionStarted());
     await panel.getByRole('button', { name: 'End trial session' }).click();
+    await expect(panel.getByRole('button', { name: 'Reset' })).toBeVisible({ timeout: 5000 });
   });
 });
