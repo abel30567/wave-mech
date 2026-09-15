@@ -1,5 +1,6 @@
 import { safeDiagnostic, type DiagnosticSnapshot } from '../shared/diagnostics.js';
 import type { TranscriptEntry } from '../shared/realtime.js';
+import type { GptLiveDiagnostics } from '../shared/gpt-live-trial.js';
 
 export interface TranscriptReport {
   messages: TranscriptEntry[];
@@ -10,6 +11,7 @@ export interface TranscriptReport {
   reportedModel?: string;
   buildId?: string;
   browser?: { family: string; platform: string; online: boolean; visible: boolean; width: number; height: number };
+  gptLiveTrial?: GptLiveDiagnostics;
 }
 
 /** Best-effort protection for conversation text; tool payloads never enter the report. */
@@ -57,6 +59,23 @@ export function formatTranscriptReport(report: TranscriptReport): string {
   if (!report.messages.length) lines.push('(No conversation text retained.)');
   for (const message of report.messages) {
     lines.push('', `[Turn ${message.turnId}] ${message.role === 'user' ? 'You' : 'wave-mech'}`, redactTranscript(message.text));
+  }
+  if (report.gptLiveTrial) {
+    const trial = report.gptLiveTrial;
+    lines.push('', 'GPT-LIVE TRIAL');
+    lines.push(`Voice model: ${trial.voiceModel}`);
+    lines.push(`Backend model: ${trial.backendModel}`);
+    lines.push(`Cumulative voice: ${trial.cumulativeVoiceSeconds.toFixed(1)}s`);
+    lines.push(`Estimated cost: $${trial.estimatedCostUsd.toFixed(4)}`);
+    lines.push(`Closure confirmed: ${trial.closureConfirmed}`);
+    lines.push(`Closure reason: ${trial.closureReason ?? 'none'}`);
+    lines.push(`Delegations processed: ${trial.delegationsProcessed}`);
+    if (trial.transcript.length > 0) {
+      lines.push('', 'GPT-LIVE TRANSCRIPT');
+      for (const entry of trial.transcript) {
+        lines.push(`[${entry.source}] ${entry.role}: ${redactTranscript(entry.text)}`);
+      }
+    }
   }
   lines.push('', 'DIAGNOSTICS');
   if (report.diagnostics.dropped > 0) lines.push(`[History truncated: ${report.diagnostics.dropped} earlier diagnostic records omitted.]`);
