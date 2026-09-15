@@ -225,6 +225,20 @@ async function waitForDC(page: Page) {
 
 test.describe('GPT-Live trial panel', () => {
 
+  test('does not claim an active session without the provider started event', async ({ page }) => {
+    await page.addInitScript(GPT_LIVE_MOCK);
+    await setupGptLiveRoutes(page);
+    await page.goto('/');
+    const created = page.waitForResponse('**/api/gpt-live/session');
+    await page.getByRole('button', { name: 'Start GPT-Live trial', exact: true }).click();
+    await created;
+    await waitForDC(page);
+    await page.waitForTimeout(6000);
+    await expect(page.getByRole('button', { name: 'Connecting…', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Mute', exact: true })).toHaveCount(0);
+    await page.getByRole('button', { name: 'End trial session', exact: true }).click();
+  });
+
   test('successful start, session.started, mute, and End lifecycle', async ({ page }) => {
     const errors: string[] = [];
     page.on('pageerror', e => errors.push(e.message));

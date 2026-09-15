@@ -223,7 +223,18 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
       }
       pcRef.current = pc;
       stream.getTracks().forEach(t => pc.addTrack(t, stream));
-      pc.addTransceiver('audio', { direction: 'sendrecv' });
+      let providerStarted = false;
+      const dc = pc.createDataChannel('oai-events', { ordered: true });
+      dc.onmessage = (ev) => {
+        if (genRef.current !== g) return;
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'session.started') {
+            providerStarted = true;
+            setState(prev => prev.phase === 'connecting' ? { ...prev, phase: 'active' } : prev);
+          }
+        } catch { /* non-JSON */ }
+      };
 
       const offer = await pc.createOffer();
       if (genRef.current !== g) { stopLocalMedia(); startingRef.current = false; return; }
@@ -273,17 +284,6 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
         }
       };
 
-      const dc = pc.createDataChannel('oai-events', { ordered: true });
-      dc.onmessage = (ev) => {
-        if (genRef.current !== g) return;
-        try {
-          const msg = JSON.parse(ev.data);
-          if (msg.type === 'session.started') {
-            setState(prev => prev.phase === 'connecting' ? { ...prev, phase: 'active' } : prev);
-          }
-        } catch { /* non-JSON */ }
-      };
-
       await pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
       if (genRef.current !== g) {
         stopLocalMedia();
@@ -298,13 +298,8 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
       startingRef.current = false;
 
       setTimeout(() => {
-        if (genRef.current !== g) return;
-        setState(prev =>
-          prev.phase === 'connecting' && prev.sessionId === data.sessionId
-            ? { ...prev, phase: 'active' }
-            : prev,
-        );
-      }, 5000);
+        if (genRef.current === g && !providerStarted) void endSession();
+      }, 15000);
     } catch (error) {
       if (genRef.current !== g) { startingRef.current = false; return; }
       stopLocalMedia();
