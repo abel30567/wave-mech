@@ -250,7 +250,11 @@ export class GptLiveManager {
 
       return { sessionId, sdp: result.answerSdp };
     } catch (error) {
-      this.budget.finalize(sessionId, 0, false);
+      const hadProviderSession = provider !== null
+        && this.budget.snapshot.reservations.some(
+          r => r.sessionId === sessionId && r.providerSessionId !== null,
+        );
+      this.budget.finalize(sessionId, 0, !hadProviderSession);
       await this.budget.save();
       if (provider) provider.destroy();
       if (harness) { try { await harness.close(); } catch { /* ignore */ } }

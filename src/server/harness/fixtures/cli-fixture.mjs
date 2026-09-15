@@ -250,7 +250,54 @@ async function runSecretSentinel() {
   await emit({ type: 'result', subtype: 'success', is_error: false, result: 'Safe response', session_id: SESSION_ID });
 }
 
+async function runToolThenResult() {
+  await streamEvent({ type: 'message_start', message: { role: 'assistant' } });
+
+  // Pre-tool narration
+  await streamEvent({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+  await streamEvent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Let me look that up.' } });
+  await streamEvent({ type: 'content_block_stop', index: 0 });
+
+  // Tool call
+  await streamEvent({ type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'ttr-1', name: 'WebSearch' } });
+  await streamEvent({ type: 'content_block_stop', index: 1 });
+  await streamEvent({ type: 'message_stop' });
+
+  await emit({
+    type: 'user',
+    parent_tool_use_id: null,
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'ttr-1', content: 'search results here' }] },
+  });
+
+  // Second message with final result text (different from preamble)
+  await streamEvent({ type: 'message_start', message: { role: 'assistant' } });
+  await streamEvent({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+  await streamEvent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'The answer is 42.' } });
+  await streamEvent({ type: 'content_block_stop', index: 0 });
+  await streamEvent({ type: 'message_stop' });
+
+  await emit({ type: 'result', subtype: 'success', is_error: false, result: 'The answer is 42.', session_id: SESSION_ID });
+}
+
+async function runTextOnly() {
+  await streamEvent({ type: 'message_start', message: { role: 'assistant' } });
+  await streamEvent({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+  await streamEvent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Simple direct answer.' } });
+  await streamEvent({ type: 'content_block_stop', index: 0 });
+  await streamEvent({ type: 'message_stop' });
+
+  await emit({ type: 'result', subtype: 'success', is_error: false, result: 'Simple direct answer.', session_id: SESSION_ID });
+}
+
 async function handleTurn(userText) {
+  if (SCENARIO === 'tool_then_result') {
+    await runToolThenResult();
+    return;
+  }
+  if (SCENARIO === 'text_only') {
+    await runTextOnly();
+    return;
+  }
   if (SCENARIO === 'tool_crash') {
     await streamEvent({ type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'crash-tool', name: 'mcp__fermi__execute' } });
     process.exit(1);

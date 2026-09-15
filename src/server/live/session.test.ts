@@ -3,8 +3,29 @@ import { tmpdir } from 'node:os';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { GptLiveManager, type GptLiveSessionCallbacks } from './session.js';
+import { GptLiveManager, type GptLiveSessionCallbacks, type HarnessFactory } from './session.js';
 import type { LiveProvider, ProviderEventHandler, SidebandHandle } from './provider.js';
+import type { HarnessSession, HarnessOptions } from '../../shared/contracts.js';
+
+function createMockHarnessFactory(): HarnessFactory {
+  return (options: HarnessOptions): HarnessSession => {
+    let started = false;
+    return {
+      async start() {
+        started = true;
+        options.onEvent({ type: 'ready' });
+      },
+      async send(text: string) {
+        if (!started) throw new Error('Not started');
+        options.onEvent({ type: 'text', text: `Response to: ${text}` });
+        if (options.onResult) options.onResult(`Response to: ${text}`);
+      },
+      async close() {
+        started = false;
+      },
+    };
+  };
+}
 
 function tmpDir(): string {
   return path.join(tmpdir(), `wave-live-test-${randomBytes(4).toString('hex')}`);
@@ -265,6 +286,7 @@ describe('GptLiveManager', () => {
       configuredModel: 'claude-opus-4-6[1m]',
       nodeExecutable: process.execPath,
       providerFactory: () => provider,
+      harnessFactory: createMockHarnessFactory(),
     });
     await manager.initialize();
 
@@ -293,6 +315,7 @@ describe('GptLiveManager', () => {
       configuredModel: 'claude-opus-4-6[1m]',
       nodeExecutable: process.execPath,
       providerFactory: () => provider,
+      harnessFactory: createMockHarnessFactory(),
     });
     await manager.initialize();
 
@@ -335,6 +358,7 @@ describe('GptLiveManager', () => {
       configuredModel: 'claude-opus-4-6[1m]',
       nodeExecutable: process.execPath,
       providerFactory: () => slowProvider,
+      harnessFactory: createMockHarnessFactory(),
     });
     await manager.initialize();
 
@@ -366,6 +390,7 @@ describe('GptLiveManager', () => {
       configuredModel: 'claude-opus-4-6[1m]',
       nodeExecutable: process.execPath,
       providerFactory: () => provider,
+      harnessFactory: createMockHarnessFactory(),
     });
     await manager.initialize();
 
@@ -399,6 +424,7 @@ describe('GptLiveManager', () => {
       configuredModel: 'claude-opus-4-6[1m]',
       nodeExecutable: process.execPath,
       providerFactory: () => provider,
+      harnessFactory: createMockHarnessFactory(),
     });
     await manager.initialize();
 
@@ -431,6 +457,7 @@ describe('GptLiveManager', () => {
       configuredModel: 'claude-opus-4-6[1m]',
       nodeExecutable: process.execPath,
       providerFactory: () => provider,
+      harnessFactory: createMockHarnessFactory(),
     });
     await manager.initialize();
 
@@ -461,6 +488,7 @@ describe('GptLiveManager', () => {
       configuredModel: 'claude-opus-4-6[1m]',
       nodeExecutable: process.execPath,
       providerFactory: () => provider,
+      harnessFactory: createMockHarnessFactory(),
     });
     await manager.initialize();
 
@@ -491,6 +519,7 @@ describe('GptLiveManager', () => {
       configuredModel: 'claude-opus-4-6[1m]',
       nodeExecutable: process.execPath,
       providerFactory: () => provider,
+      harnessFactory: createMockHarnessFactory(),
     });
     await manager.initialize();
 
@@ -523,6 +552,7 @@ describe('GptLiveManager', () => {
       configuredModel: 'claude-opus-4-6[1m]',
       nodeExecutable: process.execPath,
       providerFactory: () => provider,
+      harnessFactory: createMockHarnessFactory(),
     });
     await manager.initialize();
 
@@ -551,6 +581,7 @@ describe('GptLiveManager', () => {
       configuredModel: 'claude-opus-4-6[1m]',
       nodeExecutable: process.execPath,
       providerFactory: () => provider,
+      harnessFactory: createMockHarnessFactory(),
     });
     await manager.initialize();
 
@@ -579,6 +610,7 @@ describe('GptLiveManager', () => {
       configuredModel: 'claude-opus-4-6[1m]',
       nodeExecutable: process.execPath,
       providerFactory: () => provider,
+      harnessFactory: createMockHarnessFactory(),
     });
     await manager.initialize();
 

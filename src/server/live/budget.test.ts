@@ -111,4 +111,111 @@ describe('GptLiveBudget', () => {
     const { mode } = await import('node:fs').then(fs => fs.promises.stat(filePath));
     expect(mode & 0o777).toBe(0o600);
   });
+
+  it('locks out new sessions after unconfirmed finalization (regression)', async () => {
+    const budget = new GptLiveBudget(filePath);
+    await budget.load();
+    budget.reserve('s', 300);
+    budget.setProviderSessionId('s', 'p');
+    budget.finalize('s', 0, false);
+    await budget.save();
+
+    expect(budget.hasUncertainClosure).toBe(true);
+    expect(budget.canReserve(300)).toBe(false);
+
+    const budget2 = new GptLiveBudget(filePath);
+    await budget2.load();
+    budget2.reconcileOrphans();
+    expect(budget2.canReserve(300)).toBe(false);
+    expect(budget2.hasUncertainClosure).toBe(true);
+  });
+
+  it('confirmClosure unlocks after authentic session.closed', async () => {
+    const budget = new GptLiveBudget(filePath);
+    await budget.load();
+    budget.reserve('s', 300);
+    budget.setProviderSessionId('s', 'p');
+    budget.finalize('s', 0, false);
+    await budget.save();
+
+    expect(budget.canReserve(300)).toBe(false);
+
+    const confirmed = budget.confirmClosure('s', 42);
+    expect(confirmed).toBe(true);
+    expect(budget.hasUncertainClosure).toBe(false);
+    expect(budget.canReserve(300)).toBe(true);
+    expect(budget.cumulativeUsageUsd).toBeCloseTo((42 / 60) * 0.05, 6);
+  });
+
+  it('rejects confirmClosure with invalid seconds', async () => {
+    const budget = new GptLiveBudget(filePath);
+    await budget.load();
+    budget.reserve('s', 300);
+    budget.finalize('s', 0, false);
+
+    expect(budget.confirmClosure('s', NaN)).toBe(false);
+    expect(budget.confirmClosure('s', -1)).toBe(false);
+    expect(budget.confirmClosure('s', 301)).toBe(false);
+    expect(budget.confirmClosure('s', Infinity)).toBe(false);
+    expect(budget.hasUncertainClosure).toBe(true);
+  });
+
+  it('rejects NaN/negative voiceSeconds in finalize', async () => {
+    const budget = new GptLiveBudget(filePath);
+    await budget.load();
+
+    budget.reserve('s1', 120);
+    budget.finalize('s1', NaN, true);
+    expect(budget.hasUncertainClosure).toBe(true);
+
+    const budget2 = new GptLiveBudget(filePath);
+    await budget2.load();
+    budget2.reserve('s2', 120);
+    budget2.finalize('s2', -5, true);
+    expect(budget2.hasUncertainClosure).toBe(true);
+  });
+
+  it('rejects voiceSeconds exceeding max in finalize', async () => {
+    const budget = new GptLiveBudget(filePath);
+    await budget.load();
+    budget.reserve('s', 300);
+    budget.finalize('s', 500, true);
+    expect(budget.hasUncertainClosure).toBe(true);
+  });
+
+  it('orphan reconciliation locks out new sessions', async () => {
+    const budget = new GptLiveBudget(filePath);
+    await budget.load();
+    budget.reserve('orphan', 300);
+    await budget.save();
+
+    const budget2 = new GptLiveBudget(filePath);
+    await budget2.load();
+    const orphans = budget2.reconcileOrphans();
+    expect(orphans).toBe(1);
+    expect(budget2.hasUncertainClosure).toBe(true);
+    expect(budget2.canReserve(60)).toBe(false);
+  });
+
+  it('rejects corrupt ledger on load', async () => {
+    await writeFile(filePath, JSON.stringify({
+      cumulativeUsageUsd: -1,
+      reservations: [],
+      lastUpdated: new Date().toISOString(),
+    }));
+
+    const budget = new GptLiveBudget(filePath);
+    await expect(budget.load()).rejects.toThrow('Invalid budget ledger');
+  });
+
+  it('rejects corrupt reservation values on load', async () => {
+    await writeFile(filePath, JSON.stringify({
+      cumulativeUsageUsd: 0,
+      reservations: [{ sessionId: 's', providerSessionId: null, reservedUsd: NaN, actualUsd: null, createdAt: '', finalized: false, closureConfirmed: false }],
+      lastUpdated: new Date().toISOString(),
+    }));
+
+    const budget = new GptLiveBudget(filePath);
+    await expect(budget.load()).rejects.toThrow('Corrupt reservation');
+  });
 });

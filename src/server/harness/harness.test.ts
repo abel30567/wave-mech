@@ -280,6 +280,52 @@ describe('createHarness', () => {
   });
 });
 
+describe('createHarness — onResult callback', () => {
+  it('invokes onResult with final text only (not preamble) when tools are used', async () => {
+    const results: string[] = [];
+    const { session, texts } = build('tool_then_result', {}, {
+      onResult: (text) => results.push(text),
+    });
+    await session.start();
+    await session.send('hi');
+    expect(results).toHaveLength(1);
+    expect(results[0]).toBe('The answer is 42.');
+    expect(texts()).toContain('Let me look that up.');
+    expect(texts()).toContain('The answer is 42.');
+  });
+
+  it('invokes onResult with full text when no tools are used', async () => {
+    const results: string[] = [];
+    const { session } = build('text_only', {}, {
+      onResult: (text) => results.push(text),
+    });
+    await session.start();
+    await session.send('hi');
+    expect(results).toHaveLength(1);
+    expect(results[0]).toBe('Simple direct answer.');
+  });
+
+  it('does not invoke onResult on error result', async () => {
+    const results: string[] = [];
+    const { session } = build('error', {}, {
+      onResult: (text) => results.push(text),
+    });
+    await session.start();
+    await expect(session.send('hi')).rejects.toThrow();
+    expect(results).toHaveLength(0);
+  });
+
+  it('does not invoke onResult when process crashes', async () => {
+    const results: string[] = [];
+    const { session } = build('crash', {}, {
+      onResult: (text) => results.push(text),
+    });
+    await session.start();
+    await expect(session.send('hi')).rejects.toThrow();
+    expect(results).toHaveLength(0);
+  });
+});
+
 describe('createHarness — model validation', () => {
   it('preserves a safe Claude model identifier from system/init', async () => {
     const { session, events } = build('basic', { MODEL: 'claude-opus-4-6' });
