@@ -499,13 +499,13 @@ describe('billing-regression: over-300-actual usage', () => {
 
     const callbacks = noopCallbacks();
     await manager.createSession('owner', 'v=0\r\noffer', 'http://localhost', callbacks);
-    await new Promise(r => setTimeout(r, 50));
+    await vi.waitFor(() => expect(sidebandHandler).not.toBeNull());
 
     manager.handleUsageUpdate(55);
     sidebandHandler!.onSessionClosed('deadline', { seconds: 65 });
-    await new Promise(r => setTimeout(r, 50));
-
-    expect(callbacks.onSessionClosed).toHaveBeenCalledWith('deadline', true);
+    await vi.waitFor(() => {
+      expect(callbacks.onSessionClosed).toHaveBeenCalledWith('deadline', true);
+    });
 
     const budget = new GptLiveBudget(path.join(workDir, 'budget.json'));
     await budget.load();
