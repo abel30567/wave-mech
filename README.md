@@ -4,7 +4,7 @@ A voice-first application built around the Claude Code harness and Fermi MCP.
 
 ## Status
 
-The P2 preview supports hands-free foreground turns, bounded mobile reconnection, and explicit read-only web/Fermi tools. It remains a development preview: physical iPhone acceptance and final PR merge are still pending.
+The P2 preview supports hands-free foreground turns, bounded mobile reconnection, web/Fermi tools, and copyable conversation diagnostics. The owner has explicitly authorized automatic execution of requested Fermi actions, including consequential actions. It remains a development preview: physical iPhone acceptance and final PR merge are still pending.
 
 ## Run locally
 
@@ -16,11 +16,17 @@ npm run build
 npm start
 ```
 
-Open `http://127.0.0.1:4317`. `npm run dev` runs the development server. Inference uses the existing Claude Code CLI configuration and authentication; the application does not call an inference API directly.
+Open `http://127.0.0.1:4317`. `npm run dev` runs the development server. Inference follows the Fermi daemon pattern: a persistent Claude Code CLI process, streaming JSON I/O, native Claude login, and explicit `--model 'claude-opus-4-6[1m]'`. Authenticate with the CLI's supported `claude auth login` flow if needed. The application does not call an inference API directly.
 
 For speech, provide `ELEVENLABS_API_KEY` in the server environment, or a private (0600) key file selected by `WAVE_ELEVENLABS_KEY_FILE` (default `.wave-mech/elevenlabs.key`). Never put credentials in browser code, chat, or version control. `WAVE_VOICE_ID` selects the ElevenLabs voice. An optional operator-provided token broker can use `WAVE_SPEECH_TOKEN_URL` with a `{type}` placeholder and `WAVE_SPEECH_TOKEN_AUTH`; that adapter expects POST returning JSON containing `token`.
 
-The CLI's own configuration selects its inference route. Tool authorization is separate from inference authentication. The app explicitly enables `WebSearch`, `WebFetch`, `ToolSearch`, and read-only Fermi memory/skill discovery/loading through the configured Fermi MCP endpoint. Skill creation, secrets, generic execution, shell/file mutation, and other consequential capabilities remain denied.
+The voice subprocess uses Anthropic directly, not an inherited coding proxy. The server removes inherited `ANTHROPIC_*` overrides (including API keys and proxy auth tokens), alternate-provider switches, and HTTP(S)/ALL proxy variables from that child while preserving supported Claude OAuth authentication. User/project settings are excluded from voice sessions; global settings and other agents are unchanged. The requested Opus 4.6 / 1M option must be available to the authenticated account; no fallback model is configured. Tool authorization is separate from inference authentication. The app enables `WebSearch`, `WebFetch`, `ToolSearch`, and all tools in the explicitly registered `mcp__fermi__` namespace, including Fermi execution and write capabilities. These run without app-layer tool prompts for user-requested actions. Local Claude shell/filesystem tools and unrelated MCP namespaces remain unavailable; Fermi's enforced service permissions still apply. Loading a skill is not evidence that an integration operation succeeded.
+
+## Copy a debug transcript
+
+Use **Copy transcript** beside the conversation heading. It copies retained conversation text plus timestamped tool attempts/outcomes, safe failure categories, and audio/connection diagnostics. Copy still works after End or disconnect; starting a new session clears the previous report. If the browser denies clipboard access, a selectable report appears instead. Nothing is uploaded automatically.
+
+Diagnostics retain at most 200 records / 64 KiB per log and report when earlier records were omitted. Raw tool inputs/results, HTTP headers, credentials, signed URL queries, and audio are not diagnostic fields. Common credential patterns in conversation text are redacted as a best-effort precaution; **review the transcript before sharing**, since conversation text can contain personal or otherwise sensitive information. Configured and harness-reported models are labeled separately. Operators may set a non-secret `WAVE_BUILD_ID` (for example a tested commit/patch identifier); an unset build is reported as unknown, not guessed.
 
 ## Verify
 
@@ -54,4 +60,4 @@ Voice sessions will be isolated from unrelated background tasks. Stopping audio 
 
 ## Security boundaries
 
-Long-lived credentials stay server-side and out of source control, browser code, and logs. Consequential tool actions require appropriate confirmation. Each harness process must establish and verify its own MCP access.
+Long-lived credentials stay server-side and out of source control, browser code, model context, and diagnostic logs. The owner has authorized automatic Fermi actions for this private preview; there is no additional app confirmation bridge. This does not authorize actions merely because a retrieved page or skill requests them, remove Fermi's service restrictions, or grant access to unrelated local tools. Each harness process must establish and verify its own MCP access. Keep the protected preview access gate enabled.

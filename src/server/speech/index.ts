@@ -1,5 +1,6 @@
 import { WebSocket, type RawData } from 'ws';
 import type { SpeechOptions, SpeechSession } from '../../shared/contracts.js';
+import type { DiagnosticInput } from '../../shared/diagnostics.js';
 import {
   DEFAULT_STT_ENDPOINT,
   DEFAULT_TTS_ENDPOINT,
@@ -16,6 +17,22 @@ import {
 } from './protocol.js';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
+// ElevenLabs' TTS `stream-input` socket closes after 20 s of inactivity (its
+// default `inactivity_timeout`). During a long Fermi tool wait the model can
+// open TTS with a preamble and then pause well past that window, so the socket
+// is silently dropped and the eventual continuation fails. The documented
+// keepalive is a single space, which resets the idle timer WITHOUT ending
+// generation — an *empty* string would be the End-of-Sequence and close the
+// stream, so it must never be used as a keepalive. We ping comfortably inside
+// the window. (Bounded: it runs only while a TTS socket is open and is cleared
+// on flush/cancel/teardown/close.)
+const DEFAULT_TTS_KEEPALIVE_MS = 15_000;
+
+/** Internal, non-contract tuning knobs (kept out of the shared SpeechOptions). */
+export interface SpeechTuning {
+  /** Interval between TTS idle keepalive pings; must stay below the server's idle timeout. */
+  ttsKeepAliveMs?: number;
+}
 // Deliberately small: the caller drives one manual turn at a time, so a large
 // backlog means the peer is unhealthy rather than merely slow.
 const MAX_QUEUED_FRAMES = 256;
@@ -155,12 +172,17 @@ function rawToString(data: RawData): string {
   return Buffer.from(data as ArrayBuffer).toString('utf8');
 }
 
-export function createSpeech(options: SpeechOptions): SpeechSession {
+export function createSpeech(options: SpeechOptions, tuning: SpeechTuning = {}): SpeechSession {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const sttEndpoint = options.endpoints?.stt ?? DEFAULT_STT_ENDPOINT;
   const ttsEndpoint = options.endpoints?.tts ?? DEFAULT_TTS_ENDPOINT;
+  const ttsKeepAliveMs = tuning.ttsKeepAliveMs ?? DEFAULT_TTS_KEEPALIVE_MS;
 
   let closed = false;
+
+  const emitDiagnostic = (input: DiagnosticInput): void => {
+    try { options.onDiagnostic?.(input); } catch { /* must not break speech */ }
+  };
 
   // --- Speech-to-text (persistent across manual turns) ----------------------
   let stt: SpeechSocket | undefined;
@@ -216,8 +238,10 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
       await socket.open(withSttToken(sttEndpoint, token), timeoutMs);
     } catch (error) {
       if (stt === socket) stt = undefined;
+      emitDiagnostic({ source: 'speech', code: 'stt_connect_failed', reason: 'network' });
       throw error;
     }
+    emitDiagnostic({ source: 'speech', code: 'stt_connected' });
     // A cancellation may have landed while the socket was opening; never let an
     // orphaned-but-open socket become the active recognition.
     if (closed || generation !== sttGeneration || stt !== socket) {
@@ -275,6 +299,7 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
     acceptedBytes = 0;
     stt?.teardown();
     stt = undefined;
+    emitDiagnostic({ source: 'speech', code: 'stt_aborted' });
   };
 
   const commitRecognition = (): Promise<string> => {
@@ -303,6 +328,29 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
   // Synthesis epoch: bumped on cancel/close so a socket that finishes opening —
   // or an audio frame that arrives — after cancellation cannot feed a replacement.
   let ttsGeneration = 0;
+  let ttsKeepAlive: ReturnType<typeof setTimeout> | undefined;
+
+  const clearTtsKeepAlive = (): void => {
+    if (ttsKeepAlive) clearTimeout(ttsKeepAlive);
+    ttsKeepAlive = undefined;
+  };
+
+  // Keep an open-but-idle TTS socket alive during a long tool wait. A single
+  // space resets the server's idle timer without ending generation; we never
+  // send an empty string here (that is EOS). Re-armed after each real frame and
+  // after each ping; cleared whenever the socket is finishing or torn down so a
+  // ping can never race a flush or land after EOS.
+  const armTtsKeepAlive = (): void => {
+    clearTtsKeepAlive();
+    const socket = tts;
+    if (closed || !socket) return;
+    ttsKeepAlive = setTimeout(() => {
+      if (closed || tts !== socket || pendingFinish) return;
+      socket.send(ttsTextFrame(' '));
+      armTtsKeepAlive();
+    }, ttsKeepAliveMs);
+    (ttsKeepAlive as { unref?: () => void }).unref?.();
+  };
 
   const settleFinish = (error: Error): void => {
     if (!pendingFinish) return;
@@ -313,25 +361,36 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
   };
 
   const teardownTts = (): void => {
+    clearTtsKeepAlive();
     tts?.teardown();
     tts = undefined;
     ttsStarting = undefined;
   };
 
+  let ttsFirstAudio = false;
+
   const handleTtsFrame = (raw: string): void => {
     const event = parseTtsEvent(raw);
     if (event.error) {
       settleFinish(new Error('speech_synthesis_error'));
+      emitDiagnostic({ source: 'speech', code: 'tts_error', reason: 'provider' });
       options.onError(event.error);
       return;
     }
     if (event.ignore) return;
-    if (event.audio) options.onAudio(event.audio, TTS_SAMPLE_RATE);
+    if (event.audio) {
+      if (!ttsFirstAudio) {
+        ttsFirstAudio = true;
+        emitDiagnostic({ source: 'speech', code: 'tts_first_audio', sampleRate: TTS_SAMPLE_RATE });
+      }
+      options.onAudio(event.audio, TTS_SAMPLE_RATE);
+    }
     if (event.final && pendingFinish) {
       clearTimeout(pendingFinish.timer);
       const resolve = pendingFinish.resolve;
       pendingFinish = undefined;
       resolve();
+      emitDiagnostic({ source: 'speech', code: 'tts_finished' });
       teardownTts();
     }
   };
@@ -346,6 +405,7 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
     });
     tts = socket;
     socket.send(ttsInitFrame());
+    armTtsKeepAlive();
     ttsStarting = (async () => {
       const token = await options.getToken('tts_websocket');
       if (closed || generation !== ttsGeneration || tts !== socket) {
@@ -369,6 +429,7 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
 
   const writeText = (text: string): void => {
     if (closed || !text) return;
+    if (!tts && !ttsStarting) ttsFirstAudio = false;
     textBuffer += text;
     if (textBuffer.length > 8192) throw new Error('speech_text_overflow');
     let end = textBuffer.length;
@@ -377,11 +438,15 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
     ensureTts();
     tts?.send(ttsTextFrame(textBuffer.slice(0, end)));
     textBuffer = textBuffer.slice(end);
+    // Real text resets the idle window; re-arm so the next tool wait is covered.
+    armTtsKeepAlive();
   };
 
   const finishSpeech = (): Promise<void> => {
     if (closed) return Promise.reject(new Error('speech_closed'));
     if (pendingFinish) return Promise.reject(new Error('speech_finish_in_progress'));
+    // No more idle: we are about to send EOS, so a keepalive space must not race it.
+    clearTtsKeepAlive();
     if (textBuffer) {
       ensureTts();
       tts?.send(ttsTextFrame(`${textBuffer} `));
@@ -408,7 +473,9 @@ export function createSpeech(options: SpeechOptions): SpeechSession {
     ttsGeneration++;
     settleFinish(new Error('speech_cancelled'));
     textBuffer = '';
+    ttsFirstAudio = false;
     teardownTts();
+    emitDiagnostic({ source: 'speech', code: 'tts_cancelled' });
   };
 
   const close = (): void => {

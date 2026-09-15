@@ -1,20 +1,8 @@
 import type { ToolAccessOptions } from '../../shared/access-contracts.js';
 
 const BUILTIN_TOOLS = ['WebSearch', 'WebFetch', 'ToolSearch'] as const;
-
-const MCP_ALLOWED_TOOLS = [
-  'mcp__fermi__memory_recall',
-  'mcp__fermi__skill_search',
-  'mcp__fermi__skill_load',
-] as const;
-
-const ALLOWED_TOOLS: readonly string[] = [...BUILTIN_TOOLS, ...MCP_ALLOWED_TOOLS];
-
-const DENIED_TOOLS = [
-  'mcp__fermi__secret_resolve',
-  'mcp__fermi__skill_set',
-  'mcp__fermi__execute',
-];
+const FERMI_PREFIX = 'mcp__fermi__';
+const ALLOWED_TOOLS = [...BUILTIN_TOOLS, `${FERMI_PREFIX}*`];
 
 function shellQuote(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
@@ -35,8 +23,7 @@ export function buildToolArguments(options: ToolAccessOptions): string[] {
 
   const settings = {
     permissions: {
-      allow: [...ALLOWED_TOOLS],
-      deny: [...DENIED_TOOLS],
+      allow: ALLOWED_TOOLS,
     },
     hooks: {
       PreToolUse: [
@@ -59,15 +46,15 @@ export function buildToolArguments(options: ToolAccessOptions): string[] {
     '--tools', BUILTIN_TOOLS.join(','),
     '--permission-mode', 'dontAsk',
     '--allowedTools', ALLOWED_TOOLS.join(','),
-    '--disallowedTools', DENIED_TOOLS.join(','),
     '--settings', JSON.stringify(settings),
   ];
 }
 
 export function permissionHookSource(): string {
-  const whitelist = JSON.stringify(ALLOWED_TOOLS);
+  const builtins = JSON.stringify([...BUILTIN_TOOLS]);
   return `'use strict';
-const WHITELIST = new Set(${whitelist});
+const BUILTINS = new Set(${builtins});
+const FERMI_PREFIX = ${JSON.stringify(FERMI_PREFIX)};
 const MAX_INPUT = 65536;
 let data = '', overflow = false;
 
@@ -91,10 +78,14 @@ process.stdin.on('end', () => {
   try {
     const input = JSON.parse(data);
     const toolName = input && typeof input === 'object' ? input.tool_name : undefined;
-    if (typeof toolName === 'string' && WHITELIST.has(toolName)) {
+    if (typeof toolName !== 'string') {
+      respond('deny', 'Tool not permitted: ' + String(toolName ?? 'unknown').slice(0, 100));
+      return;
+    }
+    if (BUILTINS.has(toolName) || (toolName.startsWith(FERMI_PREFIX) && /^[a-zA-Z0-9_-]{1,100}$/.test(toolName.slice(FERMI_PREFIX.length)))) {
       respond('allow');
     } else {
-      respond('deny', 'Tool not permitted: ' + String(toolName ?? 'unknown').slice(0, 100));
+      respond('deny', 'Tool not permitted: ' + toolName.slice(0, 100));
     }
   } catch {
     respond('deny', 'Malformed hook input');

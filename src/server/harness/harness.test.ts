@@ -8,6 +8,7 @@ const FIXTURE = fileURLToPath(new URL('./fixtures/cli-fixture.mjs', import.meta.
 interface Harness {
   start(): Promise<void>;
   send(text: string): Promise<void>;
+  interrupt(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -25,7 +26,7 @@ function build(
     env: { SCENARIO: scenario, ...extraEnv },
     onEvent: (event) => events.push(event),
     ...overrides,
-  });
+  }) as unknown as Harness;
   openSessions.push(session);
   return {
     session,
@@ -59,11 +60,12 @@ describe('createHarness', () => {
     const { session, events } = build('basic');
     await session.start();
     await vi.waitFor(() => {
-      expect(events.find((e) => e.type === 'ready')).toEqual({
+      const ready = events.find((e) => e.type === 'ready');
+      expect(ready).toBeDefined();
+      expect(ready).toMatchObject({
         type: 'ready', sessionId: 'fixture-session', tools: ['Read', 'Bash'],
       });
     });
-    // No inference happened just from starting.
     expect(events.some((e) => e.type === 'text')).toBe(false);
   });
 
@@ -75,18 +77,19 @@ describe('createHarness', () => {
     expect(texts()).not.toContain('secret reasoning');
     expect(texts()).not.toContain('passwd');
     expect(texts()).not.toContain('NESTED-LEAK');
-    // Exactly two deltas -> two text events (no completed-message duplication).
     expect(events.filter((e) => e.type === 'text')).toHaveLength(2);
   });
 
-  it('emits tool running/done status', async () => {
+  it('emits tool running/done status with callId and durationMs', async () => {
     const { session, tools } = build('basic');
     await session.start();
     await session.send('hi');
-    expect(tools()).toEqual([
-      { type: 'tool', name: 'Read', status: 'running' },
-      { type: 'tool', name: 'Read', status: 'done' },
-    ]);
+    const toolEvents = tools() as Array<Extract<HarnessEvent, { type: 'tool' }>>;
+    expect(toolEvents).toHaveLength(2);
+    expect(toolEvents[0]).toMatchObject({ type: 'tool', name: 'Read', status: 'running', callId: 'tool-1' });
+    expect(toolEvents[1]).toMatchObject({ type: 'tool', name: 'Read', status: 'done', callId: 'tool-1' });
+    expect(toolEvents[1].durationMs).toBeTypeOf('number');
+    expect(toolEvents[1].durationMs).toBeGreaterThanOrEqual(0);
   });
 
   it('reassembles multi-byte UTF-8 text fragmented across chunk boundaries', async () => {
@@ -147,7 +150,7 @@ describe('createHarness', () => {
       timeoutMs: 2000,
       onEvent: (e) => events.push(e),
     });
-    openSessions.push(session);
+    openSessions.push(session as unknown as Harness);
     await expect(session.start()).rejects.toThrow(/failed to start/i);
   });
 
@@ -158,9 +161,7 @@ describe('createHarness', () => {
     const closed = session.close();
     await expect(pending).rejects.toThrow(/closed/i);
     await expect(closed).resolves.toBeUndefined();
-    // Idempotent: a second close resolves too.
     await expect(session.close()).resolves.toBeUndefined();
-    // Sending after close is rejected.
     await expect(session.send('again')).rejects.toThrow(/closed/i);
   });
 
@@ -181,45 +182,40 @@ describe('createHarness', () => {
     const { session, tools } = build('basic', { TOOL_ERROR: 'failed' });
     await session.start();
     await session.send('hi');
-    expect(tools()).toEqual([
-      { type: 'tool', name: 'Read', status: 'running' },
-      { type: 'tool', name: 'Read', status: 'failed' },
-    ]);
+    const toolEvents = tools() as Array<Extract<HarnessEvent, { type: 'tool' }>>;
+    expect(toolEvents[1]).toMatchObject({ type: 'tool', name: 'Read', status: 'failed' });
   });
 
   it('maps a permission-denied tool_result to denied', async () => {
     const { session, tools } = build('basic', { TOOL_ERROR: 'denied' });
     await session.start();
     await session.send('hi');
-    expect(tools().at(-1)).toEqual({ type: 'tool', name: 'Read', status: 'denied' });
+    const last = tools().at(-1) as Extract<HarnessEvent, { type: 'tool' }>;
+    expect(last).toMatchObject({ type: 'tool', name: 'Read', status: 'denied' });
+    expect(last.reason).toBe('policy_denied');
   });
 
   it('interrupt() with no active turn resolves without a control_request', async () => {
     const { session } = build('basic');
     await session.start();
-    // Casting: interrupt is a P2 compatibility method on the adapter.
-    await expect((session as unknown as { interrupt(): Promise<void> }).interrupt()).resolves.toBeUndefined();
+    await expect(session.interrupt()).resolves.toBeUndefined();
   });
 
   it('interrupt() acknowledges, settles the turn, and fences late generation text', async () => {
     const built = build('interrupt', {}, { timeoutMs: 2000 });
-    const session = built.session as unknown as { interrupt(): Promise<void> } & typeof built.session;
+    const session = built.session;
     await session.start();
     const turn = session.send('go');
-    // Wait until the fixture has streamed its first (pre-interrupt) delta.
     await vi.waitFor(() => expect(built.texts()).toContain('Partial answer'));
     await session.interrupt();
-    // The aborted turn settles (resolve or reject is acceptable) rather than hanging.
     await turn.then(() => undefined, () => undefined);
-    // Late text emitted after the interrupt request must be fenced out.
     expect(built.texts()).not.toContain('LATE-AFTER-INTERRUPT');
   });
 
   it('interrupt() rejects when the control_request is never acknowledged', async () => {
     const built = build('interrupt', { INTERRUPT_NOACK: '1' }, { timeoutMs: 8000 });
-    const session = built.session as unknown as { interrupt(): Promise<void> } & typeof built.session;
+    const session = built.session;
     await session.start();
-    // The hanging turn is settled by afterEach close(); swallow its rejection.
     const turn = session.send('go');
     turn.catch(() => undefined);
     await vi.waitFor(() => expect(built.texts()).toContain('Partial answer'));
@@ -228,62 +224,50 @@ describe('createHarness', () => {
 
   it('quarantines after an unacknowledged interrupt so a replacement send is refused', async () => {
     const built = build('interrupt', { INTERRUPT_NOACK: '1' }, { timeoutMs: 400 });
-    const session = built.session as unknown as { interrupt(): Promise<void> } & typeof built.session;
+    const session = built.session;
     await session.start();
     const turn = session.send('go');
     turn.catch(() => undefined);
     await vi.waitFor(() => expect(built.texts()).toContain('Partial answer'));
-    // A short timeout collides the receipt and turn timers; either way the
-    // interrupt rejects (never resolves as a clean cancel) and quarantines.
     await expect(session.interrupt()).rejects.toThrow();
-    // The turn itself fails locally rather than resolving as a clean cancel.
     await expect(turn).rejects.toThrow();
-    // A replacement send must not lift the fence over possibly-live generation.
     await expect(session.send('replacement')).rejects.toThrow(/quarantined/i);
   });
 
   it('rejects and quarantines when an acknowledged interrupt never settles the turn (ACK / no result)', async () => {
     const built = build('interrupt', { INTERRUPT_NO_RESULT: '1' }, { timeoutMs: 500 });
-    const session = built.session as unknown as { interrupt(): Promise<void> } & typeof built.session;
+    const session = built.session;
     await session.start();
     const turn = session.send('go');
     turn.catch(() => undefined);
     await vi.waitFor(() => expect(built.texts()).toContain('Partial answer'));
-    // Acknowledged but no terminal result: a local settle timeout is not proven
-    // cancellation, so the interrupt rejects rather than resolving as success.
     await expect(session.interrupt()).rejects.toThrow();
     await expect(turn).rejects.toThrow();
-    // The fence stays raised: the fixture's post-ACK delta never surfaces.
     expect(built.texts()).not.toContain('LATE-AFTER-INTERRUPT');
     await expect(session.send('replacement')).rejects.toThrow(/quarantined/i);
   });
 
   it('rejects, fences, and quarantines when the process explicitly refuses the interrupt', async () => {
     const built = build('interrupt', { INTERRUPT_REJECT: '1' }, { timeoutMs: 2000 });
-    const session = built.session as unknown as { interrupt(): Promise<void> } & typeof built.session;
+    const session = built.session;
     await session.start();
     const turn = session.send('go');
     turn.catch(() => undefined);
     await vi.waitFor(() => expect(built.texts()).toContain('Partial answer'));
-    // The refusal rejects the interrupt and the turn; the late old-generation
-    // result must NOT resolve the turn as a clean completion.
     await expect(session.interrupt()).rejects.toThrow(/interrupt refused/i);
     await expect(turn).rejects.toThrow(/interrupt refused/i);
-    // Give the fixture's late old-generation output time to arrive over stdout.
     await new Promise((resolve) => setTimeout(resolve, 150));
     expect(built.texts()).not.toContain('LATE-AFTER-INTERRUPT');
     await expect(session.send('replacement')).rejects.toThrow(/quarantined/i);
   });
 
   it('never surfaces late old-generation deltas after an unconfirmed interrupt', async () => {
-    // ACK arrives, then the settle timeout quarantines before the deferred late
-    // result would arrive: no old-generation text or result may resurface.
     const built = build(
       'interrupt',
       { INTERRUPT_NO_RESULT: '1', INTERRUPT_LATE_RESULT: '1', LATE_MS: '400' },
       { timeoutMs: 250 },
     );
-    const session = built.session as unknown as { interrupt(): Promise<void> } & typeof built.session;
+    const session = built.session;
     await session.start();
     const turn = session.send('go');
     turn.catch(() => undefined);
@@ -293,5 +277,125 @@ describe('createHarness', () => {
     expect(built.texts()).not.toContain('LATE-AFTER-INTERRUPT');
     expect(built.texts()).not.toContain('LATE-OLD-GENERATION');
     await expect(session.send('replacement')).rejects.toThrow(/quarantined/i);
+  });
+});
+
+describe('createHarness — model validation', () => {
+  it('preserves a safe Claude model identifier from system/init', async () => {
+    const { session, events } = build('basic', { MODEL: 'claude-opus-4-6' });
+    await session.start();
+    await vi.waitFor(() => {
+      const ready = events.find((e) => e.type === 'ready') as Extract<HarnessEvent, { type: 'ready' }>;
+      expect(ready?.model).toBe('claude-opus-4-6');
+    });
+  });
+
+  it('rejects a model identifier that does not match the safe pattern', async () => {
+    const { session, events } = build('basic', { MODEL: '../../../etc/passwd' });
+    await session.start();
+    await vi.waitFor(() => {
+      const ready = events.find((e) => e.type === 'ready') as Extract<HarnessEvent, { type: 'ready' }>;
+      expect(ready?.model).toBeUndefined();
+    });
+  });
+
+  it('rejects a model that does not start with claude-', async () => {
+    const { session, events } = build('basic', { MODEL: 'gpt-4o' });
+    await session.start();
+    await vi.waitFor(() => {
+      const ready = events.find((e) => e.type === 'ready') as Extract<HarnessEvent, { type: 'ready' }>;
+      expect(ready?.model).toBeUndefined();
+    });
+  });
+
+  it('reports the explicit 1M model without discarding its context suffix', async () => {
+    const { session, events } = build('basic', { MODEL: 'claude-opus-4-6[1m]' });
+    await session.start();
+    await vi.waitFor(() => {
+      expect(events.find(e => e.type === 'ready')).toMatchObject({ model: 'claude-opus-4-6[1m]' });
+    });
+  });
+});
+
+describe('createHarness — NDJSON fixture regressions', () => {
+  it('handles repeated/concurrent tool names with distinct callIds', async () => {
+    const built = build('concurrent_tools');
+    await built.session.start();
+    await built.session.send('go');
+    const toolEvents = built.tools() as Array<Extract<HarnessEvent, { type: 'tool' }>>;
+    const running = toolEvents.filter((t) => t.status === 'running');
+    const done = toolEvents.filter((t) => t.status === 'done');
+    expect(running).toHaveLength(2);
+    expect(done).toHaveLength(2);
+    expect(running[0].callId).toBe('ct-1');
+    expect(running[1].callId).toBe('ct-2');
+    expect(done[0].callId).toBe('ct-1');
+    expect(done[1].callId).toBe('ct-2');
+    expect(running[0].callId).not.toBe(running[1].callId);
+  });
+
+  it('classifies service failure despite is_error:false integration JSON as failed/provider', async () => {
+    const built = build('service_failure');
+    await built.session.start();
+    await built.session.send('go');
+    const toolEvents = built.tools() as Array<Extract<HarnessEvent, { type: 'tool' }>>;
+    const terminal = toolEvents.find((t) => t.status === 'failed');
+    expect(terminal).toBeDefined();
+    expect(terminal?.callId).toBe('sf-1');
+    expect(terminal?.reason).toBe('provider');
+    expect(terminal?.statusCode).toBe(503);
+  });
+
+  it('classifies pending_approval status as pending/approval_required', async () => {
+    const built = build('pending_approval');
+    await built.session.start();
+    await built.session.send('go');
+    const toolEvents = built.tools() as Array<Extract<HarnessEvent, { type: 'tool' }>>;
+    const terminal = toolEvents.find((t) => t.status === 'pending');
+    expect(terminal).toBeDefined();
+    expect(terminal?.reason).toBe('approval_required');
+  });
+
+  it('never emits raw arguments/results/errors/tokens in diagnostics for secret payloads', async () => {
+    const built = build('secret_sentinel');
+    await built.session.start();
+    await built.session.send('go');
+    const entries = built.tools() as Array<Extract<HarnessEvent, { type: 'tool' }>>;
+    const serialized = JSON.stringify(entries);
+    expect(serialized).not.toContain('sk-ant-XXXX');
+    expect(serialized).not.toContain('secret-token-value');
+    const entry = entries.find(e => e.callId === 'sec-1' && e.status === 'done');
+    expect(entry).toBeDefined();
+    expect(entry?.name).toBe('mcp__fermi__secret_resolve');
+    expect(entry?.status).toBe('done');
+  });
+
+  it('settles unresolved active tool attempts on exit/cancellation', async () => {
+    const built = build('tool_crash');
+    await built.session.start();
+    await expect(built.session.send('go')).rejects.toThrow(/exited/i);
+    const entries = built.tools() as Array<Extract<HarnessEvent, { type: 'tool' }>>;
+    expect(entries.filter(e => e.status === 'cancelled')).toEqual([expect.objectContaining({ callId: 'crash-tool', reason: 'cancelled' })]);
+    expect(entries.filter(e => e.status === 'done')).toEqual([]);
+  });
+
+  it('emits tool outcomes for the coordinator diagnostic log', async () => {
+    const built = build('basic');
+    await built.session.start();
+    await built.session.send('go');
+    const entries = (built.tools() as Array<Extract<HarnessEvent, { type: 'tool' }>>).filter(e => e.status !== 'running');
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toMatchObject({ callId: 'tool-1', name: 'Read', status: 'done' });
+    expect(entries[0].durationMs).toBeTypeOf('number');
+  });
+
+  it('deduplicates repeated tool starts and results from the stream', async () => {
+    const built = build('duplicate_tools');
+    await built.session.start();
+    await built.session.send('go');
+    const toolEvents = built.tools() as Array<Extract<HarnessEvent, { type: 'tool' }>>;
+    const terminal = toolEvents.filter((t) => t.status !== 'running');
+    expect(terminal).toHaveLength(1);
+    expect(terminal[0].status).toBe('done');
   });
 });

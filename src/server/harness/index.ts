@@ -1,20 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { StringDecoder } from 'node:string_decoder';
 import type { HarnessEvent, HarnessOptions, HarnessSession } from '../../shared/contracts.js';
-
-/**
- * P1 harness adapter.
- *
- * Owns a single, persistent Claude Code CLI subprocess that speaks newline
- * delimited JSON (NDJSON) on stdin/stdout. It is deliberately half-duplex:
- * one manual turn is admitted at a time and `send()` settles only when the
- * CLI reports a whole-turn `result`.
- *
- * Only eligible top-level assistant text is streamed as `text` events. Thinking
- * blocks, tool-input JSON, sub-agent (nested `parent_tool_use_id`) output and
- * the trailing completed-message/result duplication are intentionally not
- * re-emitted as speech.
- */
+import type { DiagnosticReason, DiagnosticToolStatus } from '../../shared/diagnostics.js';
 
 const DEFAULT_COMMAND = 'claude';
 
@@ -39,13 +26,15 @@ const CLOSE_GRACE_MS = 2_000;
 // unhealthy and cancellation must be reported as failed rather than assumed.
 const INTERRUPT_RECEIPT_MS = 5_000;
 
-/** Loose view of a CLI NDJSON line. The concrete schema is owned by the CLI. */
+const SAFE_MODEL_RE = /^claude-[a-z0-9][a-z0-9.\[\]-]{0,80}$/;
+
 interface CliMessage {
   type?: string;
   subtype?: string;
   session_id?: string;
   tools?: unknown;
   mcp_servers?: unknown;
+  model?: unknown;
   parent_tool_use_id?: string | null;
   event?: CliStreamEvent;
   message?: { role?: string; content?: unknown };
@@ -78,6 +67,12 @@ interface Pending {
   reject: (error: Error) => void;
   timer: NodeJS.Timeout | undefined;
   settled: boolean;
+}
+
+interface ActiveTool {
+  callId: string;
+  name: string;
+  startMs: number;
 }
 
 class ClaudeCliHarness implements HarnessSession {
@@ -120,8 +115,8 @@ class ClaudeCliHarness implements HarnessSession {
 
   /** Per-message map of content-block index -> block type (text/thinking/tool_use). */
   private blockTypes = new Map<number, string | undefined>();
-  /** tool_use id -> tool name, used to pair running/done status events. */
-  private toolNames = new Map<string, string>();
+  private activeTools = new Map<string, ActiveTool>();
+  private seenToolIds = new Set<string>();
 
   constructor(options: HarnessOptions) {
     if (typeof options?.onEvent !== 'function') {
@@ -222,6 +217,7 @@ class ClaudeCliHarness implements HarnessSession {
       // Reset per-turn parsing state so a prior turn cannot leak indices, and
       // lift any interrupt fence so this fresh generation streams normally.
       this.blockTypes.clear();
+      this.seenToolIds.clear();
       this.suppressStream = false;
 
       const line = JSON.stringify({
@@ -404,15 +400,22 @@ class ClaudeCliHarness implements HarnessSession {
       ? msg.tools.filter((t): t is string => typeof t === 'string')
       : undefined;
     const mcp = this.readMcpServers(msg.mcp_servers);
+    const model = this.validateModel(msg.model);
     const event: HarnessEvent = { type: 'ready' };
     if (typeof msg.session_id === 'string') event.sessionId = msg.session_id;
     if (tools) event.tools = tools;
     if (mcp) event.mcp = mcp;
+    if (model) event.model = model;
     this.emit(event);
     this.settleStart(undefined);
   }
 
-  /** Extract MCP connection metadata from system/init when the CLI reports it. */
+  private validateModel(value: unknown): string | undefined {
+    if (typeof value !== 'string') return undefined;
+    if (!SAFE_MODEL_RE.test(value)) return undefined;
+    return value;
+  }
+
   private readMcpServers(value: unknown): Array<{ name: string; status: string }> | undefined {
     if (!Array.isArray(value)) return undefined;
     const servers: Array<{ name: string; status: string }> = [];
@@ -472,8 +475,12 @@ class ClaudeCliHarness implements HarnessSession {
         this.blockTypes.set(index, block?.type);
         if (block?.type === 'tool_use' && typeof block.id === 'string') {
           const name = typeof block.name === 'string' ? block.name : 'tool';
-          this.toolNames.set(block.id, name);
-          this.emit({ type: 'tool', name, status: 'running' });
+          const callId = block.id;
+          if (this.seenToolIds.has(callId)) return;
+          this.seenToolIds.add(callId);
+          const active: ActiveTool = { callId, name, startMs: Date.now() };
+          this.activeTools.set(callId, active);
+          this.emit({ type: 'tool', name, status: 'running', callId });
         }
         return;
       }
@@ -498,7 +505,7 @@ class ClaudeCliHarness implements HarnessSession {
   }
 
   private handleToolResults(msg: CliMessage): void {
-    if (msg.parent_tool_use_id != null) return;
+    if (msg.parent_tool_use_id != null || this.suppressStream) return;
     const content = msg.message?.content;
     if (!Array.isArray(content)) return;
     for (const block of content) {
@@ -509,17 +516,54 @@ class ClaudeCliHarness implements HarnessSession {
       ) {
         const id = (block as { tool_use_id?: unknown }).tool_use_id;
         if (typeof id === 'string') {
-          const name = this.toolNames.get(id) ?? 'tool';
-          this.toolNames.delete(id);
-          // An errored tool result is a failure — a denial when the CLI/hook
-          // blocked it — never a successful `done`.
-          const status = (block as { is_error?: unknown }).is_error === true
-            ? (this.isDenial(block) ? 'denied' : 'failed')
-            : 'done';
-          this.emit({ type: 'tool', name, status });
+          const active = this.activeTools.get(id);
+          if (!active) continue; // duplicate, cancelled, or unrelated result
+          this.activeTools.delete(id);
+          const isError = (block as { is_error?: unknown }).is_error === true;
+          const { status, reason, statusCode } = this.classifyToolResult(block, isError);
+          const durationMs = Math.max(0, Date.now() - active.startMs);
+          this.emit({ type: 'tool', name: active.name, status, callId: id, durationMs, reason, statusCode });
         }
       }
     }
+  }
+
+  private classifyToolResult(
+    block: unknown,
+    isError: boolean,
+  ): { status: DiagnosticToolStatus; reason?: DiagnosticReason; statusCode?: number } {
+    const content = (block as { content?: unknown }).content;
+    const texts = typeof content === 'string' ? [content] : Array.isArray(content)
+      ? content.flatMap(value => value && typeof value.text === 'string' ? [value.text] : []) : [];
+    // A successful MCP transport can still carry an integration failure or a
+    // pending approval. Inspect structured envelopes before trusting is_error.
+    for (const text of texts) {
+      let value: unknown;
+      try { value = JSON.parse(text); } catch { continue; }
+      for (let depth = 0; depth < 3 && value && typeof value === 'object' && !Array.isArray(value); depth++) {
+        const item = value as Record<string, unknown>;
+        const statusCode = [item.statusCode, item.status, item.http_status].find(code => typeof code === 'number' && Number.isInteger(code) && code >= 100 && code <= 599) as number | undefined;
+        if (item.status === 'pending_approval' || item.status === 'approval_required') {
+          return { status: 'pending', reason: 'approval_required', statusCode };
+        }
+        const failed = item.ok === false || item.success === false || (item.error != null && item.error !== false && item.error !== '')
+          || ['error', 'failed', 'denied'].includes(String(item.status)) || (statusCode !== undefined && statusCode >= 400);
+        if (failed) {
+          const error = item.error && typeof item.error === 'object' ? item.error as Record<string, unknown> : undefined;
+          const code = typeof error?.code === 'string' ? error.code : typeof item.code === 'string' ? item.code : '';
+          const reason: DiagnosticReason = statusCode === 401 || statusCode === 403 || /auth|unauthorized/i.test(code) ? 'authentication'
+            : statusCode === 404 ? 'not_found' : statusCode === 429 || /rate_limit/i.test(code) ? 'rate_limited'
+            : /timeout/i.test(code) ? 'timeout' : /network|connection/i.test(code) ? 'network'
+            : statusCode && statusCode >= 500 ? 'provider' : 'unknown';
+          return { status: item.status === 'denied' || statusCode === 403 ? 'denied' : 'failed', reason, statusCode };
+        }
+        value = item.result;
+      }
+    }
+    if (!isError) return { status: 'done' };
+    const text = texts.join(' ');
+    if (/\b(denied|not allowed|blocked)\b|tool not permitted/i.test(text)) return { status: 'denied', reason: 'policy_denied' };
+    return { status: 'failed', reason: 'unknown' };
   }
 
   private handleResult(msg: CliMessage): void {
@@ -538,17 +582,6 @@ class ClaudeCliHarness implements HarnessSession {
     this.failPending(new Error(message));
   }
 
-  /** Recognize a permission/policy denial in an errored tool result's content. */
-  private isDenial(block: unknown): boolean {
-    const content = (block as { content?: unknown }).content;
-    const text = typeof content === 'string'
-      ? content
-      : Array.isArray(content)
-        ? content.map((c) => (c && typeof c === 'object' ? String((c as { text?: unknown }).text ?? '') : '')).join(' ')
-        : '';
-    return /\b(denied|permission|not allowed|blocked)\b/i.test(text);
-  }
-
   private readMessage(msg: CliMessage): string | undefined {
     if (typeof msg.error === 'string') return msg.error;
     if (typeof msg.result === 'string' && msg.is_error === true) return msg.result;
@@ -561,12 +594,21 @@ class ClaudeCliHarness implements HarnessSession {
 
   private onExit(code: number | null, signal: NodeJS.Signals | null): void {
     this.ready = false;
+    this.settleActiveTools('cancelled');
     if (this.pending) {
       const detail = signal ? `signal ${signal}` : `code ${code ?? 'unknown'}`;
       this.failPending(new Error(`Harness process exited (${detail}) before completing the turn.`));
     }
     this.settleStart(new Error('Harness process exited before it became ready.'));
     this.finishClose();
+  }
+
+  private settleActiveTools(status: 'cancelled' | 'failed'): void {
+    for (const [id, active] of this.activeTools) {
+      const durationMs = Math.max(0, Date.now() - active.startMs);
+      this.emit({ type: 'tool', name: active.name, status, callId: id, durationMs, reason: status === 'cancelled' ? 'cancelled' : 'unknown' });
+    }
+    this.activeTools.clear();
   }
 
   private finishClose(): void {
@@ -582,6 +624,7 @@ class ClaudeCliHarness implements HarnessSession {
   }
 
   private resolvePending(): void {
+    this.settleActiveTools(this.pendingInterrupt ? 'cancelled' : 'failed');
     const pending = this.pending;
     if (!pending || pending.settled) return;
     pending.settled = true;
@@ -609,6 +652,7 @@ class ClaudeCliHarness implements HarnessSession {
       // The aborted turn has genuinely settled: the interrupt is complete.
       this.settleInterrupt(interrupt, undefined);
     }
+    this.settleActiveTools('cancelled');
     const pending = this.pending;
     if (!pending || pending.settled) return;
     pending.settled = true;

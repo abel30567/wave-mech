@@ -1,4 +1,5 @@
 import type { HarnessEvent } from '../../shared/contracts.js';
+import { DiagnosticLog, type DiagnosticInput, type DiagnosticReason } from '../../shared/diagnostics.js';
 import {
   MAX_AUDIO_SEQUENCE,
   PCM_RATE,
@@ -15,34 +16,8 @@ import {
   type TranscriptEntry,
 } from '../../shared/realtime.js';
 
-/**
- * P2 conversation coordinator.
- *
- * Owns the durable conversational state for one authenticated session while
- * main owns authentication, the single-session registry, the connection epoch
- * and the 120-second detach expiry. Sockets attach and detach around this
- * coordinator; the transcript, turn state and the persistent Claude Code CLI
- * inference all survive a reconnection.
- *
- * Invariants enforced here (see docs/p2-worker-contract.md):
- *  - Turn ids strictly increase; ids/state are reserved before any await.
- *  - Input audio is contiguous, accepted at most once, and bounded; an ACK is
- *    emitted only once the speech adapter actually accepts a frame.
- *  - Commit, user text and inference happen exactly once per turn; duplicate
- *    calls with identical content are idempotent and conflicting reuse fails.
- *  - Never more than one inference in flight, and never continue past an
- *    unconfirmed interrupt settlement.
- *  - A disconnected response finishes into retained text without emitting
- *    unbounded unheard TTS, and resume never replays possibly heard audio.
- */
-
-// ~120 seconds of mono PCM16 @ 16 kHz — the same recording ceiling P1 uses.
 const MAX_INPUT_BYTES = PCM_RATE * 2 * 120;
-// Bound the transcript we retain for snapshots. This does not reset the model's
-// own context (the persistent CLI keeps that) — it only bounds resume payloads.
 const MAX_MESSAGES = 200;
-// Enough recent per-seq fingerprints to detect a conflicting duplicate frame
-// without retaining the whole utterance.
 const FINGERPRINT_WINDOW = 256;
 
 type InputStatus = 'recording' | 'committing' | 'committed' | 'aborted' | 'failed';
@@ -112,11 +87,15 @@ class Conversation implements RetainedConversation {
   private closePromise: Promise<void> | undefined;
   private closed = false;
 
+  private readonly diagnostics: DiagnosticLog;
+  private model: string | undefined;
+
   constructor(private readonly options: ConversationOptions) {
     this.id = options.id;
     this.mode = options.mode;
     this.now = options.now ?? Date.now;
     this.speechConfigured = typeof options.speech === 'function';
+    this.diagnostics = new DiagnosticLog('server', this.now);
   }
 
   // --- lifecycle ------------------------------------------------------------
@@ -131,6 +110,9 @@ class Conversation implements RetainedConversation {
         onPartial: (text) => this.onPartial(text),
         onAudio: (audio, sampleRate) => this.onAudio(audio, sampleRate),
         onError: (message) => this.onSpeechError(message),
+        onDiagnostic: (event) => {
+          if (!this.closed) this.recordDiagnostic({ ...event, turnId: this.response?.turnId ?? this.input?.turnId, responseId: this.response?.responseId });
+        },
       });
     }
 
@@ -164,7 +146,7 @@ class Conversation implements RetainedConversation {
       try {
         this.speech?.cancelSpeech();
       } catch {
-        /* best-effort: cancellation must not throw out of detach */
+        /* best-effort */
       }
     }
   }
@@ -173,6 +155,7 @@ class Conversation implements RetainedConversation {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
     this.phase = 'closed';
+    this.recordDiagnostic({ source: 'server', code: 'session_closed' });
     this.closePromise = (async () => {
       try {
         this.speech?.close();
@@ -304,6 +287,8 @@ class Conversation implements RetainedConversation {
     }
     if (this.capabilities) snapshot.capabilities = this.capabilities;
     if (this.notice) snapshot.notice = this.notice;
+    snapshot.diagnostics = this.diagnostics.snapshot();
+    if (this.model) snapshot.model = this.model;
     return snapshot;
   }
 
@@ -364,7 +349,7 @@ class Conversation implements RetainedConversation {
       this.emitNotice('stale_turn', 'There is no recording to finish.');
       return;
     }
-    if (input.status !== 'recording') return; // already committing/committed
+    if (input.status !== 'recording') return;
     if (lastSeq !== input.receivedSeq) {
       // A declared last sequence we never fully received means missing tail
       // audio; refuse to commit a truncated prefix and ask for a repeat.
@@ -412,7 +397,7 @@ class Conversation implements RetainedConversation {
   private onText(turnId: number, text: string): void {
     const signature = `text:${textSignature(text)}`;
     const existing = this.turnSignatures.get(turnId);
-    if (existing === signature) return; // idempotent replay
+    if (existing === signature) return;
     if (existing !== undefined || turnId <= this.lastTurnId) {
       this.emitNotice('stale_turn', 'That turn is no longer current.');
       return;
@@ -468,7 +453,7 @@ class Conversation implements RetainedConversation {
     this.response = response;
     this.input = undefined;
     this.setPhase('thinking');
-    // Run detached so interrupts can be handled while inference is in flight.
+    this.recordDiagnostic({ source: 'server', code: 'turn_start', turnId, responseId: response.responseId });
     this.inference = this.runInference(response, text);
   }
 
@@ -485,6 +470,7 @@ class Conversation implements RetainedConversation {
         /* ignore */
       }
       if (this.response === response) this.setPhase('idle');
+      this.recordDiagnostic({ source: 'server', code: 'inference_failed', turnId: response.turnId, responseId: response.responseId, reason: 'unknown' });
       this.emit({ type: 'error', code: 'inference_failed', message: 'The response could not be completed.', fatal: false });
       return;
     }
@@ -520,11 +506,12 @@ class Conversation implements RetainedConversation {
 
   private async onInterrupt(responseId: number): Promise<void> {
     const response = this.response;
-    if (!response || response.responseId !== responseId) return; // stale/unknown
+    if (!response || response.responseId !== responseId) return;
     if (response.cancelled) return;
     response.cancelled = true;
     response.audioInterrupted = true;
     this.setPhase('interrupting');
+    this.recordDiagnostic({ source: 'server', code: 'interruption', responseId, turnId: response.turnId });
 
     // Clear unheard output immediately on a separate synthesis epoch.
     try {
@@ -590,7 +577,11 @@ class Conversation implements RetainedConversation {
       case 'tool': {
         const response = this.response;
         if (!response || response.cancelled) return;
-        this.emit({ type: 'tool', responseId: response.responseId, name: event.name, status: event.status });
+        this.emit({ type: 'tool', responseId: response.responseId, name: event.name, status: event.status,
+          callId: event.callId, reason: event.reason, statusCode: event.statusCode, durationMs: event.durationMs });
+        this.recordDiagnostic({ source: 'server', code: event.status === 'running' ? 'tool_start' : 'tool_result',
+          callId: event.callId, tool: event.name, status: event.status, durationMs: event.durationMs,
+          reason: event.reason, statusCode: event.statusCode, turnId: response.turnId, responseId: response.responseId });
         return;
       }
       case 'error': {
@@ -632,6 +623,13 @@ class Conversation implements RetainedConversation {
 
   private onSpeechError(message: string): void {
     if (this.closed) return;
+
+    const category = this.classifySpeechError(message);
+    const reason: DiagnosticReason = category === 'timeout' ? 'timeout' : category === 'connection_lost' ? 'network'
+      : category === 'quota_exceeded' ? 'rate_limited' : category === 'unknown' ? 'unknown' : 'provider';
+    this.recordDiagnostic({ source: 'server', code: 'speech_error', reason,
+      turnId: this.response?.turnId ?? this.input?.turnId, responseId: this.response?.responseId });
+
     const input = this.input;
     if (input && input.status === 'recording') {
       // STT dropped before commit: reset only the unfinished input.
@@ -649,7 +647,16 @@ class Conversation implements RetainedConversation {
       return;
     }
     this.emitNotice('speech_error', 'The speech connection reported a problem.');
-    void message;
+  }
+
+  private classifySpeechError(message: string): string {
+    const lower = message.toLowerCase();
+    if (lower.includes('timeout')) return 'timeout';
+    if (lower.includes('quota')) return 'quota_exceeded';
+    if (lower.includes('connection') || lower.includes('disconnect')) return 'connection_lost';
+    if (lower.includes('stt') || lower.includes('recognition') || lower.includes('transcri')) return 'stt_error';
+    if (lower.includes('tts') || lower.includes('synthe') || lower.includes('speech')) return 'tts_error';
+    return 'unknown';
   }
 
   // --- helpers --------------------------------------------------------------
@@ -662,8 +669,10 @@ class Conversation implements RetainedConversation {
       const server = event.mcp.find((m) => m.name === 'fermi');
       fermi = server ? (server.status === 'connected' ? 'connected' : 'unavailable') : 'unavailable';
     }
+    if (event.model && /^claude-[a-z0-9.\[\]-]{1,80}$/.test(event.model)) this.model = event.model;
     this.capabilities = { web, fermi, tools: [...tools] };
-    this.emit({ type: 'capabilities', capabilities: this.capabilities });
+    this.recordDiagnostic({ source: 'server', code: 'connection_ready' });
+    this.emit({ type: 'capabilities', capabilities: this.capabilities, model: this.model });
   }
 
   /** True when a turn is being recorded, committed, or answered. */
@@ -756,6 +765,11 @@ class Conversation implements RetainedConversation {
   private emitNotice(code: string, message: string): void {
     this.notice = message;
     this.emit({ type: 'notice', code, message });
+  }
+
+  private recordDiagnostic(input: DiagnosticInput): void {
+    const event = this.diagnostics.record(input);
+    this.emit({ type: 'diagnostic', event });
   }
 
   private emit(event: RealtimeEvent): void {

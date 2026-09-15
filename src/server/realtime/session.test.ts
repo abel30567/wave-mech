@@ -12,9 +12,8 @@ import type {
   RetainedConversation,
 } from '../../shared/realtime.js';
 import type { SpeechTokenKind } from '../../shared/contracts.js';
+import type { DiagnosticSnapshot } from '../../shared/diagnostics.js';
 
-// Real subprocess CLI fixture + real WebSocket speech fixture. These tests
-// exercise process/socket races and error paths, not return-value stubs.
 const CLI_FIXTURE = fileURLToPath(new URL('../harness/fixtures/cli-fixture.mjs', import.meta.url));
 
 interface Built {
@@ -142,7 +141,6 @@ describe('createConversation — happy path', () => {
     const done = only(b.events, 'response_done')[0];
     expect(done.lastAudioSeq).toBe(audio.length);
 
-    // Playback acknowledgement returns to idle.
     b.conv.handle({ type: 'playback_done', responseId: 1, lastSeq: done.lastAudioSeq });
     await vi.waitFor(() => expect(b.conv.snapshot().phase).toBe('idle'));
   });
@@ -179,7 +177,7 @@ describe('createConversation — audio acceptance invariants', () => {
     await b.conv.handle({ type: 'record', turnId: 1 });
 
     b.conv.audio(frame(1, 1, 'a'));
-    b.conv.audio(frame(1, 1, 'a')); // identical retransmit
+    b.conv.audio(frame(1, 1, 'a'));
     expect(only(b.events, 'audio_ack').filter((e) => e.seq === 1)).toHaveLength(2);
     expect(only(b.events, 'input_aborted')).toHaveLength(0);
   });
@@ -191,8 +189,8 @@ describe('createConversation — audio acceptance invariants', () => {
     await b.conv.handle({ type: 'record', turnId: 1 });
 
     b.conv.audio(frame(1, 1, 'a'));
-    b.conv.audio(frame(1, 3, 'c')); // gap: dropped, no ack
-    b.conv.audio(frame(1, 2, 'b')); // fills the gap: accepted
+    b.conv.audio(frame(1, 3, 'c'));
+    b.conv.audio(frame(1, 2, 'b'));
     expect(only(b.events, 'audio_ack').map((e) => e.seq)).toEqual([1, 2]);
   });
 
@@ -203,7 +201,7 @@ describe('createConversation — audio acceptance invariants', () => {
     await b.conv.handle({ type: 'record', turnId: 1 });
 
     b.conv.audio(frame(1, 1, 'a'));
-    b.conv.audio(frame(1, 1, 'DIFFERENT')); // same seq, different bytes
+    b.conv.audio(frame(1, 1, 'DIFFERENT'));
     const aborted = only(b.events, 'input_aborted');
     expect(aborted).toHaveLength(1);
     expect(aborted[0]).toMatchObject({ turnId: 1, reason: 'discontinuity' });
@@ -248,9 +246,9 @@ describe('createConversation — turn ordering & idempotency', () => {
     b.attach();
     await b.conv.start();
     await b.conv.handle({ type: 'text', turnId: 1, text: 'hello' });
-    await b.conv.handle({ type: 'text', turnId: 1, text: 'hello' }); // exact replay -> idempotent
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'hello' });
     expect(only(b.events, 'notice').filter((n) => n.code === 'stale_turn')).toHaveLength(0);
-    await b.conv.handle({ type: 'text', turnId: 1, text: 'different' }); // conflicting reuse
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'different' });
     expect(only(b.events, 'notice').some((n) => n.code === 'stale_turn')).toBe(true);
   });
 });
@@ -266,7 +264,6 @@ describe('createConversation — interruption', () => {
     await b.conv.handle({ type: 'interrupt', responseId: 1 });
     expect(only(b.events, 'response_cancelled')).toEqual([{ type: 'response_cancelled', responseId: 1 }]);
     expect(only(b.events, 'response_done')).toHaveLength(0);
-    // Late fenced generation text must not have surfaced.
     expect(only(b.events, 'text').some((e) => e.text.includes('LATE-AFTER-INTERRUPT'))).toBe(false);
     expect(b.conv.snapshot().phase).toBe('idle');
   });
@@ -293,14 +290,11 @@ describe('createConversation — interruption', () => {
     await vi.waitFor(() => expect(only(b.events, 'text').some((e) => e.text.includes('Partial answer'))).toBe(true));
 
     await b.conv.handle({ type: 'interrupt', responseId: 1 });
-    // A failed settlement must NOT be dressed up as a clean cancellation.
     await vi.waitFor(() => expect(only(b.events, 'ended')).toHaveLength(1));
     expect(only(b.events, 'response_cancelled')).toHaveLength(0);
     const fatal = only(b.events, 'error').find((e) => e.code === 'interrupt_failed');
     expect(fatal?.fatal).toBe(true);
-    // Late old-generation text never surfaced.
     expect(only(b.events, 'text').some((e) => e.text.includes('LATE-AFTER-INTERRUPT'))).toBe(false);
-    // Admission is not reopened: a replacement turn is refused (session closed).
     await b.conv.handle({ type: 'text', turnId: 2, text: 'replacement' });
     expect(only(b.events, 'user').some((u) => u.text === 'replacement')).toBe(false);
   });
@@ -329,21 +323,15 @@ describe('createConversation — synthesis finalization stays busy', () => {
     b.attach();
     await b.conv.start();
     await b.conv.handle({ type: 'text', turnId: 1, text: 'first' });
-    // Wait until inference streamed text; finishSpeech is now in flight (busy)
-    // because the fixture defers the final audio frame.
     await vi.waitFor(() => expect(only(b.events, 'text').length).toBeGreaterThan(0));
     await vi.waitFor(() => expect(b.conv.snapshot().phase === 'thinking' || b.conv.snapshot().phase === 'speaking').toBe(true));
 
-    // A new typed turn during synthesis finalization must be refused as busy,
-    // not admitted (which would mislabel the first response's trailing audio).
     await b.conv.handle({ type: 'text', turnId: 2, text: 'second' });
     expect(only(b.events, 'notice').some((n) => n.code === 'busy')).toBe(true);
 
     await vi.waitFor(() => expect(only(b.events, 'response_done')).toHaveLength(1), { timeout: 3000 });
     expect(only(b.events, 'response_done')[0].responseId).toBe(1);
-    // Every audio frame belongs to the first response.
     expect(only(b.events, 'audio').every((a) => a.responseId === 1 && a.turnId === 1)).toBe(true);
-    // The second turn never produced a user echo or a second response.
     expect(only(b.events, 'user').some((u) => u.text === 'second')).toBe(false);
   });
 });
@@ -384,7 +372,6 @@ describe('createConversation — abort, ping, and lifecycle', () => {
     await b.conv.close();
     await b.conv.close();
     expect(only(b.events, 'ended')).toHaveLength(1);
-    // Commands after close are ignored.
     await b.conv.handle({ type: 'ping', id: 1 });
     expect(only(b.events, 'pong')).toHaveLength(0);
   });
@@ -407,7 +394,6 @@ describe('createConversation — detach / attach recovery', () => {
       { turnId: 1, role: 'user', text: 'hi there' },
       { turnId: 1, role: 'assistant', text: 'Hello café 🌊 world' },
     ]);
-    // A resume carries transcript/status only — never replayed audio frames.
     expect(only(resumeEvents, 'audio')).toHaveLength(0);
   });
 
@@ -416,14 +402,284 @@ describe('createConversation — detach / attach recovery', () => {
     b.attach();
     await b.conv.start();
     await b.conv.handle({ type: 'text', turnId: 1, text: 'slow one' });
-    // Detach after text has streamed but before the delayed result settles.
     await vi.waitFor(() => expect(only(b.events, 'text')).not.toHaveLength(0));
     b.conv.detach();
 
     await vi.waitFor(() => expect(b.conv.snapshot().response?.finished).toBe(true), { timeout: 2000 });
     const snap = b.conv.snapshot();
     expect(snap.response?.audioInterrupted).toBe(true);
-    expect(snap.response?.lastAudioSeq).toBe(0); // no unheard TTS was produced
+    expect(snap.response?.lastAudioSeq).toBe(0);
     expect(snap.messages.some((m) => m.role === 'assistant' && m.text === 'Hello café 🌊 world')).toBe(true);
+  });
+
+  it('includes diagnostics in reconnect snapshot', async () => {
+    const b = await build({ scenario: 'basic', withSpeech: false });
+    b.attach();
+    await b.conv.start();
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'hi' });
+    await vi.waitFor(() => expect(only(b.events, 'response_done')).toHaveLength(1));
+
+    b.conv.detach();
+    const resumeEvents: RealtimeEvent[] = [];
+    b.conv.attach((e) => resumeEvents.push(e));
+
+    const snap = only(resumeEvents, 'snapshot')[0].snapshot;
+    expect(snap.diagnostics).toBeDefined();
+    expect(snap.diagnostics!.entries.length).toBeGreaterThan(0);
+    expect(snap.diagnostics!.entries.every((e) => e.id.startsWith('server:'))).toBe(true);
+  });
+
+  it('includes model in reconnect snapshot capabilities', async () => {
+    const b = await build({ scenario: 'basic', harnessEnv: { MODEL: 'claude-opus-4-6' }, withSpeech: false });
+    b.attach();
+    await b.conv.start();
+    await vi.waitFor(() => expect(only(b.events, 'capabilities')).toHaveLength(1));
+
+    b.conv.detach();
+    const resumeEvents: RealtimeEvent[] = [];
+    b.conv.attach((e) => resumeEvents.push(e));
+
+    const snap = only(resumeEvents, 'snapshot')[0].snapshot;
+    expect(snap.model).toBe('claude-opus-4-6');
+  });
+});
+
+describe('createConversation — diagnostics', () => {
+  it('records tool outcomes with turnId/responseId/callId', async () => {
+    const b = await build({ scenario: 'basic', withSpeech: false });
+    b.attach();
+    await b.conv.start();
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'hi' });
+    await vi.waitFor(() => expect(only(b.events, 'response_done')).toHaveLength(1));
+
+    const snap = b.conv.snapshot();
+    const diag = snap.diagnostics!;
+    expect(diag.entries.length).toBeGreaterThan(0);
+    const start = diag.entries.find((e) => e.callId === 'tool-1' && e.code === 'tool_start');
+    expect(start).toBeDefined();
+    expect(start!.tool).toBe('Read');
+    expect(start!.status).toBe('running');
+    const result = diag.entries.find((e) => e.callId === 'tool-1' && e.code === 'tool_result');
+    expect(result).toBeDefined();
+    expect(result!.tool).toBe('Read');
+    expect(result!.turnId).toBe(1);
+    expect(result!.responseId).toBe(1);
+    expect(result!.status).toBe('done');
+    expect(result!.durationMs).toBeTypeOf('number');
+  });
+
+  it('emits type:diagnostic live events during tool completion', async () => {
+    const b = await build({ scenario: 'basic', withSpeech: false });
+    b.attach();
+    await b.conv.start();
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'hi' });
+    await vi.waitFor(() => expect(only(b.events, 'response_done')).toHaveLength(1));
+
+    const diagnosticEvents = only(b.events, 'diagnostic');
+    expect(diagnosticEvents.length).toBeGreaterThan(0);
+    expect(diagnosticEvents[0].event.source).toBe('server');
+  });
+
+  it('does not produce duplicate tool statuses', async () => {
+    const b = await build({ scenario: 'basic', withSpeech: false });
+    b.attach();
+    await b.conv.start();
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'hi' });
+    await vi.waitFor(() => expect(only(b.events, 'response_done')).toHaveLength(1));
+
+    const snap = b.conv.snapshot();
+    const diag = snap.diagnostics!;
+    const pairCounts = new Map<string, number>();
+    for (const entry of diag.entries) {
+      if (!entry.callId) continue;
+      const key = `${entry.callId}:${entry.code}`;
+      pairCounts.set(key, (pairCounts.get(key) ?? 0) + 1);
+    }
+    for (const [, count] of pairCounts) {
+      expect(count).toBe(1);
+    }
+  });
+
+  it('records concurrent/repeated tool names with distinct entries', async () => {
+    const b = await build({ scenario: 'concurrent_tools', withSpeech: false });
+    b.attach();
+    await b.conv.start();
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'go' });
+    await vi.waitFor(() => expect(only(b.events, 'response_done')).toHaveLength(1));
+
+    const snap = b.conv.snapshot();
+    const diag = snap.diagnostics!;
+    const readStarts = diag.entries.filter((e) => e.tool === 'Read' && e.code === 'tool_start');
+    const readResults = diag.entries.filter((e) => e.tool === 'Read' && e.code === 'tool_result');
+    expect(readStarts).toHaveLength(2);
+    expect(readResults).toHaveLength(2);
+    expect(readStarts[0].callId).not.toBe(readStarts[1].callId);
+  });
+
+  it('excludes secret content from diagnostic snapshot', async () => {
+    const b = await build({ scenario: 'secret_sentinel', withSpeech: false });
+    b.attach();
+    await b.conv.start();
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'go' });
+    await vi.waitFor(() => expect(only(b.events, 'response_done')).toHaveLength(1));
+
+    const snap = b.conv.snapshot();
+    const serialized = JSON.stringify(snap);
+    expect(serialized).not.toContain('sk-ant-XXXX');
+    expect(serialized).not.toContain('secret-token-value');
+  });
+
+  it('records server turn events in diagnostic log', async () => {
+    const b = await build({ scenario: 'basic', withSpeech: false });
+    b.attach();
+    await b.conv.start();
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'hi' });
+    await vi.waitFor(() => expect(only(b.events, 'response_done')).toHaveLength(1));
+
+    const snap = b.conv.snapshot();
+    const diag = snap.diagnostics!;
+    const turnEvents = diag.entries.filter((e) => e.code === 'turn_start');
+    expect(turnEvents.length).toBeGreaterThan(0);
+    expect(turnEvents[0].turnId).toBe(1);
+  });
+
+  it('records interruption event in diagnostics', async () => {
+    const b = await build({ scenario: 'interrupt', harnessTimeoutMs: 3000, withSpeech: false });
+    b.attach();
+    await b.conv.start();
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'go' });
+    await vi.waitFor(() => expect(only(b.events, 'text').some((e) => e.text.includes('Partial answer'))).toBe(true));
+    await b.conv.handle({ type: 'interrupt', responseId: 1 });
+
+    const snap = b.conv.snapshot();
+    const diag = snap.diagnostics!;
+    expect(diag.entries.some((e) => e.code === 'interruption')).toBe(true);
+  });
+
+  it('preserves snapshot compatibility when no diagnostics tool events exist', async () => {
+    const b = await build({ scenario: 'error', withSpeech: false });
+    b.attach();
+    await b.conv.start();
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'fail' });
+    // Wait for error event
+    await vi.waitFor(() => expect(only(b.events, 'error').length).toBeGreaterThan(0));
+
+    const snap = b.conv.snapshot();
+    expect(snap.diagnostics).toBeDefined();
+    expect(snap.diagnostics!.dropped).toBe(0);
+    expect(snap.messages).toBeDefined();
+    expect(snap.sessionId).toBe('sess-1');
+  });
+
+  it('records speech diagnostic category without raw message', async () => {
+    const b = await build({
+      scenario: 'basic',
+      withSpeech: false,
+    });
+    b.attach();
+    await b.conv.start();
+    const snap = b.conv.snapshot();
+    expect(snap.diagnostics).toBeDefined();
+    expect(snap.diagnostics!.entries.every((e) => e.source === 'server')).toBe(true);
+  });
+
+  it('bounds diagnostic entries to the configured limit', async () => {
+    const b = await build({ scenario: 'basic', withSpeech: false });
+    b.attach();
+    await b.conv.start();
+
+    // Run multiple turns to accumulate diagnostic entries
+    for (let i = 1; i <= 5; i++) {
+      await b.conv.handle({ type: 'text', turnId: i, text: `msg ${i}` });
+      await vi.waitFor(() => {
+        const done = only(b.events, 'response_done');
+        return expect(done.length).toBe(i);
+      });
+    }
+
+    const snap = b.conv.snapshot();
+    const diag = snap.diagnostics!;
+    expect(diag.entries.length).toBeLessThanOrEqual(200);
+  });
+
+  it('detects service failure despite is_error:false via structured envelope', async () => {
+    const b = await build({ scenario: 'service_failure', withSpeech: false });
+    b.attach();
+    await b.conv.start();
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'go' });
+    await vi.waitFor(() => expect(only(b.events, 'response_done')).toHaveLength(1));
+
+    const tools = only(b.events, 'tool');
+    const start = tools.find((t) => t.status === 'running');
+    const result = tools.find((t) => t.status !== 'running');
+    expect(start).toBeDefined();
+    expect(result).toBeDefined();
+    expect(result!.status).toBe('failed');
+    expect(result!.statusCode).toBe(503);
+    expect(result!.reason).toBe('provider');
+  });
+
+  it('records pending approval status from structured tool result', async () => {
+    const b = await build({ scenario: 'pending_approval', withSpeech: false });
+    b.attach();
+    await b.conv.start();
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'go' });
+    await vi.waitFor(() => expect(only(b.events, 'response_done')).toHaveLength(1));
+
+    const tools = only(b.events, 'tool');
+    const result = tools.find((t) => t.status === 'pending');
+    expect(result).toBeDefined();
+    expect(result!.reason).toBe('approval_required');
+  });
+
+  it('session isolation: second session does not see first session diagnostics', async () => {
+    const b1 = await build({ scenario: 'basic', withSpeech: false });
+    b1.attach();
+    await b1.conv.start();
+    await b1.conv.handle({ type: 'text', turnId: 1, text: 'hi' });
+    await vi.waitFor(() => expect(only(b1.events, 'response_done')).toHaveLength(1));
+    const snap1 = b1.conv.snapshot();
+
+    const b2 = await build({ scenario: 'basic', withSpeech: false });
+    b2.attach();
+    await b2.conv.start();
+    const snap2 = b2.conv.snapshot();
+
+    expect(snap1.diagnostics!.entries.length).toBeGreaterThan(0);
+    expect(snap2.diagnostics!.entries.length).toBeLessThan(snap1.diagnostics!.entries.length);
+    expect(snap2.diagnostics!.entries.every((e) => e.id.startsWith('server:'))).toBe(true);
+    expect(snap2.sessionId).toBe('sess-1');
+    expect(snap2.sessionId).toBe(snap1.sessionId);
+  });
+
+  it('transcript isolation: old cancelled tool results never mutate replacement turns', async () => {
+    const b = await build({ scenario: 'basic', withSpeech: false });
+    b.attach();
+    await b.conv.start();
+
+    // First turn
+    await b.conv.handle({ type: 'text', turnId: 1, text: 'first' });
+    await vi.waitFor(() => expect(only(b.events, 'response_done')).toHaveLength(1));
+
+    // Second turn
+    await b.conv.handle({ type: 'text', turnId: 2, text: 'second' });
+    await vi.waitFor(() => expect(only(b.events, 'response_done')).toHaveLength(2));
+
+    const snap = b.conv.snapshot();
+    // Check that turn 1 and turn 2 messages are distinct
+    const turn1User = snap.messages.filter((m) => m.turnId === 1 && m.role === 'user');
+    const turn2User = snap.messages.filter((m) => m.turnId === 2 && m.role === 'user');
+    expect(turn1User).toHaveLength(1);
+    expect(turn2User).toHaveLength(1);
+    expect(turn1User[0].text).toBe('first');
+    expect(turn2User[0].text).toBe('second');
+
+    // Diagnostic entries should have distinct turnIds
+    const diag = snap.diagnostics!;
+    const turn1Entries = diag.entries.filter((e) => e.turnId === 1);
+    const turn2Entries = diag.entries.filter((e) => e.turnId === 2);
+    // Each turn produces one tool entry (Read)
+    expect(turn1Entries.length).toBeGreaterThanOrEqual(1);
+    expect(turn2Entries.length).toBeGreaterThanOrEqual(1);
   });
 });

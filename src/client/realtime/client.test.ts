@@ -604,6 +604,124 @@ describe('conversation client: audio availability and independence', () => {
   });
 });
 
+describe('conversation client: diagnostics', () => {
+  it('records session lifecycle events in diagnostics()', async () => {
+    const h = setup();
+    const socket = await connected(h);
+    const diag = h.client.diagnostics!();
+    expect(diag.entries.some((e) => e.code === 'session_start')).toBe(true);
+    expect(diag.entries.some((e) => e.code === 'connect_started')).toBe(true);
+    expect(diag.entries.some((e) => e.code === 'socket_open')).toBe(true);
+    expect(diag.entries.some((e) => e.code === 'snapshot_received')).toBe(true);
+    expect(diag.entries.every((e) => e.source === 'client' || e.source === 'audio')).toBe(true);
+  });
+
+  it('merges server diagnostics from snapshot on reconnect without duplicates', async () => {
+    vi.useFakeTimers();
+    const h = setup();
+    await h.client.start();
+    const first = h.sockets[0];
+    first.open();
+    first.receive(snapshot({
+      sessionId: 'sess-d',
+      diagnostics: {
+        entries: [
+          { source: 'server' as const, code: 'turn_start', id: 'server:1', at: 1000, turnId: 1, responseId: 1 },
+          { source: 'server' as const, code: 'tool_result', id: 'server:2', at: 1001, tool: 'Read', callId: 'c1', status: 'done' as const, turnId: 1, responseId: 1 },
+        ],
+        dropped: 0,
+      },
+    }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    const diagBefore = h.client.diagnostics!();
+    const serverBefore = diagBefore.entries.filter((e) => e.source === 'server');
+    expect(serverBefore).toHaveLength(2);
+
+    first.drop();
+    await vi.advanceTimersByTimeAsync(750);
+    const second = h.sockets[1];
+    second.open();
+    second.receive(snapshot({
+      sessionId: 'sess-d',
+      diagnostics: {
+        entries: [
+          { source: 'server' as const, code: 'turn_start', id: 'server:1', at: 1000, turnId: 1, responseId: 1 },
+          { source: 'server' as const, code: 'tool_result', id: 'server:2', at: 1001, tool: 'Read', callId: 'c1', status: 'done' as const, turnId: 1, responseId: 1 },
+          { source: 'server' as const, code: 'turn_start', id: 'server:3', at: 1002, turnId: 2, responseId: 2 },
+        ],
+        dropped: 0,
+      },
+    }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    const diagAfter = h.client.diagnostics!();
+    const serverAfter = diagAfter.entries.filter((e) => e.source === 'server');
+    expect(serverAfter).toHaveLength(3);
+    const ids = serverAfter.map((e) => e.id);
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it('retains diagnostics history after end', async () => {
+    const h = setup();
+    await connected(h);
+    await h.client.end();
+    const diag = h.client.diagnostics!();
+    expect(diag.entries.some((e) => e.code === 'session_end')).toBe(true);
+    expect(diag.entries.length).toBeGreaterThan(0);
+  });
+
+  it('records first_audio_received with timing metadata', async () => {
+    const h = setup();
+    const socket = await connected(h);
+    socket.receive({ type: 'user', turnId: 1, text: 'hi' });
+    socket.receive({ type: 'audio', turnId: 1, responseId: 1, seq: 1, audio: 'AAA=', sampleRate: 16000 });
+    const diag = h.client.diagnostics!();
+    const firstAudio = diag.entries.find((e) => e.code === 'first_audio_received');
+    expect(firstAudio).toBeDefined();
+    expect(firstAudio!.responseId).toBe(1);
+    expect(firstAudio!.sampleRate).toBe(16000);
+    expect(firstAudio!.durationMs).toBeTypeOf('number');
+  });
+
+  it('records model provenance from capabilities event', async () => {
+    const h = setup();
+    const socket = await connected(h);
+    socket.receive({ type: 'capabilities', capabilities: { web: true, fermi: 'connected', tools: ['Read'] }, model: 'claude-opus-4-6' });
+    await tick();
+    expect(h.last().model).toBe('claude-opus-4-6');
+  });
+
+  it('starts with clean diagnostics per client (no cross-contamination)', async () => {
+    const h1 = setup();
+    const s1 = await connected(h1);
+    s1.receive({ type: 'user', turnId: 1, text: 'unique-turn' });
+    const d1 = h1.client.diagnostics!();
+
+    const h2 = setup();
+    await connected(h2);
+    const d2 = h2.client.diagnostics!();
+
+    expect(d1.entries.some((e) => e.code === 'user_turn_accepted')).toBe(true);
+    expect(d2.entries.some((e) => e.code === 'user_turn_accepted')).toBe(false);
+    expect(d2.entries.every((e) => e.id.startsWith('client:'))).toBe(true);
+  });
+
+  it('does not include raw tool inputs or results in diagnostics', async () => {
+    const h = setup();
+    const socket = await connected(h);
+    socket.receive({
+      type: 'diagnostic',
+      event: { source: 'server' as const, code: 'tool_result', id: 'server:1', at: Date.now(), tool: 'Read', callId: 'c1', status: 'done' as const, turnId: 1, responseId: 1 },
+    });
+    const diag = h.client.diagnostics!();
+    const serialized = JSON.stringify(diag);
+    expect(serialized).not.toContain('password');
+    expect(serialized).not.toContain('sk-ant');
+    expect(diag.entries.every((e) => !('input' in e) && !('result' in e))).toBe(true);
+  });
+});
+
 describe('conversation client: transcript rendering', () => {
   it('does not re-emit or clone the transcript on audio-only frames after the first', async () => {
     const h = setup();

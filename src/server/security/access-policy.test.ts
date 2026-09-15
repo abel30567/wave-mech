@@ -82,23 +82,20 @@ describe('buildToolArguments argv-level structure', () => {
     expect(argValue(args, '--permission-mode')).toBe('dontAsk');
   });
 
-  it('emits --allowedTools with builtins and MCP read tools', () => {
+  it('emits --allowedTools with builtins only (no specific Fermi tools)', () => {
     const args = buildToolArguments(BASE_OPTS);
     const allowed = argValue(args, '--allowedTools')!.split(',');
     expect(allowed).toContain('WebSearch');
     expect(allowed).toContain('WebFetch');
     expect(allowed).toContain('ToolSearch');
-    expect(allowed).toContain('mcp__fermi__memory_recall');
-    expect(allowed).toContain('mcp__fermi__skill_search');
-    expect(allowed).toContain('mcp__fermi__skill_load');
+    expect(allowed).not.toContain('mcp__fermi__memory_recall');
+    expect(allowed).not.toContain('mcp__fermi__skill_search');
+    expect(allowed).not.toContain('mcp__fermi__skill_load');
   });
 
-  it('emits --disallowedTools with sensitive tools', () => {
+  it('does NOT emit --disallowedTools (no explicit denials)', () => {
     const args = buildToolArguments(BASE_OPTS);
-    const denied = argValue(args, '--disallowedTools')!.split(',');
-    expect(denied).toContain('mcp__fermi__secret_resolve');
-    expect(denied).toContain('mcp__fermi__skill_set');
-    expect(denied).toContain('mcp__fermi__execute');
+    expect(hasFlag(args, '--disallowedTools')).toBe(false);
   });
 
   it('does NOT put mcpServers inside --settings', () => {
@@ -107,14 +104,14 @@ describe('buildToolArguments argv-level structure', () => {
     expect(settings).not.toHaveProperty('mcpServers');
   });
 
-  it('--settings contains PreToolUse hook and permissions', () => {
+  it('--settings contains PreToolUse hook and permissions.allow (no deny)', () => {
     const args = buildToolArguments(BASE_OPTS);
     const settings = parseJsonArg(args, '--settings') as {
-      permissions: { allow: string[]; deny: string[] };
+      permissions: { allow: string[]; deny?: string[] };
       hooks: { PreToolUse: Array<{ hooks: Array<{ type: string; command: string }> }> };
     };
     expect(settings.permissions.allow).toContain('WebSearch');
-    expect(settings.permissions.deny).toContain('mcp__fermi__secret_resolve');
+    expect(settings.permissions).not.toHaveProperty('deny');
     expect(settings.hooks.PreToolUse[0].hooks[0].type).toBe('command');
   });
 
@@ -173,9 +170,16 @@ describe('buildToolArguments argv-level structure', () => {
     expect(() => JSON.parse(argValue(args, '--mcp-config')!)).not.toThrow();
     expect(() => JSON.parse(argValue(args, '--settings')!)).not.toThrow();
   });
+
+  it('does not contain a blanket bypass flag', () => {
+    const args = buildToolArguments(BASE_OPTS);
+    for (const flag of ['--dangerously-skip-permissions', '--bypass', '--no-permissions', '--trust-all']) {
+      expect(hasFlag(args, flag)).toBe(false);
+    }
+  });
 });
 
-describe('permissionHookSource subprocess', () => {
+describe('permissionHookSource subprocess — builtins', () => {
   it('allows WebSearch', async () => {
     const { stdout } = await runHook(JSON.stringify({ tool_name: 'WebSearch', tool_input: {} }));
     const output = JSON.parse(stdout);
@@ -192,7 +196,9 @@ describe('permissionHookSource subprocess', () => {
     const { stdout } = await runHook(JSON.stringify({ tool_name: 'ToolSearch', tool_input: {} }));
     expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('allow');
   });
+});
 
+describe('permissionHookSource subprocess — Fermi namespace autoapproval', () => {
   it('allows mcp__fermi__memory_recall', async () => {
     const { stdout } = await runHook(
       JSON.stringify({ tool_name: 'mcp__fermi__memory_recall', tool_input: {} }),
@@ -214,6 +220,50 @@ describe('permissionHookSource subprocess', () => {
     expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('allow');
   });
 
+  it('allows mcp__fermi__execute (previously denied)', async () => {
+    const { stdout } = await runHook(
+      JSON.stringify({ tool_name: 'mcp__fermi__execute', tool_input: {} }),
+    );
+    expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('allow');
+  });
+
+  it('allows mcp__fermi__skill_set (previously denied)', async () => {
+    const { stdout } = await runHook(
+      JSON.stringify({ tool_name: 'mcp__fermi__skill_set', tool_input: {} }),
+    );
+    expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('allow');
+  });
+
+  it('allows mcp__fermi__secret_resolve (previously denied)', async () => {
+    const { stdout } = await runHook(
+      JSON.stringify({ tool_name: 'mcp__fermi__secret_resolve', tool_input: {} }),
+    );
+    expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('allow');
+  });
+
+  it('allows mcp__fermi__fs_read', async () => {
+    const { stdout } = await runHook(
+      JSON.stringify({ tool_name: 'mcp__fermi__fs_read', tool_input: {} }),
+    );
+    expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('allow');
+  });
+
+  it('allows mcp__fermi__browser_action', async () => {
+    const { stdout } = await runHook(
+      JSON.stringify({ tool_name: 'mcp__fermi__browser_action', tool_input: {} }),
+    );
+    expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('allow');
+  });
+
+  it('allows any future mcp__fermi__* tool', async () => {
+    const { stdout } = await runHook(
+      JSON.stringify({ tool_name: 'mcp__fermi__new_capability_2026', tool_input: {} }),
+    );
+    expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('allow');
+  });
+});
+
+describe('permissionHookSource subprocess — denials', () => {
   it('denies Bash tool', async () => {
     const { stdout } = await runHook(
       JSON.stringify({ tool_name: 'Bash', tool_input: { command: 'ls' } }),
@@ -237,27 +287,6 @@ describe('permissionHookSource subprocess', () => {
     expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('deny');
   });
 
-  it('denies mcp__fermi__secret_resolve', async () => {
-    const { stdout } = await runHook(
-      JSON.stringify({ tool_name: 'mcp__fermi__secret_resolve', tool_input: {} }),
-    );
-    expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('deny');
-  });
-
-  it('denies mcp__fermi__skill_set', async () => {
-    const { stdout } = await runHook(
-      JSON.stringify({ tool_name: 'mcp__fermi__skill_set', tool_input: {} }),
-    );
-    expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('deny');
-  });
-
-  it('denies mcp__fermi__execute', async () => {
-    const { stdout } = await runHook(
-      JSON.stringify({ tool_name: 'mcp__fermi__execute', tool_input: {} }),
-    );
-    expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('deny');
-  });
-
   it('denies unknown tools', async () => {
     const { stdout } = await runHook(
       JSON.stringify({ tool_name: 'SomethingNew', tool_input: {} }),
@@ -265,6 +294,38 @@ describe('permissionHookSource subprocess', () => {
     expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('deny');
   });
 
+  it('denies mcp__fermi_evil (single underscore — prefix injection attack)', async () => {
+    const { stdout } = await runHook(
+      JSON.stringify({ tool_name: 'mcp__fermi_evil', tool_input: {} }),
+    );
+    const output = JSON.parse(stdout);
+    expect(output.hookSpecificOutput.permissionDecision).toBe('deny');
+    expect(output.hookSpecificOutput.permissionDecisionReason).toContain('mcp__fermi_evil');
+  });
+
+  it('denies mcp__fermi_ with single trailing underscore', async () => {
+    const { stdout } = await runHook(
+      JSON.stringify({ tool_name: 'mcp__fermi_', tool_input: {} }),
+    );
+    expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('deny');
+  });
+
+  it('denies unrelated MCP namespace mcp__other__tool', async () => {
+    const { stdout } = await runHook(
+      JSON.stringify({ tool_name: 'mcp__other__tool', tool_input: {} }),
+    );
+    expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('deny');
+  });
+
+  it('denies shell tool', async () => {
+    const { stdout } = await runHook(
+      JSON.stringify({ tool_name: 'shell', tool_input: {} }),
+    );
+    expect(JSON.parse(stdout).hookSpecificOutput.permissionDecision).toBe('deny');
+  });
+});
+
+describe('permissionHookSource subprocess — fail-closed edge cases', () => {
   it('denies on malformed JSON', async () => {
     const { stdout } = await runHook('this is not json');
     const output = JSON.parse(stdout);
@@ -343,6 +404,30 @@ describe('hook subprocess invoked via settings command', () => {
     expect(output.hookSpecificOutput.permissionDecision).toBe('allow');
   });
 
+  it('allows Fermi tools when invoked via settings command', async () => {
+    const args = buildToolArguments({
+      fermiUrl: 'https://fermi.example.com',
+      nodeExecutable: process.execPath,
+      hookFile: hookPath,
+    });
+    const settings = parseJsonArg(args, '--settings') as {
+      hooks: { PreToolUse: Array<{ hooks: Array<{ command: string }> }> };
+    };
+    const cmd = settings.hooks.PreToolUse[0].hooks[0].command;
+
+    const result = await new Promise<{ code: number; stdout: string }>((resolve, reject) => {
+      const proc = spawn('sh', ['-c', cmd], { stdio: ['pipe', 'pipe', 'pipe'] });
+      let stdout = '';
+      proc.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+      proc.on('close', (code) => resolve({ code: code ?? 1, stdout }));
+      proc.on('error', reject);
+      proc.stdin.write(JSON.stringify({ tool_name: 'mcp__fermi__execute', tool_input: {} }));
+      proc.stdin.end();
+    });
+
+    expect(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision).toBe('allow');
+  });
+
   it('denies dangerous tools when invoked via settings command', async () => {
     const args = buildToolArguments({
       fermiUrl: 'https://fermi.example.com',
@@ -366,6 +451,30 @@ describe('hook subprocess invoked via settings command', () => {
 
     const output = JSON.parse(result.stdout);
     expect(output.hookSpecificOutput.permissionDecision).toBe('deny');
+  });
+
+  it('denies mcp__fermi_evil via settings command', async () => {
+    const args = buildToolArguments({
+      fermiUrl: 'https://fermi.example.com',
+      nodeExecutable: process.execPath,
+      hookFile: hookPath,
+    });
+    const settings = parseJsonArg(args, '--settings') as {
+      hooks: { PreToolUse: Array<{ hooks: Array<{ command: string }> }> };
+    };
+    const cmd = settings.hooks.PreToolUse[0].hooks[0].command;
+
+    const result = await new Promise<{ code: number; stdout: string }>((resolve, reject) => {
+      const proc = spawn('sh', ['-c', cmd], { stdio: ['pipe', 'pipe', 'pipe'] });
+      let stdout = '';
+      proc.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+      proc.on('close', (code) => resolve({ code: code ?? 1, stdout }));
+      proc.on('error', reject);
+      proc.stdin.write(JSON.stringify({ tool_name: 'mcp__fermi_evil', tool_input: {} }));
+      proc.stdin.end();
+    });
+
+    expect(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
   });
 
   it('handles paths with special characters via settings command', async () => {

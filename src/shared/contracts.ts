@@ -1,7 +1,9 @@
+import type { DiagnosticInput, DiagnosticReason, DiagnosticToolStatus } from './diagnostics.js';
+
 export type HarnessEvent =
-  | { type: 'ready'; sessionId?: string; tools?: string[]; mcp?: Array<{ name: string; status: string }> }
+  | { type: 'ready'; sessionId?: string; model?: string; tools?: string[]; mcp?: Array<{ name: string; status: string }> }
   | { type: 'text'; text: string }
-  | { type: 'tool'; name: string; status: 'running' | 'done' | 'failed' | 'denied' }
+  | { type: 'tool'; name: string; status: DiagnosticToolStatus; callId?: string; reason?: DiagnosticReason; statusCode?: number; durationMs?: number }
   | { type: 'error'; message: string };
 
 export interface HarnessOptions {
@@ -28,6 +30,7 @@ export interface SpeechOptions {
   onPartial(text: string): void;
   onAudio(audio: string, sampleRate: number): void;
   onError(message: string): void;
+  onDiagnostic?(event: DiagnosticInput): void;
   endpoints?: { stt?: string; tts?: string };
   timeoutMs?: number;
 }
@@ -69,7 +72,7 @@ export type ServerMessage =
   | { type: 'user'; text: string }
   | { type: 'text'; text: string }
   | { type: 'audio'; audio: string; sampleRate: number }
-  | { type: 'tool'; name: string; status: 'running' | 'done' | 'failed' | 'denied' }
+  | { type: 'tool'; name: string; status: DiagnosticToolStatus }
   | { type: 'response_done' }
   | { type: 'idle' }
   | { type: 'error'; message: string; fatal?: boolean }
