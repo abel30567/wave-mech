@@ -289,7 +289,64 @@ async function runTextOnly() {
   await emit({ type: 'result', subtype: 'success', is_error: false, result: 'Simple direct answer.', session_id: SESSION_ID });
 }
 
+async function runMultiToolRounds() {
+  await streamEvent({ type: 'message_start', message: { role: 'assistant' } });
+
+  // Round 1 preamble
+  await streamEvent({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+  await streamEvent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Let me check that for you.' } });
+  await streamEvent({ type: 'content_block_stop', index: 0 });
+
+  // Tool call round 1
+  await streamEvent({ type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'mtr-1', name: 'WebSearch' } });
+  await streamEvent({ type: 'content_block_stop', index: 1 });
+  await streamEvent({ type: 'message_stop' });
+
+  await emit({
+    type: 'user', parent_tool_use_id: null,
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'mtr-1', content: 'search result' }] },
+  });
+
+  // Interim narration between rounds
+  await streamEvent({ type: 'message_start', message: { role: 'assistant' } });
+  await streamEvent({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+  await streamEvent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'I found something, let me verify.' } });
+  await streamEvent({ type: 'content_block_stop', index: 0 });
+
+  // Tool call round 2
+  await streamEvent({ type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'mtr-2', name: 'WebFetch' } });
+  await streamEvent({ type: 'content_block_stop', index: 1 });
+  await streamEvent({ type: 'message_stop' });
+
+  await emit({
+    type: 'user', parent_tool_use_id: null,
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'mtr-2', content: 'fetched content' }] },
+  });
+
+  // Final answer (different from all narration)
+  await streamEvent({ type: 'message_start', message: { role: 'assistant' } });
+  await streamEvent({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+  await streamEvent({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'The verified answer is 7.' } });
+  await streamEvent({ type: 'content_block_stop', index: 0 });
+  await streamEvent({ type: 'message_stop' });
+
+  await emit({ type: 'result', subtype: 'success', is_error: false, result: 'The verified answer is 7.', session_id: SESSION_ID });
+}
+
+async function runResultOnly() {
+  // Turn with no streamed text — only the result line carries the answer.
+  await emit({ type: 'result', subtype: 'success', is_error: false, result: 'Result-only answer.', session_id: SESSION_ID });
+}
+
 async function handleTurn(userText) {
+  if (SCENARIO === 'multi_tool_rounds') {
+    await runMultiToolRounds();
+    return;
+  }
+  if (SCENARIO === 'result_only') {
+    await runResultOnly();
+    return;
+  }
   if (SCENARIO === 'tool_then_result') {
     await runToolThenResult();
     return;
