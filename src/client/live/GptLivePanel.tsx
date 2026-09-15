@@ -42,7 +42,7 @@ const initialState: SessionState = {
 };
 
 const SDP_SECRET_RE = /v=0\r?\no=|a=candidate:|a=ice-ufrag:|a=ice-pwd:|a=fingerprint:/;
-const KEY_HEADER_RE = /sk-[a-zA-Z0-9]{10,}|Bearer [a-zA-Z0-9._\-]+|authorization:\s/i;
+const KEY_HEADER_RE = /sk-[a-zA-Z0-9_-]{8,}|Bearer [a-zA-Z0-9._\-]+|authorization:\s/i;
 
 function looksLikeRawPayload(text: string): boolean {
   return SDP_SECRET_RE.test(text) || KEY_HEADER_RE.test(text);
@@ -50,7 +50,7 @@ function looksLikeRawPayload(text: string): boolean {
 
 function sanitizeText(text: string): string {
   return text
-    .replace(/sk-[a-zA-Z0-9]{10,}/g, '[key-redacted]')
+    .replace(/sk-[a-zA-Z0-9_-]{8,}/g, '[key-redacted]')
     .replace(/Bearer [a-zA-Z0-9._\-]+/g, 'Bearer [redacted]')
     .slice(0, 2000);
 }
@@ -236,9 +236,9 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
         credentials: 'same-origin',
         body: JSON.stringify({ sdp: offer.sdp }),
       });
-      if (genRef.current !== g) { stopLocalMedia(); startingRef.current = false; return; }
 
       if (!resp.ok) {
+        if (genRef.current !== g) { stopLocalMedia(); startingRef.current = false; return; }
         const text = await resp.text();
         throw new Error(text || `Session creation failed (${resp.status})`);
       }
