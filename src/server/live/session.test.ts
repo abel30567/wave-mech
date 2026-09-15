@@ -629,4 +629,101 @@ describe('GptLiveManager', () => {
     const [reason, confirmed] = (callbacks.onSessionClosed as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(confirmed).toBe(false);
   }, 25_000);
+
+  it('rejects NaN/negative usage update values', async () => {
+    const keyFile = path.join(workDir, 'test-api.key');
+    await writeFile(keyFile, 'sk-test-key-12345-abcdef', { mode: 0o600 });
+    const { provider } = createMockProvider();
+    const manager = new GptLiveManager({
+      enabled: true,
+      apiKeyFile: keyFile,
+      budgetFile: path.join(workDir, 'budget.json'),
+      maxSessionSeconds: 60,
+      configuredModel: 'claude-opus-4-6[1m]',
+      nodeExecutable: process.execPath,
+      providerFactory: () => provider,
+      harnessFactory: createMockHarnessFactory(),
+    });
+    await manager.initialize();
+    const callbacks = noopCallbacks();
+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', callbacks);
+
+    manager.handleUsageUpdate(NaN);
+    manager.handleUsageUpdate(-5);
+    manager.handleUsageUpdate(Infinity);
+
+    expect(manager.getDiagnostics().cumulativeVoiceSeconds).toBe(0);
+    await manager.shutdown();
+  });
+
+  it('sideband failure triggers session close', async () => {
+    const keyFile = path.join(workDir, 'test-api.key');
+    await writeFile(keyFile, 'sk-test-key-12345-abcdef', { mode: 0o600 });
+
+    const provider: LiveProvider = {
+      async createSession() {
+        return { providerSessionId: 'prov-sb-fail', answerSdp: 'v=0\r\nanswer' };
+      },
+      async attachSideband() {
+        throw new Error('WebSocket connection failed');
+      },
+      sendThinking() {},
+      sendCommentary() {},
+      closeSession() {},
+      async hangup() {},
+      destroy() {},
+    };
+
+    const manager = new GptLiveManager({
+      enabled: true,
+      apiKeyFile: keyFile,
+      budgetFile: path.join(workDir, 'budget.json'),
+      maxSessionSeconds: 60,
+      configuredModel: 'claude-opus-4-6[1m]',
+      nodeExecutable: process.execPath,
+      providerFactory: () => provider,
+      harnessFactory: createMockHarnessFactory(),
+    });
+    await manager.initialize();
+    const callbacks = noopCallbacks();
+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', callbacks);
+
+    await vi.waitFor(() => {
+      expect(manager.hasActiveSession).toBe(false);
+    }, { timeout: 20_000 });
+
+    expect(callbacks.onError).toHaveBeenCalled();
+  }, 25_000);
+
+  it('sanitizeErrorMessage returns fixed safe categories, not raw SDK messages', async () => {
+    const keyFile = path.join(workDir, 'test-api.key');
+    await writeFile(keyFile, 'sk-test-key-12345-abcdef', { mode: 0o600 });
+
+    const { provider } = createMockProvider({
+      createError: new Error('Connection refused: sk-proj-abc123 at https://api.openai.com/v1/live/sessions with SDP v=0\\r\\n secret ice-ufrag=ABCD'),
+    });
+
+    const manager = new GptLiveManager({
+      enabled: true,
+      apiKeyFile: keyFile,
+      budgetFile: path.join(workDir, 'budget.json'),
+      maxSessionSeconds: 60,
+      configuredModel: 'claude-opus-4-6[1m]',
+      nodeExecutable: process.execPath,
+      providerFactory: () => provider,
+      harnessFactory: createMockHarnessFactory(),
+    });
+    await manager.initialize();
+
+    try {
+      await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
+    } catch (e) {
+      const msg = (e as Error).message;
+      expect(msg).toBe('Session creation failed.');
+      expect(msg).not.toContain('sk-proj');
+      expect(msg).not.toContain('api.openai.com');
+      expect(msg).not.toContain('SDP');
+      expect(msg).not.toContain('ice-ufrag');
+    }
+  });
 });

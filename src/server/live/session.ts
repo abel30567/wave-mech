@@ -95,6 +95,12 @@ export class GptLiveManager {
     }
   }
 
+  private safeSave(): void {
+    this.budget.save().catch(() => {
+      // Budget save failure is not recoverable - lockout is preserved in memory
+    });
+  }
+
   private async loadApiKey(): Promise<void> {
     try {
       const keyPath = this.options.apiKeyFile;
@@ -326,7 +332,7 @@ export class GptLiveManager {
     } else {
       this.budget.finalize(sessionId, session.cumulativeVoiceSeconds, true);
     }
-    void this.budget.save();
+    this.safeSave();
 
     void this.finishCleanup(sessionId);
   }
@@ -486,6 +492,7 @@ export class GptLiveManager {
 
   handleUsageUpdate(seconds: number): void {
     if (!this.active) return;
+    if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return;
     this.active.cumulativeVoiceSeconds = Math.max(this.active.cumulativeVoiceSeconds, seconds);
     this.active.connectedTimeEstimate = (Date.now() - this.active.startedAt) / 1000;
     const estimatedCost = (this.active.cumulativeVoiceSeconds / 60) * GPT_LIVE_PRICE_PER_MINUTE;
@@ -518,7 +525,7 @@ export class GptLiveManager {
         session.connectedTimeEstimate,
       );
       this.budget.finalize(sessionId, conservativeSeconds, false);
-      void this.budget.save();
+      this.safeSave();
 
       void this.finishCleanup(sessionId);
     }, CLOSURE_TIMEOUT_MS);
