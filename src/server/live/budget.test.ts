@@ -155,7 +155,6 @@ describe('GptLiveBudget', () => {
 
     expect(budget.confirmClosure('s', NaN)).toBe(false);
     expect(budget.confirmClosure('s', -1)).toBe(false);
-    expect(budget.confirmClosure('s', 301)).toBe(false);
     expect(budget.confirmClosure('s', Infinity)).toBe(false);
     expect(budget.hasUncertainClosure).toBe(true);
   });
@@ -175,12 +174,13 @@ describe('GptLiveBudget', () => {
     expect(budget2.hasUncertainClosure).toBe(true);
   });
 
-  it('rejects voiceSeconds exceeding max in finalize', async () => {
+  it('retains actual over-budget charges above max duration in finalize', async () => {
     const budget = new GptLiveBudget(filePath);
     await budget.load();
     budget.reserve('s', 300);
     budget.finalize('s', 500, true);
-    expect(budget.hasUncertainClosure).toBe(true);
+    expect(budget.hasUncertainClosure).toBe(false);
+    expect(budget.cumulativeUsageUsd).toBeCloseTo((500 / 60) * 0.05, 6);
   });
 
   it('orphan reconciliation locks out new sessions', async () => {

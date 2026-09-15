@@ -68,6 +68,8 @@ interface ActiveTrialSession {
   closureConfirmed: boolean | null;
   closureReason: string | null;
   closing: boolean;
+  closingPromise: Promise<void> | null;
+  closingResolve: (() => void) | null;
   provider: LiveProvider | null;
   sidebandHandle: SidebandHandle | null;
   closureTimer: ReturnType<typeof setTimeout> | null;
@@ -101,10 +103,12 @@ export class GptLiveManager {
     }
   }
 
-  private safeSave(): void {
-    this.budget.save().catch(() => {
-      // Budget save failure is not recoverable - lockout is preserved in memory
-    });
+  private async safeSave(): Promise<void> {
+    try {
+      await this.budget.save();
+    } catch {
+      // save() already latches _saveFailed, which blocks new sessions via hasUncertainClosure
+    }
   }
 
   private async loadApiKey(): Promise<void> {
@@ -140,7 +144,7 @@ export class GptLiveManager {
     return this.active !== null || this.slotTaken;
   }
 
-  validateSessionRequest(ownerId: string, sdp: string): string | null {
+  validateSessionRequest(ownerId: string, sdp: string, durationSeconds?: number): string | null {
     if (!this.options.enabled) return 'GPT-Live trial is not enabled.';
     if (!this.apiKey) return 'GPT-Live API key is not configured.';
     if (this.active || this.slotTaken) {
@@ -149,6 +153,14 @@ export class GptLiveManager {
     }
     if (!sdp || typeof sdp !== 'string' || sdp.length > 65536) {
       return 'Invalid session offer.';
+    }
+    if (durationSeconds !== undefined) {
+      if (!Number.isInteger(durationSeconds) || durationSeconds <= 0 || durationSeconds > GPT_LIVE_MAX_SESSION_SECONDS) {
+        return 'Invalid session duration.';
+      }
+    }
+    if (this.budget.isReconciliationPending) {
+      return 'Trial budget exhausted.';
     }
     if (!this.budget.canReserve(this.options.maxSessionSeconds)) {
       return 'Trial budget exhausted.';
@@ -174,6 +186,7 @@ export class GptLiveManager {
     let workspace: string | null = null;
     let harness: ReturnType<typeof createHarness> | null = null;
     let provider: LiveProvider | null = null;
+    let creationAttempted = false;
 
     try {
       workspace = await mkdtemp(path.join(tmpdir(), 'wave-live-'));
@@ -224,6 +237,10 @@ export class GptLiveManager {
         'Keep spoken responses concise. Do not repeat tool outputs verbatim.',
       ].join(' ');
 
+      this.budget.markCreationAttempted(sessionId);
+      await this.budget.save();
+      creationAttempted = true;
+
       const result = await provider.createSession(sdp, instructions, clientEventRestrictions);
 
       this.budget.setProviderSessionId(sessionId, result.providerSessionId);
@@ -255,6 +272,8 @@ export class GptLiveManager {
         closureConfirmed: null,
         closureReason: null,
         closing: false,
+        closingPromise: null,
+        closingResolve: null,
         provider,
         sidebandHandle: null,
         closureTimer: null,
@@ -265,12 +284,15 @@ export class GptLiveManager {
 
       return { sessionId, sdp: result.answerSdp };
     } catch (error) {
-      const hadProviderSession = provider !== null
-        && this.budget.snapshot.reservations.some(
+      if (!creationAttempted) {
+        this.budget.releaseUnstartedReservation(sessionId);
+      } else {
+        const hasProviderSession = this.budget.snapshot.reservations.some(
           r => r.sessionId === sessionId && r.providerSessionId !== null,
         );
-      this.budget.finalize(sessionId, 0, !hadProviderSession);
-      await this.budget.save();
+        this.budget.finalize(sessionId, 0, !hasProviderSession);
+      }
+      try { await this.budget.save(); } catch { /* save failure already latched */ }
       if (provider) provider.destroy();
       if (harness) { try { await harness.close(); } catch { /* ignore */ } }
       if (workspace) await rm(workspace, { recursive: true, force: true });
@@ -306,9 +328,10 @@ export class GptLiveManager {
           onSessionClosed: (reason, usage) => {
             this.handleProviderClosed(sessionId, reason, usage.seconds);
           },
-          onError: (_code, message) => {
+          onError: (_code, _message) => {
             if (this.active && this.active.sessionId === sessionId) {
               session.callbacks.onError('Provider error occurred.');
+              void this.closeSession(sessionId, 'sideband_error');
             }
           },
         },
@@ -327,7 +350,15 @@ export class GptLiveManager {
       && Number.isFinite(finalSeconds) && finalSeconds >= 0;
     if (validFinalSeconds) {
       session.cumulativeVoiceSeconds = Math.max(session.cumulativeVoiceSeconds, finalSeconds);
+    } else {
+      session.closureConfirmed = false;
+      session.closureReason = reason;
+      this.budget.finalize(sessionId, 0, false);
+      void this.safeSave();
+      void this.finishCleanup(sessionId);
+      return;
     }
+
     session.closureConfirmed = true;
     session.closureReason = reason;
 
@@ -336,12 +367,8 @@ export class GptLiveManager {
       session.closureTimer = null;
     }
 
-    if (session.closing) {
-      this.budget.confirmClosure(sessionId, session.cumulativeVoiceSeconds);
-    } else {
-      this.budget.finalize(sessionId, session.cumulativeVoiceSeconds, true);
-    }
-    this.safeSave();
+    this.budget.confirmClosure(sessionId, session.cumulativeVoiceSeconds);
+    void this.safeSave();
 
     void this.finishCleanup(sessionId);
   }
@@ -577,6 +604,10 @@ export class GptLiveManager {
     this.active.connectedTimeEstimate = (Date.now() - this.active.startedAt) / 1000;
     const estimatedCost = (this.active.cumulativeVoiceSeconds / 60) * GPT_LIVE_PRICE_PER_MINUTE;
     this.active.callbacks.onUsageUpdate(this.active.cumulativeVoiceSeconds, estimatedCost);
+
+    if (this.active.cumulativeVoiceSeconds >= this.options.maxSessionSeconds && !this.active.closing) {
+      void this.closeSession(this.active.sessionId, 'budget_exceeded');
+    }
   }
 
   async closeSession(sessionId: string, reason: string): Promise<void> {
@@ -587,11 +618,7 @@ export class GptLiveManager {
 
     clearTimeout(session.deadline);
 
-    if (session.provider && session.providerSessionId) {
-      try {
-        session.provider.closeSession();
-      } catch { /* best effort */ }
-    }
+    session.closingPromise = new Promise<void>(r => { session.closingResolve = r; });
 
     session.closureTimer = setTimeout(() => {
       if (!this.active || this.active.sessionId !== sessionId) return;
@@ -605,11 +632,17 @@ export class GptLiveManager {
         session.connectedTimeEstimate,
       );
       this.budget.finalize(sessionId, conservativeSeconds, false);
-      this.safeSave();
+      void this.safeSave();
 
       void this.finishCleanup(sessionId);
     }, CLOSURE_TIMEOUT_MS);
     if (typeof session.closureTimer.unref === 'function') session.closureTimer.unref();
+
+    if (session.provider && session.providerSessionId) {
+      try {
+        session.provider.closeSession();
+      } catch { /* best effort */ }
+    }
 
     if (session.provider && session.providerSessionId) {
       try {
@@ -640,11 +673,15 @@ export class GptLiveManager {
       await rm(session.workspace, { recursive: true, force: true });
     }
 
+    await this.safeSave();
+
     const confirmed = session.closureConfirmed === true;
     const closureReason = session.closureReason ?? 'unknown';
+    const resolve = session.closingResolve;
     session.callbacks.onSessionClosed(closureReason, confirmed);
     this.active = null;
     this.slotTaken = false;
+    if (resolve) resolve();
   }
 
   getDiagnostics(): GptLiveDiagnostics {
@@ -668,8 +705,28 @@ export class GptLiveManager {
   }
 
   async shutdown(): Promise<void> {
-    if (this.active) {
-      await this.closeSession(this.active.sessionId, 'shutdown');
+    if (!this.active) return;
+    const session = this.active;
+    const sessionId = session.sessionId;
+
+    await this.closeSession(sessionId, 'shutdown');
+
+    if (this.active && this.active.sessionId === sessionId) {
+      if (session.closureTimer) {
+        clearTimeout(session.closureTimer);
+        session.closureTimer = null;
+      }
+      if (session.closureConfirmed === null) {
+        session.closureConfirmed = false;
+        session.closureReason = 'shutdown';
+        const conservativeSeconds = Math.max(
+          session.cumulativeVoiceSeconds,
+          session.connectedTimeEstimate,
+        );
+        this.budget.finalize(sessionId, conservativeSeconds, false);
+        void this.safeSave();
+      }
+      await this.finishCleanup(sessionId);
     }
   }
 }
