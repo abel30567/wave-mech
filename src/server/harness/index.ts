@@ -580,10 +580,16 @@ class ClaudeCliHarness implements HarnessSession {
       this.failPending(new Error(message));
       return;
     }
-    if (this.options.onResult && this.turnText.length > 0) {
-      const resultText = this.turnHadTool
-        ? this.turnText.slice(this.lastTextBeforeTool.length).trim()
-        : this.turnText.trim();
+    if (!this.pending) {
+      // Duplicate or stale result after the turn already settled — drop it.
+      return;
+    }
+    if (this.quarantined || this.suppressStream) {
+      this.failPending(new Error('Result arrived on a quarantined or interrupted generation.'));
+      return;
+    }
+    if (this.options.onResult) {
+      const resultText = typeof msg.result === 'string' ? msg.result.trim() : '';
       if (resultText.length > 0) {
         try { this.options.onResult(resultText); } catch { /* consumer error */ }
       }
