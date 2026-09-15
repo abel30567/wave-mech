@@ -176,6 +176,10 @@ const server = createServer(async (request, response) => {
     if (!hosts.has(request.headers.host ?? '') || !origins.has(request.headers.origin ?? '') || !validBootstrapCookie(request) || !ownerId) {
       response.writeHead(403).end('Origin not permitted.'); return;
     }
+    const sessionOwnerId = gptLive.getSessionOwnerId();
+    if (sessionOwnerId && sessionOwnerId !== ownerId) {
+      response.writeHead(403).end('Not session owner.'); return;
+    }
     const chunks: Buffer[] = [];
     let size = 0;
     request.on('data', (chunk: Buffer) => { size += chunk.length; if (size <= 4096) chunks.push(chunk); });
@@ -199,7 +203,7 @@ const server = createServer(async (request, response) => {
     const ownerId = ownerOf(request);
     if (!ownerId) { response.writeHead(403).end(); return; }
     response.setHeader('Content-Type', 'application/json');
-    response.end(JSON.stringify(gptLive.getDiagnostics()));
+    response.end(JSON.stringify(gptLive.getDiagnostics(ownerId)));
     return;
   }
   if (pathname.startsWith('/api/')) { response.writeHead(404).end(); return; }

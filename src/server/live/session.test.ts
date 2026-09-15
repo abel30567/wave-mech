@@ -407,7 +407,7 @@ describe('GptLiveManager', () => {
     }
   });
 
-  it('does not confirm closure from reason strings alone', async () => {
+  it('retains diagnostic snapshot after closure with valid final seconds', async () => {
     const keyFile = path.join(workDir, 'test-api.key');
     await writeFile(keyFile, 'sk-test-key-12345-abcdef', { mode: 0o600 });
 
@@ -438,9 +438,45 @@ describe('GptLiveManager', () => {
 
     await new Promise(resolve => setTimeout(resolve, 50));
 
-    const diagAfter = manager.getDiagnostics();
-    expect(diagAfter.closureConfirmed).toBeNull();
     expect(manager.hasActiveSession).toBe(false);
+    const diagAfter = manager.getDiagnostics();
+    expect(diagAfter.closureConfirmed).toBe(true);
+    expect(diagAfter.cumulativeVoiceSeconds).toBe(42);
+    expect(diagAfter.closureReason).toBe('close_requested');
+  });
+
+  it('diagnostics return empty for non-owning caller after closure', async () => {
+    const keyFile = path.join(workDir, 'test-api.key');
+    await writeFile(keyFile, 'sk-test-key-12345-abcdef', { mode: 0o600 });
+
+    let sidebandHandler: ProviderEventHandler | null = null;
+    const { provider } = createMockProvider({
+      onAttachSideband: (handler) => { sidebandHandler = handler; },
+    });
+
+    const manager = new GptLiveManager({
+      enabled: true,
+      apiKeyFile: keyFile,
+      budgetFile: path.join(workDir, 'budget.json'),
+      maxSessionSeconds: 60,
+      configuredModel: 'claude-opus-4-6[1m]',
+      nodeExecutable: process.execPath,
+      providerFactory: () => provider,
+      harnessFactory: createMockHarnessFactory(),
+    });
+    await manager.initialize();
+
+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
+
+    sidebandHandler!.onSessionClosed('close_requested', { seconds: 42 });
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    const ownerDiag = manager.getDiagnostics('owner-1');
+    expect(ownerDiag.closureConfirmed).toBe(true);
+
+    const otherDiag = manager.getDiagnostics('other-owner');
+    expect(otherDiag.sessionId).toBeNull();
+    expect(otherDiag.transcript).toEqual([]);
   });
 
   it('accumulates usage by max, not sum', async () => {

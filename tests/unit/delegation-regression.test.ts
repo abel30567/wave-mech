@@ -135,16 +135,18 @@ describe('delegation serialization holds until send settles (issue 2)', () => {
     await rm(workDir, { recursive: true, force: true });
   });
 
-  it('two sequential delegations: second waits for first send to settle', async () => {
+  it('two sequential delegations: second waits for first send to settle and uses fresh input', async () => {
     let sendCount = 0;
     let concurrentSends = 0;
     let maxConcurrent = 0;
     let sendGate: (() => void) | null = null;
+    const sentTexts: string[] = [];
 
     const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
       async start() { options.onEvent({ type: 'ready' }); },
       async send(text: string) {
         sendCount++;
+        sentTexts.push(text);
         concurrentSends++;
         maxConcurrent = Math.max(maxConcurrent, concurrentSends);
         await new Promise<void>(resolve => { sendGate = resolve; });
@@ -190,30 +192,29 @@ describe('delegation serialization holds until send settles (issue 2)', () => {
     manager.handleInputTranscript('do task one');
     manager.handleDelegationCreated('deleg-s1', 1000);
 
-    // Wait for send to be called
     await vi.waitFor(() => expect(sendCount).toBe(1));
 
     // Queue second delegation while first is in progress
-    manager.handleInputTranscript(' and also task two');
     manager.handleDelegationCreated('deleg-s2', 2000);
 
-    // First send still in progress — second must not have started
     expect(sendCount).toBe(1);
     expect(maxConcurrent).toBe(1);
 
-    // Settle first send
+    // Settle first send — cursor advances past "do task one"
     sendGate!();
     await vi.waitFor(() => expect(commentaryCalls.length).toBeGreaterThanOrEqual(1));
 
-    // Wait for second send
+    // Now provide fresh input for the second delegation
+    manager.handleInputTranscript('do task two');
+
     await vi.waitFor(() => expect(sendCount).toBe(2));
 
-    // Settle second
     sendGate!();
     await vi.waitFor(() => expect(commentaryCalls.length).toBeGreaterThanOrEqual(2));
 
-    // Never had concurrent sends
     expect(maxConcurrent).toBe(1);
+    expect(sentTexts[0]).toBe('do task one');
+    expect(sentTexts[1]).toBe('do task two');
 
     await manager.shutdown();
   });
@@ -740,13 +741,15 @@ describe('event-driven input queue replaces sleep/drop (issue 4)', () => {
     await manager.shutdown();
   });
 
-  it('duplicate delegation IDs are deduped while preserving delayed task', async () => {
+  it('duplicate delegation IDs are deduped while preserving delayed task with fresh input', async () => {
     let sendCount = 0;
+    let sendGate: (() => void) | null = null;
 
     const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
       async start() { options.onEvent({ type: 'ready' }); },
       async send() {
         sendCount++;
+        await new Promise<void>(resolve => { sendGate = resolve; });
         if (options.onResult) options.onResult('ok');
       },
       async close() {},
@@ -782,16 +785,29 @@ describe('event-driven input queue replaces sleep/drop (issue 4)', () => {
     await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
     manager.handleInputTranscript('hello');
 
-    // Same ID sent twice
+    // Same ID sent twice — should only process once
     manager.handleDelegationCreated('deleg-dup', 1000);
     manager.handleDelegationCreated('deleg-dup', 1000);
 
-    // Different ID follows
+    // Different ID queued
     manager.handleDelegationCreated('deleg-new', 2000);
 
-    await vi.waitFor(() => expect(sendCount).toBeGreaterThanOrEqual(2), { timeout: 3000 });
+    await vi.waitFor(() => expect(sendCount).toBe(1));
 
-    // Only 2 sends: deleg-dup once, deleg-new once
+    // Settle first — cursor advances
+    sendGate!();
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    // Provide fresh input for the second delegation
+    manager.handleInputTranscript('world');
+
+    await vi.waitFor(() => expect(sendCount).toBe(2), { timeout: 3000 });
+
+    // Settle second
+    sendGate!();
+    await new Promise(resolve => setTimeout(resolve, 50));
+
+    // Exactly 2 sends: deleg-dup once, deleg-new once
     expect(sendCount).toBe(2);
 
     await manager.shutdown();

@@ -61,6 +61,7 @@ interface ActiveTrialSession {
   processedDelegationIds: Set<string>;
   pendingResult: string | null;
   sendSettling: boolean;
+  inputCursor: number;
   inputWaiters: Array<() => void>;
   transcript: GptLiveTranscriptEntry[];
   cumulativeVoiceSeconds: number;
@@ -82,6 +83,8 @@ export class GptLiveManager {
   private apiKey: string | null = null;
   private active: ActiveTrialSession | null = null;
   private slotTaken = false;
+  private lastDiagnosticSnapshot: GptLiveDiagnostics | null = null;
+  private lastSessionOwnerId: string | null = null;
 
   constructor(options: GptLiveManagerOptions) {
     this.options = {
@@ -265,6 +268,7 @@ export class GptLiveManager {
         processedDelegationIds: new Set(),
         pendingResult: null,
         sendSettling: false,
+        inputCursor: 0,
         inputWaiters: [],
         transcript: [],
         cumulativeVoiceSeconds: 0,
@@ -500,8 +504,9 @@ export class GptLiveManager {
       return;
     }
 
-    // send() resolved — the turn is complete. Deliver stored result as commentary.
+    // send() resolved — the turn is complete. Advance cursor and deliver result.
     session.sendSettling = false;
+    session.inputCursor = session.transcript.length;
     if (!this.active || this.active.sessionId !== sessionId) return;
     const resultText = session.pendingResult;
     session.pendingResult = null;
@@ -555,12 +560,17 @@ export class GptLiveManager {
   }
 
   private assembleUserContext(session: ActiveTrialSession): string {
-    const userEntries = session.transcript.filter(t => t.role === 'user');
-    if (userEntries.length === 0) return '';
+    const freshEntries: GptLiveTranscriptEntry[] = [];
+    for (let i = session.inputCursor; i < session.transcript.length; i++) {
+      if (session.transcript[i].role === 'user') {
+        freshEntries.push(session.transcript[i]);
+      }
+    }
+    if (freshEntries.length === 0) return '';
     const parts: string[] = [];
     let byteLen = 0;
-    for (let i = userEntries.length - 1; i >= 0 && byteLen < 2000; i--) {
-      const t = userEntries[i].text;
+    for (let i = freshEntries.length - 1; i >= 0 && byteLen < 2000; i--) {
+      const t = freshEntries[i].text;
       if (!t) continue;
       parts.unshift(t);
       byteLen += Buffer.byteLength(t, 'utf8');
@@ -675,6 +685,9 @@ export class GptLiveManager {
 
     await this.safeSave();
 
+    this.lastDiagnosticSnapshot = this.buildDiagnostics(session);
+    this.lastSessionOwnerId = session.ownerId;
+
     const confirmed = session.closureConfirmed === true;
     const closureReason = session.closureReason ?? 'unknown';
     const resolve = session.closingResolve;
@@ -684,24 +697,54 @@ export class GptLiveManager {
     if (resolve) resolve();
   }
 
-  getDiagnostics(): GptLiveDiagnostics {
-    const session = this.active;
+  private buildDiagnostics(session: ActiveTrialSession): GptLiveDiagnostics {
     return {
-      sessionId: session?.sessionId ?? null,
+      sessionId: session.sessionId,
       voiceModel: GPT_LIVE_VOICE_MODEL,
       backendModel: GPT_LIVE_BACKEND_MODEL,
-      cumulativeVoiceSeconds: session?.cumulativeVoiceSeconds ?? 0,
-      estimatedCostUsd: session
-        ? (session.cumulativeVoiceSeconds / 60) * GPT_LIVE_PRICE_PER_MINUTE
-        : 0,
-      closureConfirmed: session?.closureConfirmed ?? null,
-      closureReason: session?.closureReason ?? null,
-      delegationsProcessed: session?.processedDelegationIds.size ?? 0,
+      cumulativeVoiceSeconds: session.cumulativeVoiceSeconds,
+      estimatedCostUsd: (session.cumulativeVoiceSeconds / 60) * GPT_LIVE_PRICE_PER_MINUTE,
+      closureConfirmed: session.closureConfirmed,
+      closureReason: session.closureReason,
+      delegationsProcessed: session.processedDelegationIds.size,
       delegationsSkipped: 0,
-      transcript: session
-        ? session.transcript.map(t => ({ ...t }))
-        : [],
+      transcript: session.transcript.map(t => ({ ...t })),
     };
+  }
+
+  getDiagnostics(ownerId?: string): GptLiveDiagnostics {
+    if (this.active) {
+      if (ownerId && this.active.ownerId !== ownerId) {
+        return this.emptyDiagnostics();
+      }
+      return this.buildDiagnostics(this.active);
+    }
+    if (this.lastDiagnosticSnapshot) {
+      if (ownerId && this.lastSessionOwnerId !== ownerId) {
+        return this.emptyDiagnostics();
+      }
+      return this.lastDiagnosticSnapshot;
+    }
+    return this.emptyDiagnostics();
+  }
+
+  private emptyDiagnostics(): GptLiveDiagnostics {
+    return {
+      sessionId: null,
+      voiceModel: GPT_LIVE_VOICE_MODEL,
+      backendModel: GPT_LIVE_BACKEND_MODEL,
+      cumulativeVoiceSeconds: 0,
+      estimatedCostUsd: 0,
+      closureConfirmed: null,
+      closureReason: null,
+      delegationsProcessed: 0,
+      delegationsSkipped: 0,
+      transcript: [],
+    };
+  }
+
+  getSessionOwnerId(): string | null {
+    return this.active?.ownerId ?? this.lastSessionOwnerId;
   }
 
   async shutdown(): Promise<void> {
