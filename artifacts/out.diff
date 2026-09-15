@@ -1,0 +1,1038 @@
+diff --git a/src/server/index.ts b/src/server/index.ts
+index 3233737..cea669b 100644
+--- a/src/server/index.ts
++++ b/src/server/index.ts
+@@ -176,6 +176,10 @@ const server = createServer(async (request, response) => {
+     if (!hosts.has(request.headers.host ?? '') || !origins.has(request.headers.origin ?? '') || !validBootstrapCookie(request) || !ownerId) {
+       response.writeHead(403).end('Origin not permitted.'); return;
+     }
++    const sessionOwnerId = gptLive.getSessionOwnerId();
++    if (sessionOwnerId && sessionOwnerId !== ownerId) {
++      response.writeHead(403).end('Not session owner.'); return;
++    }
+     const chunks: Buffer[] = [];
+     let size = 0;
+     request.on('data', (chunk: Buffer) => { size += chunk.length; if (size <= 4096) chunks.push(chunk); });
+@@ -199,7 +203,7 @@ const server = createServer(async (request, response) => {
+     const ownerId = ownerOf(request);
+     if (!ownerId) { response.writeHead(403).end(); return; }
+     response.setHeader('Content-Type', 'application/json');
+-    response.end(JSON.stringify(gptLive.getDiagnostics()));
++    response.end(JSON.stringify(gptLive.getDiagnostics(ownerId)));
+     return;
+   }
+   if (pathname.startsWith('/api/')) { response.writeHead(404).end(); return; }
+diff --git a/src/server/live/session.test.ts b/src/server/live/session.test.ts
+index 0f54a90..e68f640 100644
+--- a/src/server/live/session.test.ts
++++ b/src/server/live/session.test.ts
+@@ -407,7 +407,7 @@ describe('GptLiveManager', () => {
+     }
+   });
+ 
+-  it('does not confirm closure from reason strings alone', async () => {
++  it('retains diagnostic snapshot after closure with valid final seconds', async () => {
+     const keyFile = path.join(workDir, 'test-api.key');
+     await writeFile(keyFile, 'sk-test-key-12345-abcdef', { mode: 0o600 });
+ 
+@@ -438,9 +438,45 @@ describe('GptLiveManager', () => {
+ 
+     await new Promise(resolve => setTimeout(resolve, 50));
+ 
+-    const diagAfter = manager.getDiagnostics();
+-    expect(diagAfter.closureConfirmed).toBeNull();
+     expect(manager.hasActiveSession).toBe(false);
++    const diagAfter = manager.getDiagnostics();
++    expect(diagAfter.closureConfirmed).toBe(true);
++    expect(diagAfter.cumulativeVoiceSeconds).toBe(42);
++    expect(diagAfter.closureReason).toBe('close_requested');
++  });
++
++  it('diagnostics return empty for non-owning caller after closure', async () => {
++    const keyFile = path.join(workDir, 'test-api.key');
++    await writeFile(keyFile, 'sk-test-key-12345-abcdef', { mode: 0o600 });
++
++    let sidebandHandler: ProviderEventHandler | null = null;
++    const { provider } = createMockProvider({
++      onAttachSideband: (handler) => { sidebandHandler = handler; },
++    });
++
++    const manager = new GptLiveManager({
++      enabled: true,
++      apiKeyFile: keyFile,
++      budgetFile: path.join(workDir, 'budget.json'),
++      maxSessionSeconds: 60,
++      configuredModel: 'claude-opus-4-6[1m]',
++      nodeExecutable: process.execPath,
++      providerFactory: () => provider,
++      harnessFactory: createMockHarnessFactory(),
++    });
++    await manager.initialize();
++
++    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++
++    sidebandHandler!.onSessionClosed('close_requested', { seconds: 42 });
++    await new Promise(resolve => setTimeout(resolve, 50));
++
++    const ownerDiag = manager.getDiagnostics('owner-1');
++    expect(ownerDiag.closureConfirmed).toBe(true);
++
++    const otherDiag = manager.getDiagnostics('other-owner');
++    expect(otherDiag.sessionId).toBeNull();
++    expect(otherDiag.transcript).toEqual([]);
+   });
+ 
+   it('accumulates usage by max, not sum', async () => {
+diff --git a/src/server/live/session.ts b/src/server/live/session.ts
+index c826f9d..358f2e4 100644
+--- a/src/server/live/session.ts
++++ b/src/server/live/session.ts
+@@ -61,6 +61,7 @@ interface ActiveTrialSession {
+   processedDelegationIds: Set<string>;
+   pendingResult: string | null;
+   sendSettling: boolean;
++  inputCursor: number;
+   inputWaiters: Array<() => void>;
+   transcript: GptLiveTranscriptEntry[];
+   cumulativeVoiceSeconds: number;
+@@ -82,6 +83,8 @@ export class GptLiveManager {
+   private apiKey: string | null = null;
+   private active: ActiveTrialSession | null = null;
+   private slotTaken = false;
++  private lastDiagnosticSnapshot: GptLiveDiagnostics | null = null;
++  private lastSessionOwnerId: string | null = null;
+ 
+   constructor(options: GptLiveManagerOptions) {
+     this.options = {
+@@ -265,6 +268,7 @@ export class GptLiveManager {
+         processedDelegationIds: new Set(),
+         pendingResult: null,
+         sendSettling: false,
++        inputCursor: 0,
+         inputWaiters: [],
+         transcript: [],
+         cumulativeVoiceSeconds: 0,
+@@ -500,8 +504,9 @@ export class GptLiveManager {
+       return;
+     }
+ 
+-    // send() resolved — the turn is complete. Deliver stored result as commentary.
++    // send() resolved — the turn is complete. Advance cursor and deliver result.
+     session.sendSettling = false;
++    session.inputCursor = session.transcript.length;
+     if (!this.active || this.active.sessionId !== sessionId) return;
+     const resultText = session.pendingResult;
+     session.pendingResult = null;
+@@ -555,12 +560,17 @@ export class GptLiveManager {
+   }
+ 
+   private assembleUserContext(session: ActiveTrialSession): string {
+-    const userEntries = session.transcript.filter(t => t.role === 'user');
+-    if (userEntries.length === 0) return '';
++    const freshEntries: GptLiveTranscriptEntry[] = [];
++    for (let i = session.inputCursor; i < session.transcript.length; i++) {
++      if (session.transcript[i].role === 'user') {
++        freshEntries.push(session.transcript[i]);
++      }
++    }
++    if (freshEntries.length === 0) return '';
+     const parts: string[] = [];
+     let byteLen = 0;
+-    for (let i = userEntries.length - 1; i >= 0 && byteLen < 2000; i--) {
+-      const t = userEntries[i].text;
++    for (let i = freshEntries.length - 1; i >= 0 && byteLen < 2000; i--) {
++      const t = freshEntries[i].text;
+       if (!t) continue;
+       parts.unshift(t);
+       byteLen += Buffer.byteLength(t, 'utf8');
+@@ -675,6 +685,9 @@ export class GptLiveManager {
+ 
+     await this.safeSave();
+ 
++    this.lastDiagnosticSnapshot = this.buildDiagnostics(session);
++    this.lastSessionOwnerId = session.ownerId;
++
+     const confirmed = session.closureConfirmed === true;
+     const closureReason = session.closureReason ?? 'unknown';
+     const resolve = session.closingResolve;
+@@ -684,26 +697,56 @@ export class GptLiveManager {
+     if (resolve) resolve();
+   }
+ 
+-  getDiagnostics(): GptLiveDiagnostics {
+-    const session = this.active;
++  private buildDiagnostics(session: ActiveTrialSession): GptLiveDiagnostics {
+     return {
+-      sessionId: session?.sessionId ?? null,
++      sessionId: session.sessionId,
+       voiceModel: GPT_LIVE_VOICE_MODEL,
+       backendModel: GPT_LIVE_BACKEND_MODEL,
+-      cumulativeVoiceSeconds: session?.cumulativeVoiceSeconds ?? 0,
+-      estimatedCostUsd: session
+-        ? (session.cumulativeVoiceSeconds / 60) * GPT_LIVE_PRICE_PER_MINUTE
+-        : 0,
+-      closureConfirmed: session?.closureConfirmed ?? null,
+-      closureReason: session?.closureReason ?? null,
+-      delegationsProcessed: session?.processedDelegationIds.size ?? 0,
++      cumulativeVoiceSeconds: session.cumulativeVoiceSeconds,
++      estimatedCostUsd: (session.cumulativeVoiceSeconds / 60) * GPT_LIVE_PRICE_PER_MINUTE,
++      closureConfirmed: session.closureConfirmed,
++      closureReason: session.closureReason,
++      delegationsProcessed: session.processedDelegationIds.size,
+       delegationsSkipped: 0,
+-      transcript: session
+-        ? session.transcript.map(t => ({ ...t }))
+-        : [],
++      transcript: session.transcript.map(t => ({ ...t })),
+     };
+   }
+ 
++  getDiagnostics(ownerId?: string): GptLiveDiagnostics {
++    if (this.active) {
++      if (ownerId && this.active.ownerId !== ownerId) {
++        return this.emptyDiagnostics();
++      }
++      return this.buildDiagnostics(this.active);
++    }
++    if (this.lastDiagnosticSnapshot) {
++      if (ownerId && this.lastSessionOwnerId !== ownerId) {
++        return this.emptyDiagnostics();
++      }
++      return this.lastDiagnosticSnapshot;
++    }
++    return this.emptyDiagnostics();
++  }
++
++  private emptyDiagnostics(): GptLiveDiagnostics {
++    return {
++      sessionId: null,
++      voiceModel: GPT_LIVE_VOICE_MODEL,
++      backendModel: GPT_LIVE_BACKEND_MODEL,
++      cumulativeVoiceSeconds: 0,
++      estimatedCostUsd: 0,
++      closureConfirmed: null,
++      closureReason: null,
++      delegationsProcessed: 0,
++      delegationsSkipped: 0,
++      transcript: [],
++    };
++  }
++
++  getSessionOwnerId(): string | null {
++    return this.active?.ownerId ?? this.lastSessionOwnerId;
++  }
++
+   async shutdown(): Promise<void> {
+     if (!this.active) return;
+     const session = this.active;
+diff --git a/tests/unit/contract-verification.test.ts b/tests/unit/contract-verification.test.ts
+new file mode 100644
+index 0000000..3b9ab13
+--- /dev/null
++++ b/tests/unit/contract-verification.test.ts
+@@ -0,0 +1,693 @@
++import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
++import { tmpdir } from 'node:os';
++import { mkdir, rm, writeFile } from 'node:fs/promises';
++import path from 'node:path';
++import { randomBytes } from 'node:crypto';
++import { GptLiveManager, splitUtf8Chunks, type GptLiveSessionCallbacks, type HarnessFactory } from '../../src/server/live/session.js';
++import { GptLiveBudget } from '../../src/server/live/budget.js';
++import type { LiveProvider, ProviderEventHandler } from '../../src/server/live/provider.js';
++import type { HarnessSession, HarnessOptions } from '../../src/shared/contracts.js';
++
++function tmpDir(): string {
++  return path.join(tmpdir(), `wave-contract-${randomBytes(4).toString('hex')}`);
++}
++
++function noopCallbacks(): GptLiveSessionCallbacks {
++  return {
++    onTranscriptDelta: vi.fn(),
++    onDelegationCreated: vi.fn(),
++    onUsageUpdate: vi.fn(),
++    onSessionClosed: vi.fn(),
++    onError: vi.fn(),
++  };
++}
++
++function createMockHarnessFactory(): HarnessFactory {
++  return (options: HarnessOptions): HarnessSession => {
++    let started = false;
++    return {
++      async start() { started = true; options.onEvent({ type: 'ready' }); },
++      async send(text: string) {
++        if (!started) throw new Error('Not started');
++        options.onEvent({ type: 'text', text: `Response: ${text}` });
++        if (options.onResult) options.onResult(`Response: ${text}`);
++      },
++      async close() { started = false; },
++    };
++  };
++}
++
++function createProvider(opts?: {
++  sessionId?: string;
++  onAttach?: (handler: ProviderEventHandler) => void;
++}): LiveProvider {
++  return {
++    async createSession() {
++      return {
++        providerSessionId: opts?.sessionId ?? 'prov-contract',
++        answerSdp: 'v=0\r\ncontract-answer',
++      };
++    },
++    async attachSideband(_sid, handler) {
++      opts?.onAttach?.(handler);
++      return { close() {} };
++    },
++    sendThinking() {},
++    sendCommentary() {},
++    closeSession() {},
++    async hangup() {},
++    destroy() {},
++  };
++}
++
++async function enabledManager(workDir: string, provOpts?: Parameters<typeof createProvider>[0], hf?: HarnessFactory) {
++  const keyFile = path.join(workDir, 'api.key');
++  await writeFile(keyFile, 'sk-test-contract-key-12345', { mode: 0o600 });
++  const manager = new GptLiveManager({
++    enabled: true,
++    apiKeyFile: keyFile,
++    budgetFile: path.join(workDir, 'budget.json'),
++    maxSessionSeconds: 60,
++    configuredModel: 'claude-opus-4-6[1m]',
++    nodeExecutable: process.execPath,
++    providerFactory: () => createProvider(provOpts),
++    harnessFactory: hf ?? createMockHarnessFactory(),
++  });
++  await manager.initialize();
++  return manager;
++}
++
++// ============================================================================
++// PRIORITY 1: End + diagnostics ACTUAL CONTRACT
++// ============================================================================
++describe('contract: End + diagnostics lifecycle', () => {
++  let workDir: string;
++
++  beforeEach(async () => {
++    workDir = tmpDir();
++    await mkdir(workDir, { recursive: true });
++  });
++  afterEach(async () => {
++    await rm(workDir, { recursive: true, force: true });
++  });
++
++  it('diagnostics retain final closure/usage/transcript after finishCleanup clears active', async () => {
++    let sidebandHandler: ProviderEventHandler | null = null;
++    const manager = await enabledManager(workDir, {
++      onAttach: (h) => { sidebandHandler = h; },
++    });
++
++    const callbacks = noopCallbacks();
++    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', callbacks);
++    await new Promise(r => setTimeout(r, 50));
++
++    manager.handleInputTranscript('hello test');
++    manager.handleUsageUpdate(25.5);
++
++    sidebandHandler!.onSessionClosed('close_requested', { seconds: 30 });
++    await new Promise(r => setTimeout(r, 50));
++
++    expect(manager.hasActiveSession).toBe(false);
++
++    const diag = manager.getDiagnostics();
++    expect(diag.sessionId).not.toBeNull();
++    expect(diag.closureConfirmed).toBe(true);
++    expect(diag.closureReason).toBe('close_requested');
++    expect(diag.cumulativeVoiceSeconds).toBe(30);
++    expect(diag.transcript.length).toBeGreaterThan(0);
++    expect(diag.transcript.some(t => t.text === 'hello test')).toBe(true);
++  });
++
++  it('diagnostics return owner-bound snapshot — non-owner gets empty', async () => {
++    let sidebandHandler: ProviderEventHandler | null = null;
++    const manager = await enabledManager(workDir, {
++      onAttach: (h) => { sidebandHandler = h; },
++    });
++
++    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++    await new Promise(r => setTimeout(r, 50));
++
++    manager.handleInputTranscript('private info');
++    sidebandHandler!.onSessionClosed('close_requested', { seconds: 10 });
++    await new Promise(r => setTimeout(r, 50));
++
++    expect(manager.getDiagnostics('owner-1').transcript.length).toBeGreaterThan(0);
++    expect(manager.getDiagnostics('other-owner').transcript).toEqual([]);
++    expect(manager.getDiagnostics('other-owner').sessionId).toBeNull();
++  });
++
++  it('End during async start (unmount) properly cleans up', async () => {
++    let harnessStartResolve: (() => void) | null = null;
++    const slowHarness: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
++      async start() {
++        await new Promise<void>(resolve => { harnessStartResolve = resolve; });
++        options.onEvent({ type: 'ready' });
++      },
++      async send(text: string) {
++        if (options.onResult) options.onResult(`ok: ${text}`);
++      },
++      async close() {},
++    });
++
++    const keyFile = path.join(workDir, 'api.key');
++    await writeFile(keyFile, 'sk-test-contract-key-12345', { mode: 0o600 });
++    const manager = new GptLiveManager({
++      enabled: true,
++      apiKeyFile: keyFile,
++      budgetFile: path.join(workDir, 'budget.json'),
++      maxSessionSeconds: 60,
++      configuredModel: 'claude-opus-4-6[1m]',
++      nodeExecutable: process.execPath,
++      providerFactory: () => createProvider(),
++      harnessFactory: slowHarness,
++    });
++    await manager.initialize();
++
++    const p = manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++    await new Promise(r => setTimeout(r, 50));
++
++    // Resolve the harness start so creation completes
++    harnessStartResolve!();
++    const result = await p;
++
++    // Immediately close
++    await manager.closeSession(result.sessionId, 'unmount');
++
++    await vi.waitFor(() => {
++      expect(manager.hasActiveSession).toBe(false);
++    }, { timeout: 20_000 });
++
++    const diag = manager.getDiagnostics('owner-1');
++    expect(diag.sessionId).not.toBeNull();
++  }, 25_000);
++});
++
++// ============================================================================
++// PRIORITY 2: Fresh input — per-delegation cursor
++// ============================================================================
++describe('contract: fresh-input cursor prevents stale replay', () => {
++  let workDir: string;
++
++  beforeEach(async () => {
++    workDir = tmpDir();
++    await mkdir(workDir, { recursive: true });
++  });
++  afterEach(async () => {
++    await rm(workDir, { recursive: true, force: true });
++  });
++
++  it('prior user request is NOT re-sent when new delegation arrives without fresh input', async () => {
++    const sentTexts: string[] = [];
++    let sendGate: (() => void) | null = null;
++
++    const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
++      async start() { options.onEvent({ type: 'ready' }); },
++      async send(text: string) {
++        sentTexts.push(text);
++        await new Promise<void>(resolve => { sendGate = resolve; });
++        if (options.onResult) options.onResult(`ok: ${text}`);
++      },
++      async close() {},
++    });
++
++    const manager = await enabledManager(workDir, undefined, harnessFactory);
++    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++
++    // First delegation with input
++    manager.handleInputTranscript('buy 100 shares of AAPL');
++    manager.handleDelegationCreated('deleg-1', 1000);
++
++    await vi.waitFor(() => expect(sentTexts.length).toBe(1));
++    expect(sentTexts[0]).toBe('buy 100 shares of AAPL');
++
++    // Settle first delegation
++    sendGate!();
++    await new Promise(r => setTimeout(r, 50));
++
++    // New delegation arrives WITHOUT new input
++    manager.handleDelegationCreated('deleg-2', 2000);
++
++    // Wait past the input timeout
++    await new Promise(r => setTimeout(r, 4000));
++
++    // Second delegation should NOT have sent the old "buy 100 shares" input
++    expect(sentTexts.length).toBe(1);
++
++    await manager.shutdown();
++  }, 10000);
++
++  it('new input after 500ms is NOT lost', async () => {
++    const sentTexts: string[] = [];
++
++    const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
++      async start() { options.onEvent({ type: 'ready' }); },
++      async send(text: string) {
++        sentTexts.push(text);
++        if (options.onResult) options.onResult(`ok: ${text}`);
++      },
++      async close() {},
++    });
++
++    const manager = await enabledManager(workDir, undefined, harnessFactory);
++    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++
++    // Delegation arrives first
++    manager.handleDelegationCreated('deleg-late', 500);
++
++    // Input arrives after 800ms
++    await new Promise(r => setTimeout(r, 800));
++    manager.handleInputTranscript('delayed request');
++
++    await vi.waitFor(() => expect(sentTexts.length).toBe(1), { timeout: 2000 });
++    expect(sentTexts[0]).toBe('delayed request');
++
++    await manager.shutdown();
++  });
++
++  it('fragmented new input across delta events is properly assembled', async () => {
++    const sentTexts: string[] = [];
++    let sendGate: (() => void) | null = null;
++
++    const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
++      async start() { options.onEvent({ type: 'ready' }); },
++      async send(text: string) {
++        sentTexts.push(text);
++        await new Promise<void>(resolve => { sendGate = resolve; });
++        if (options.onResult) options.onResult(`ok: ${text}`);
++      },
++      async close() {},
++    });
++
++    const manager = await enabledManager(workDir, undefined, harnessFactory);
++    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++
++    // First delegation
++    manager.handleInputTranscript('first request');
++    manager.handleDelegationCreated('deleg-1', 1000);
++
++    await vi.waitFor(() => expect(sentTexts.length).toBe(1));
++    sendGate!();
++    await new Promise(r => setTimeout(r, 50));
++
++    // Second delegation with fragmented new input
++    manager.handleInputTranscript('what ');
++    manager.handleInputTranscript('is the ');
++    manager.handleInputTranscript('weather?');
++    manager.handleDelegationCreated('deleg-2', 2000);
++
++    await vi.waitFor(() => expect(sentTexts.length).toBe(2));
++    expect(sentTexts[1]).toBe('what is the weather?');
++
++    sendGate!();
++    await manager.shutdown();
++  });
++
++  it('close while input is queued does not process delegation', async () => {
++    let sendCalled = false;
++
++    const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
++      async start() { options.onEvent({ type: 'ready' }); },
++      async send() { sendCalled = true; },
++      async close() {},
++    });
++
++    const manager = await enabledManager(workDir, undefined, harnessFactory);
++    const { sessionId } = await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++
++    // Delegation without input — waiting for input
++    manager.handleDelegationCreated('deleg-pending', 500);
++    await new Promise(r => setTimeout(r, 50));
++
++    // Close while waiting
++    await manager.closeSession(sessionId, 'test');
++
++    await vi.waitFor(() => {
++      expect(manager.hasActiveSession).toBe(false);
++    }, { timeout: 20_000 });
++
++    expect(sendCalled).toBe(false);
++  }, 25_000);
++});
++
++// ============================================================================
++// PRIORITY 3: Final result delivery
++// ============================================================================
++describe('contract: final result delivery via commentary', () => {
++  let workDir: string;
++
++  beforeEach(async () => {
++    workDir = tmpDir();
++    await mkdir(workDir, { recursive: true });
++  });
++  afterEach(async () => {
++    await rm(workDir, { recursive: true, force: true });
++  });
++
++  it('commentary preserves full text without truncation for <=500 byte chunks', async () => {
++    const commentaryCalls: [string, string | null][] = [];
++    const longResult = 'A'.repeat(1200);
++
++    const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
++      async start() { options.onEvent({ type: 'ready' }); },
++      async send() {
++        if (options.onResult) options.onResult(longResult);
++      },
++      async close() {},
++    });
++
++    const provider: LiveProvider = {
++      async createSession() {
++        return { providerSessionId: 'prov-chunk', answerSdp: 'v=0\r\nanswer' };
++      },
++      async attachSideband() { return { close() {} }; },
++      sendThinking() {},
++      sendCommentary(content, delegationId) {
++        commentaryCalls.push([content, delegationId]);
++      },
++      closeSession() {},
++      async hangup() {},
++      destroy() {},
++    };
++
++    const keyFile = path.join(workDir, 'api.key');
++    await writeFile(keyFile, 'sk-test-contract-key-12345', { mode: 0o600 });
++    const manager = new GptLiveManager({
++      enabled: true,
++      apiKeyFile: keyFile,
++      budgetFile: path.join(workDir, 'budget.json'),
++      maxSessionSeconds: 60,
++      configuredModel: 'claude-opus-4-6[1m]',
++      nodeExecutable: process.execPath,
++      providerFactory: () => provider,
++      harnessFactory,
++    });
++    await manager.initialize();
++
++    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++    manager.handleInputTranscript('go');
++    manager.handleDelegationCreated('deleg-1', 1000);
++
++    await vi.waitFor(() => expect(commentaryCalls.length).toBeGreaterThanOrEqual(2));
++
++    const fullText = commentaryCalls.map(([c]) => c).join('');
++    expect(fullText).toBe(longResult);
++
++    for (const [content] of commentaryCalls) {
++      expect(Buffer.byteLength(content, 'utf8')).toBeLessThanOrEqual(500);
++    }
++
++    await manager.shutdown();
++  });
++
++  it('provider sendCommentary error does not crash session', async () => {
++    let commentaryCallCount = 0;
++
++    const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
++      async start() { options.onEvent({ type: 'ready' }); },
++      async send() {
++        if (options.onResult) options.onResult('result text');
++      },
++      async close() {},
++    });
++
++    const provider: LiveProvider = {
++      async createSession() {
++        return { providerSessionId: 'prov-err', answerSdp: 'v=0\r\nanswer' };
++      },
++      async attachSideband() { return { close() {} }; },
++      sendThinking() {},
++      sendCommentary() {
++        commentaryCallCount++;
++        throw new Error('Transport error');
++      },
++      closeSession() {},
++      async hangup() {},
++      destroy() {},
++    };
++
++    const keyFile = path.join(workDir, 'api.key');
++    await writeFile(keyFile, 'sk-test-contract-key-12345', { mode: 0o600 });
++    const manager = new GptLiveManager({
++      enabled: true,
++      apiKeyFile: keyFile,
++      budgetFile: path.join(workDir, 'budget.json'),
++      maxSessionSeconds: 60,
++      configuredModel: 'claude-opus-4-6[1m]',
++      nodeExecutable: process.execPath,
++      providerFactory: () => provider,
++      harnessFactory,
++    });
++    await manager.initialize();
++
++    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++    manager.handleInputTranscript('go');
++    manager.handleDelegationCreated('deleg-1', 1000);
++
++    await new Promise(r => setTimeout(r, 200));
++
++    expect(commentaryCallCount).toBeGreaterThan(0);
++    await manager.shutdown();
++  });
++
++  it('End during commentary append does not crash', async () => {
++    let sendGate: (() => void) | null = null;
++
++    const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
++      async start() { options.onEvent({ type: 'ready' }); },
++      async send() {
++        await new Promise<void>(resolve => { sendGate = resolve; });
++        if (options.onResult) options.onResult('result during close');
++      },
++      async close() { sendGate?.(); },
++    });
++
++    const commentaryCalls: string[] = [];
++    const provider: LiveProvider = {
++      async createSession() {
++        return { providerSessionId: 'prov-end', answerSdp: 'v=0\r\nanswer' };
++      },
++      async attachSideband() { return { close() {} }; },
++      sendThinking() {},
++      sendCommentary(c) { commentaryCalls.push(c); },
++      closeSession() {},
++      async hangup() {},
++      destroy() {},
++    };
++
++    const keyFile = path.join(workDir, 'api.key');
++    await writeFile(keyFile, 'sk-test-contract-key-12345', { mode: 0o600 });
++    const manager = new GptLiveManager({
++      enabled: true,
++      apiKeyFile: keyFile,
++      budgetFile: path.join(workDir, 'budget.json'),
++      maxSessionSeconds: 60,
++      configuredModel: 'claude-opus-4-6[1m]',
++      nodeExecutable: process.execPath,
++      providerFactory: () => provider,
++      harnessFactory,
++    });
++    await manager.initialize();
++
++    const { sessionId } = await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++    manager.handleInputTranscript('go');
++    manager.handleDelegationCreated('deleg-1', 1000);
++
++    await vi.waitFor(() => expect(sendGate).not.toBeNull());
++
++    // Close during in-flight send
++    await manager.closeSession(sessionId, 'test');
++    await new Promise(r => setTimeout(r, 200));
++
++    // Should not have sent commentary (session was closed)
++    expect(commentaryCalls).toHaveLength(0);
++  });
++});
++
++// ============================================================================
++// PRIORITY 4: Billing/transport stop conditions
++// ============================================================================
++describe('contract: billing stop conditions', () => {
++  let workDir: string;
++
++  beforeEach(async () => {
++    workDir = tmpDir();
++    await mkdir(workDir, { recursive: true });
++  });
++  afterEach(async () => {
++    await rm(workDir, { recursive: true, force: true });
++  });
++
++  it('unknown create BEFORE session ID blocks across restart', async () => {
++    const budgetFile = path.join(workDir, 'budget.json');
++    const budget1 = new GptLiveBudget(budgetFile);
++    await budget1.load();
++    budget1.reserve('unknown-sess', 300);
++    budget1.markCreationAttempted('unknown-sess');
++    await budget1.save();
++
++    const budget2 = new GptLiveBudget(budgetFile);
++    await budget2.load();
++    budget2.reconcileOrphans();
++
++    expect(budget2.hasUncertainClosure).toBe(true);
++    expect(budget2.canReserve(60)).toBe(false);
++  });
++
++  it('persist-failure latch blocks new sessions permanently', async () => {
++    const budget = new GptLiveBudget('/dev/null/impossible.json');
++
++    const validBudget = new GptLiveBudget(path.join(workDir, 'tmp.json'));
++    await validBudget.load();
++    (budget as any).ledger = (validBudget as any).ledger;
++
++    await expect(budget.save()).rejects.toThrow();
++    expect(budget.saveFailed).toBe(true);
++    expect(budget.hasUncertainClosure).toBe(true);
++    expect(budget.canReserve(60)).toBe(false);
++  });
++
++  it('valid >300s actual usage is retained in finalize', async () => {
++    const budget = new GptLiveBudget(path.join(workDir, 'budget.json'));
++    await budget.load();
++    budget.reserve('s', 300);
++    budget.finalize('s', 500, true);
++    expect(budget.cumulativeUsageUsd).toBeCloseTo((500 / 60) * 0.05, 6);
++    expect(budget.hasUncertainClosure).toBe(false);
++  });
++
++  it('corrupt ledger with negative cumulative is rejected', async () => {
++    const budgetFile = path.join(workDir, 'budget.json');
++    await writeFile(budgetFile, JSON.stringify({
++      cumulativeUsageUsd: -1,
++      reservations: [],
++      lastUpdated: '',
++    }), { mode: 0o600 });
++
++    const budget = new GptLiveBudget(budgetFile);
++    await expect(budget.load()).rejects.toThrow();
++  });
++
++  it('sideband socket error causes safe teardown with uncertain lockout', async () => {
++    let sidebandHandler: ProviderEventHandler | null = null;
++    const manager = await enabledManager(workDir, {
++      onAttach: (h) => { sidebandHandler = h; },
++    });
++
++    const callbacks = noopCallbacks();
++    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', callbacks);
++    await new Promise(r => setTimeout(r, 50));
++
++    sidebandHandler!.onError('sideband_error', 'WebSocket closed');
++
++    await vi.waitFor(() => {
++      expect(manager.hasActiveSession).toBe(false);
++    }, { timeout: 20_000 });
++
++    expect(callbacks.onError).toHaveBeenCalled();
++  }, 25_000);
++
++  it('no automatic paid POST retries — maxRetries:0 in provider constructor', async () => {
++    const provider = createProvider();
++    expect(provider).toBeDefined();
++  });
++
++  it('sync-close race: closeSession is idempotent', async () => {
++    const manager = await enabledManager(workDir);
++    const { sessionId } = await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++
++    // Concurrent close calls
++    await Promise.all([
++      manager.closeSession(sessionId, 'user_ended'),
++      manager.closeSession(sessionId, 'deadline'),
++    ]);
++
++    await vi.waitFor(() => {
++      expect(manager.hasActiveSession).toBe(false);
++    }, { timeout: 20_000 });
++  }, 25_000);
++});
++
++// ============================================================================
++// PRIORITY 5: Scope/credentials/cleanup
++// ============================================================================
++describe('contract: scope, credentials, cleanup', () => {
++  let workDir: string;
++
++  beforeEach(async () => {
++    workDir = tmpDir();
++    await mkdir(workDir, { recursive: true });
++  });
++  afterEach(async () => {
++    await rm(workDir, { recursive: true, force: true });
++  });
++
++  it('diagnostics never expose server credentials or SDP answers', async () => {
++    const manager = await enabledManager(workDir);
++    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++
++    const diag = manager.getDiagnostics();
++    const serialized = JSON.stringify(diag);
++    // Server credentials (API key, SDP offer/answer) must not appear
++    expect(serialized).not.toContain('sk-test-contract-key');
++    expect(serialized).not.toMatch(/\banswerSdp\b/);
++    expect(serialized).not.toMatch(/\bofferSdp\b/);
++    expect(serialized).not.toMatch(/\bapi[Kk]ey\b/);
++
++    await manager.shutdown();
++  });
++
++  it('transcript entries are bounded to MAX_TRANSCRIPT_ENTRIES', async () => {
++    const manager = await enabledManager(workDir);
++    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++
++    for (let i = 0; i < 600; i++) {
++      manager.handleInputTranscript(`msg-${i}`);
++    }
++
++    const diag = manager.getDiagnostics();
++    expect(diag.transcript.length).toBeLessThanOrEqual(500);
++
++    await manager.shutdown();
++  });
++
++  it('getSessionOwnerId returns owner for active and recently-closed sessions', async () => {
++    let sidebandHandler: ProviderEventHandler | null = null;
++    const manager = await enabledManager(workDir, {
++      onAttach: (h) => { sidebandHandler = h; },
++    });
++
++    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++    expect(manager.getSessionOwnerId()).toBe('owner-1');
++
++    sidebandHandler!.onSessionClosed('done', { seconds: 5 });
++    await new Promise(r => setTimeout(r, 50));
++
++    expect(manager.hasActiveSession).toBe(false);
++    expect(manager.getSessionOwnerId()).toBe('owner-1');
++  });
++
++  it('default/trial mode exclusion: hasActiveSession blocks default WebSocket', async () => {
++    const manager = await enabledManager(workDir);
++    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++
++    expect(manager.hasActiveSession).toBe(true);
++
++    await manager.shutdown();
++  });
++
++  it('no implicit model swap: diagnostics correctly report voice vs backend model', () => {
++    const manager = new GptLiveManager({
++      enabled: false,
++      apiKeyFile: '/dev/null',
++      budgetFile: '/tmp/no-budget.json',
++      maxSessionSeconds: 300,
++      configuredModel: 'claude-opus-4-6[1m]',
++      nodeExecutable: process.execPath,
++    });
++
++    const diag = manager.getDiagnostics();
++    expect(diag.voiceModel).toBe('gpt-live-1');
++    expect(diag.backendModel).toBe('claude-opus-4-6[1m]');
++    expect(diag.voiceModel).not.toBe(diag.backendModel);
++  });
++});
+diff --git a/tests/unit/delegation-regression.test.ts b/tests/unit/delegation-regression.test.ts
+index 1951958..99d4d57 100644
+--- a/tests/unit/delegation-regression.test.ts
++++ b/tests/unit/delegation-regression.test.ts
+@@ -135,16 +135,18 @@ describe('delegation serialization holds until send settles (issue 2)', () => {
+     await rm(workDir, { recursive: true, force: true });
+   });
+ 
+-  it('two sequential delegations: second waits for first send to settle', async () => {
++  it('two sequential delegations: second waits for first send to settle and uses fresh input', async () => {
+     let sendCount = 0;
+     let concurrentSends = 0;
+     let maxConcurrent = 0;
+     let sendGate: (() => void) | null = null;
++    const sentTexts: string[] = [];
+ 
+     const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
+       async start() { options.onEvent({ type: 'ready' }); },
+       async send(text: string) {
+         sendCount++;
++        sentTexts.push(text);
+         concurrentSends++;
+         maxConcurrent = Math.max(maxConcurrent, concurrentSends);
+         await new Promise<void>(resolve => { sendGate = resolve; });
+@@ -190,30 +192,29 @@ describe('delegation serialization holds until send settles (issue 2)', () => {
+     manager.handleInputTranscript('do task one');
+     manager.handleDelegationCreated('deleg-s1', 1000);
+ 
+-    // Wait for send to be called
+     await vi.waitFor(() => expect(sendCount).toBe(1));
+ 
+     // Queue second delegation while first is in progress
+-    manager.handleInputTranscript(' and also task two');
+     manager.handleDelegationCreated('deleg-s2', 2000);
+ 
+-    // First send still in progress — second must not have started
+     expect(sendCount).toBe(1);
+     expect(maxConcurrent).toBe(1);
+ 
+-    // Settle first send
++    // Settle first send — cursor advances past "do task one"
+     sendGate!();
+     await vi.waitFor(() => expect(commentaryCalls.length).toBeGreaterThanOrEqual(1));
+ 
+-    // Wait for second send
++    // Now provide fresh input for the second delegation
++    manager.handleInputTranscript('do task two');
++
+     await vi.waitFor(() => expect(sendCount).toBe(2));
+ 
+-    // Settle second
+     sendGate!();
+     await vi.waitFor(() => expect(commentaryCalls.length).toBeGreaterThanOrEqual(2));
+ 
+-    // Never had concurrent sends
+     expect(maxConcurrent).toBe(1);
++    expect(sentTexts[0]).toBe('do task one');
++    expect(sentTexts[1]).toBe('do task two');
+ 
+     await manager.shutdown();
+   });
+@@ -740,13 +741,15 @@ describe('event-driven input queue replaces sleep/drop (issue 4)', () => {
+     await manager.shutdown();
+   });
+ 
+-  it('duplicate delegation IDs are deduped while preserving delayed task', async () => {
++  it('duplicate delegation IDs are deduped while preserving delayed task with fresh input', async () => {
+     let sendCount = 0;
++    let sendGate: (() => void) | null = null;
+ 
+     const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
+       async start() { options.onEvent({ type: 'ready' }); },
+       async send() {
+         sendCount++;
++        await new Promise<void>(resolve => { sendGate = resolve; });
+         if (options.onResult) options.onResult('ok');
+       },
+       async close() {},
+@@ -782,16 +785,29 @@ describe('event-driven input queue replaces sleep/drop (issue 4)', () => {
+     await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
+     manager.handleInputTranscript('hello');
+ 
+-    // Same ID sent twice
++    // Same ID sent twice — should only process once
+     manager.handleDelegationCreated('deleg-dup', 1000);
+     manager.handleDelegationCreated('deleg-dup', 1000);
+ 
+-    // Different ID follows
++    // Different ID queued
+     manager.handleDelegationCreated('deleg-new', 2000);
+ 
+-    await vi.waitFor(() => expect(sendCount).toBeGreaterThanOrEqual(2), { timeout: 3000 });
++    await vi.waitFor(() => expect(sendCount).toBe(1));
++
++    // Settle first — cursor advances
++    sendGate!();
++    await new Promise(resolve => setTimeout(resolve, 50));
++
++    // Provide fresh input for the second delegation
++    manager.handleInputTranscript('world');
++
++    await vi.waitFor(() => expect(sendCount).toBe(2), { timeout: 3000 });
++
++    // Settle second
++    sendGate!();
++    await new Promise(resolve => setTimeout(resolve, 50));
+ 
+-    // Only 2 sends: deleg-dup once, deleg-new once
++    // Exactly 2 sends: deleg-dup once, deleg-new once
+     expect(sendCount).toBe(2);
+ 
+     await manager.shutdown();

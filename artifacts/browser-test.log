@@ -1,0 +1,28 @@
+
+Running 23 tests using 1 worker
+
+  ✓   1 [chromium] › tests/e2e/gpt-live.spec.ts:228:3 › GPT-Live trial panel › successful start, session.started, mute, and End lifecycle (1.3s)
+  ✓   2 [chromium] › tests/e2e/gpt-live.spec.ts:286:3 › GPT-Live trial panel › End before getUserMedia resolves fences stale session creation (920ms)
+  ✓   3 [chromium] › tests/e2e/gpt-live.spec.ts:320:3 › GPT-Live trial panel › End during server session creation cleans up created session (804ms)
+  ✓   4 [chromium] › tests/e2e/gpt-live.spec.ts:347:3 › GPT-Live trial panel › provider closure unknown shows honest finalization status (755ms)
+  ✓   5 [chromium] › tests/e2e/gpt-live.spec.ts:366:3 › GPT-Live trial panel › ICE connection loss triggers bounded cleanup (778ms)
+  ✓   6 [chromium] › tests/e2e/gpt-live.spec.ts:388:3 › GPT-Live trial panel › audio autoplay rejection shows Resume, Resume clears block (1.0s)
+  ✓   7 [chromium] › tests/e2e/gpt-live.spec.ts:422:3 › GPT-Live trial panel › diagnostics report privacy: excludes SDP/ICE/keys, preserves transcript after End (897ms)
+  ✓   8 [chromium] › tests/e2e/gpt-live.spec.ts:470:3 › GPT-Live trial panel › clipboard fallback when clipboard is denied (1.1s)
+  ✓   9 [chromium] › tests/e2e/gpt-live.spec.ts:510:3 › GPT-Live trial panel › double Start click does not create multiple sessions (725ms)
+  ✓  10 [chromium] › tests/e2e/voice.spec.ts:87:3 › hands-free conversation › three automatic turns with no duplicate accepted turns (1.6s)
+  ✓  11 [chromium] › tests/e2e/voice.spec.ts:122:3 › hands-free conversation › reconnect preserves session context across a short socket drop (2.1s)
+  ✓  12 [chromium] › tests/e2e/voice.spec.ts:176:3 › hands-free conversation › pause and resume audio completion (1.1s)
+  ✓  13 [chromium] › tests/e2e/voice.spec.ts:200:3 › hands-free conversation › finishes an utterance that ends while its socket is offline (2.0s)
+  ✓  14 [chromium] › tests/e2e/voice.spec.ts:232:3 › hands-free conversation › resuming a paused response completes its acknowledgement and permits the next turn (1.2s)
+  ✓  15 [chromium] › tests/e2e/voice.spec.ts:253:5 › hands-free conversation › retains the recording through a 2000ms acknowledgement stall (3.7s)
+  ✓  16 [chromium] › tests/e2e/voice.spec.ts:253:5 › hands-free conversation › retains the recording through a 5000ms acknowledgement stall (6.7s)
+  ✓  17 [chromium] › tests/e2e/voice.spec.ts:298:3 › hands-free conversation › mute, text fallback, and end session (2.9s)
+  ✓  18 [chromium] › tests/e2e/voice.spec.ts:327:3 › copy conversation diagnostics › copies real tool failures after End and clears history for a new session (1.7s)
+  ✓  19 [chromium] › tests/e2e/voice.spec.ts:363:3 › copy conversation diagnostics › provides a selectable report when clipboard permission is denied (1.6s)
+  ✓  20 [chromium] › tests/e2e/voice.spec.ts:392:3 › production VAD smoke › WASM and audio startup without CSP or MIME errors (2.8s)
+  ✓  21 [chromium] › tests/e2e/voice.spec.ts:479:3 › session security › different browser owner cannot claim active session (1.7s)
+  ✓  22 [chromium] › tests/e2e/voice.spec.ts:518:3 › session security › wrong session ID is rejected as expired (474ms)
+  ✓  23 [chromium] › tests/e2e/voice.spec.ts:557:3 › session security › unauthorized origin receives 403 on bootstrap and upgrade (265ms)
+
+  23 passed (40.2s)

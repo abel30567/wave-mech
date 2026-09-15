@@ -1,0 +1,13 @@
+
+> wave-mech@0.1.0 test
+> vitest run
+
+
+ RUN  v5.0.0 /var/fermi/work
+
+
+ Test Files  26 passed (26)
+      Tests  465 passed (465)
+   Start at  04:35:12
+   Duration  74.98s (tests 97%, import 2%, transform 1%)
+
