@@ -15,20 +15,24 @@ interface GptLivePanelProps {
 
 interface SessionState {
   phase: GptLivePhase;
+  sessionId: string | null;
   transcript: GptLiveTranscriptEntry[];
   cumulativeSeconds: number;
   estimatedCostUsd: number;
   errorMessage: string | null;
   budgetRemainingUsd: number;
+  closureConfirmed: boolean | null;
 }
 
 const initialState: SessionState = {
   phase: 'idle',
+  sessionId: null,
   transcript: [],
   cumulativeSeconds: 0,
   estimatedCostUsd: 0,
   errorMessage: null,
   budgetRemainingUsd: 0,
+  closureConfirmed: null,
 };
 
 export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: GptLivePanelProps) {
@@ -39,6 +43,7 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const sessionIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     return () => {
@@ -46,7 +51,7 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
     };
   }, []);
 
-  const cleanup = useCallback(async () => {
+  const stopLocalMedia = useCallback(() => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach(t => t.stop());
       streamRef.current = null;
@@ -59,6 +64,22 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
       pcRef.current.close();
       pcRef.current = null;
     }
+  }, []);
+
+  const cleanup = useCallback(async () => {
+    stopLocalMedia();
+    sessionIdRef.current = null;
+  }, [stopLocalMedia]);
+
+  const endSessionOnServer = useCallback(async (sessionId: string) => {
+    try {
+      await fetch('/api/gpt-live/end', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ sessionId }),
+      });
+    } catch { /* best effort */ }
   }, []);
 
   const startSession = useCallback(async () => {
@@ -101,6 +122,7 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
       }
 
       const data = await response.json() as { sessionId: string; sdp: string };
+      sessionIdRef.current = data.sessionId;
 
       await pc.setRemoteDescription({ type: 'answer', sdp: data.sdp });
 
@@ -117,15 +139,36 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
         }
       };
 
+      const dc = pc.createDataChannel('oai-events', { ordered: true });
+      dc.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg.type === 'session.started') {
+            setState(prev => ({ ...prev, phase: 'active' }));
+          }
+        } catch { /* ignore non-JSON */ }
+      };
+
       setState(prev => ({
         ...prev,
-        phase: 'active',
+        phase: 'connecting',
+        sessionId: data.sessionId,
         transcript: [],
         cumulativeSeconds: 0,
         estimatedCostUsd: 0,
+        closureConfirmed: null,
       }));
 
       onModeSwitch('gpt-live');
+
+      setTimeout(() => {
+        setState(prev => {
+          if (prev.phase === 'connecting' && prev.sessionId === data.sessionId) {
+            return { ...prev, phase: 'active' };
+          }
+          return prev;
+        });
+      }, 5000);
     } catch (error) {
       await cleanup();
       setState(prev => ({
@@ -134,17 +177,36 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
         errorMessage: error instanceof Error ? error.message : 'Session start failed.',
       }));
     }
-  }, [trialStatus, defaultModeActive, cleanup, onModeSwitch]);
+  }, [trialStatus, defaultModeActive, cleanup, onModeSwitch, endSessionOnServer]);
 
   const endSession = useCallback(async () => {
     setState(prev => ({ ...prev, phase: 'ending' }));
-    await cleanup();
-    setState(prev => ({
-      ...prev,
-      phase: 'ended',
-    }));
+    stopLocalMedia();
+
+    const sid = sessionIdRef.current;
+    if (sid) {
+      await endSessionOnServer(sid);
+    }
+    sessionIdRef.current = null;
+
+    try {
+      const resp = await fetch('/api/gpt-live/diagnostics', { credentials: 'same-origin' });
+      if (resp.ok) {
+        const diag = await resp.json() as { closureConfirmed?: boolean | null };
+        setState(prev => ({
+          ...prev,
+          phase: 'ended',
+          closureConfirmed: diag.closureConfirmed ?? null,
+        }));
+      } else {
+        setState(prev => ({ ...prev, phase: 'ended' }));
+      }
+    } catch {
+      setState(prev => ({ ...prev, phase: 'ended' }));
+    }
+
     onModeSwitch('default');
-  }, [cleanup, onModeSwitch]);
+  }, [stopLocalMedia, endSessionOnServer, onModeSwitch]);
 
   const toggleMute = useCallback(() => {
     if (!streamRef.current) return;
@@ -158,32 +220,40 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
   }, [state.phase]);
 
   const copyDiagnostics = useCallback(async () => {
-    const diagnostics: GptLiveDiagnostics = {
-      sessionId: null,
-      voiceModel: 'gpt-live-1',
-      backendModel: 'claude-opus-4-6[1m]',
-      cumulativeVoiceSeconds: state.cumulativeSeconds,
-      estimatedCostUsd: state.estimatedCostUsd,
-      closureConfirmed: state.phase === 'ended' ? true : null,
-      closureReason: state.phase === 'ended' ? 'user_ended' : null,
-      delegationsProcessed: 0,
-      delegationsSkipped: 0,
-      transcript: state.transcript,
-    };
-    const lines = [
-      'wave-mech GPT-Live trial diagnostics',
-      `Voice model: ${diagnostics.voiceModel}`,
-      `Backend model: ${diagnostics.backendModel}`,
-      `Cumulative voice: ${diagnostics.cumulativeVoiceSeconds.toFixed(1)}s`,
-      `Estimated cost: $${diagnostics.estimatedCostUsd.toFixed(4)}`,
-      `Closure confirmed: ${diagnostics.closureConfirmed}`,
-      '',
-      'TRANSCRIPT',
-      ...diagnostics.transcript.map(
-        t => `[${t.source}] ${t.role}: ${t.text}`,
-      ),
-    ];
     try {
+      const resp = await fetch('/api/gpt-live/diagnostics', { credentials: 'same-origin' });
+      let diagnostics: GptLiveDiagnostics;
+      if (resp.ok) {
+        diagnostics = await resp.json() as GptLiveDiagnostics;
+      } else {
+        diagnostics = {
+          sessionId: state.sessionId,
+          voiceModel: 'gpt-live-1',
+          backendModel: 'claude-opus-4-6[1m]',
+          cumulativeVoiceSeconds: state.cumulativeSeconds,
+          estimatedCostUsd: state.estimatedCostUsd,
+          closureConfirmed: state.closureConfirmed,
+          closureReason: state.phase === 'ended' ? 'user_ended' : null,
+          delegationsProcessed: 0,
+          delegationsSkipped: 0,
+          transcript: state.transcript,
+        };
+      }
+      const lines = [
+        'wave-mech GPT-Live trial diagnostics',
+        `Voice model: ${diagnostics.voiceModel}`,
+        `Backend model: ${diagnostics.backendModel}`,
+        `Cumulative voice: ${diagnostics.cumulativeVoiceSeconds.toFixed(1)}s`,
+        `Estimated cost: $${diagnostics.estimatedCostUsd.toFixed(4)}`,
+        `Closure confirmed: ${diagnostics.closureConfirmed}`,
+        `Closure reason: ${diagnostics.closureReason ?? 'none'}`,
+        `Delegations processed: ${diagnostics.delegationsProcessed}`,
+        '',
+        'TRANSCRIPT',
+        ...diagnostics.transcript.map(
+          t => `[${t.source}] ${t.role}: ${t.text}`,
+        ),
+      ];
       await navigator.clipboard.writeText(lines.join('\n'));
     } catch { /* clipboard unavailable */ }
   }, [state]);
@@ -254,6 +324,11 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
 
         {(state.phase === 'ended' || state.phase === 'error') && (
           <>
+            {state.closureConfirmed === false && (
+              <div className="gpt-live-notice">
+                Session closure was not confirmed by the provider. Usage may be conservatively estimated.
+              </div>
+            )}
             <button
               className="primary-button"
               onClick={() => setState({ ...initialState, budgetRemainingUsd: trialStatus.budgetRemainingUsd })}

@@ -11,6 +11,7 @@ export interface BudgetLedger {
 
 export interface BudgetReservation {
   sessionId: string;
+  providerSessionId: string | null;
   reservedUsd: number;
   actualUsd: number | null;
   createdAt: string;
@@ -83,6 +84,7 @@ export class GptLiveBudget {
     const cost = (durationSeconds / 60) * GPT_LIVE_PRICE_PER_MINUTE;
     const reservation: BudgetReservation = {
       sessionId,
+      providerSessionId: null,
       reservedUsd: cost,
       actualUsd: null,
       createdAt: new Date().toISOString(),
@@ -92,6 +94,16 @@ export class GptLiveBudget {
     this.ledger.reservations.push(reservation);
     this.ledger.lastUpdated = new Date().toISOString();
     return reservation;
+  }
+
+  setProviderSessionId(sessionId: string, providerSessionId: string): void {
+    const reservation = this.ledger.reservations.find(
+      r => r.sessionId === sessionId && !r.finalized,
+    );
+    if (reservation) {
+      reservation.providerSessionId = providerSessionId;
+      this.ledger.lastUpdated = new Date().toISOString();
+    }
   }
 
   finalize(sessionId: string, voiceSeconds: number, closureConfirmed: boolean): void {
