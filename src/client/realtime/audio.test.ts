@@ -349,6 +349,29 @@ describe('createHandsFreeAudio output', () => {
     expect(ctx.live.size).toBe(1);
   });
 
+  it('fences held (unscheduled) frames on cancel so old audio cannot enter the next response', async () => {
+    const { audio, ctx } = await build();
+    // 20 one-second frames for response 1: only the look-ahead is scheduled, the
+    // rest are held pending. A barge-in/error cancels response 1.
+    for (let i = 0; i < 20; i += 1) audio.enqueueOutput(outputBase64(16000), 16000, 1, i);
+    expect(ctx.live.size).toBe(12);
+    audio.cancelOutput(1);
+    // Every scheduled source stopped; nothing lingers.
+    expect(ctx.live.size).toBe(0);
+    await expect(audio.finishOutput(1, 19)).resolves.toBe('interrupted');
+
+    // A fresh, higher generation schedules cleanly with no leftover response-1
+    // audio bleeding in from the held queue.
+    audio.enqueueOutput(outputBase64(16000), 16000, 2, 0);
+    expect(ctx.live.size).toBe(1);
+    for (const node of ctx.live) {
+      expect((node as { responseId?: number }).responseId).toBe(2);
+    }
+    const done = audio.finishOutput(2, 0);
+    ctx.finishAll();
+    await expect(done).resolves.toBe('played');
+  });
+
   it('cancels only the targeted response, leaving others scheduled', async () => {
     const { audio, ctx } = await build();
     audio.enqueueOutput(outputBase64(8000), 16000, 1, 0);
