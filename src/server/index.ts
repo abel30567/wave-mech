@@ -230,7 +230,7 @@ function newConversation(ownerId: string): ActiveSession {
   let workspace: string | undefined;
   const conversation = createConversation({
     id: randomUUID(), mode: fixtureMode ? 'fixture' : 'live',
-    harness: onEvent => {
+    harness: (onEvent, onResult) => {
       let adapter: ReturnType<typeof createHarness> | undefined;
       let closed = false;
       return {
@@ -241,9 +241,9 @@ function newConversation(ownerId: string): ActiveSession {
           await writeFile(hookFile, permissionHookSource(), { mode: 0o600 });
           if (closed) { await rm(workspace, { recursive: true, force: true }); throw new Error('Session closed.'); }
           const options: HarnessOptions = fixtureMode ? {
-            command: process.execPath, args: [path.resolve('tests/fixtures/harness.mjs')], onEvent,
+            command: process.execPath, args: [path.resolve('tests/fixtures/harness.mjs')], onEvent, onResult,
           } : {
-            command: process.env.WAVE_CLAUDE_BIN ?? 'claude', env: harnessEnvironmentOverrides(), onEvent,
+            command: process.env.WAVE_CLAUDE_BIN ?? 'claude', env: harnessEnvironmentOverrides(), onEvent, onResult,
             args: ['-p', '--model', configuredModel, '--input-format', 'stream-json', '--output-format', 'stream-json', '--include-partial-messages', '--verbose', '--setting-sources', '',
               ...(fermiUrl ? buildToolArguments({ fermiUrl, nodeExecutable: process.execPath, hookFile }) :
                 ['--tools', 'WebSearch,WebFetch', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--permission-mode', 'dontAsk', '--allowedTools', 'WebSearch', 'WebFetch']),
@@ -264,6 +264,7 @@ function newConversation(ownerId: string): ActiveSession {
         writeAudio: pcm => adapter.acceptAudio?.(pcm) ?? false,
         commitRecognition: () => adapter.commitRecognition(),
         writeText: text => adapter.writeText(text), finishSpeech: () => adapter.finishSpeech(), close: () => adapter.close(),
+        prewarm: () => adapter.prewarm(),
         abortRecognition: () => { if (!adapter.abortRecognition) throw new Error('Recognition abort unavailable.'); adapter.abortRecognition(); },
         cancelSpeech: () => { if (!adapter.cancelSpeech) throw new Error('Speech cancellation unavailable.'); adapter.cancelSpeech(); },
       };

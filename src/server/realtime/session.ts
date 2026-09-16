@@ -98,6 +98,8 @@ interface ActiveResponse {
   /** Highest played seq and its cumulative ms as reported via playback_progress. */
   playedSeq: number;
   playedMsReported: number;
+  /** The client has reported real progress: consumption, not wall-clock, governs release. */
+  progressReported: boolean;
   /** Wall-clock at first forward, for the old-client time-based fallback. */
   firstForwardAt: number | undefined;
   /** The outbox bound was exceeded: the response is explicitly truncated. */
@@ -527,6 +529,7 @@ class Conversation implements RetainedConversation {
       forwardedSeq: 0,
       playedSeq: 0,
       playedMsReported: 0,
+      progressReported: false,
       firstForwardAt: undefined,
       truncated: false,
       drainTimer: undefined,
@@ -815,11 +818,16 @@ class Conversation implements RetainedConversation {
     this.pumpOutbox(response);
   }
 
-  /** Highest played ms: the max of reported progress and the realtime estimate. */
+  /**
+   * Highest played ms. A client that reports consumption governs release by
+   * itself: while it is paused or stalled, nothing more is released, so its
+   * bounded hold queue cannot overflow. Only a client that has never reported
+   * (an older build) falls back to the realtime estimate so it does not stall.
+   */
   private playedMs(response: ActiveResponse): number {
-    const byProgress = response.playedMsReported;
+    if (response.progressReported) return response.playedMsReported;
     const byTime = response.firstForwardAt === undefined ? 0 : Math.min(response.forwardedMs, this.now() - response.firstForwardAt);
-    return Math.max(byProgress, byTime);
+    return Math.max(response.playedMsReported, byTime);
   }
 
   /**
@@ -860,6 +868,7 @@ class Conversation implements RetainedConversation {
     if (!response || response.responseId !== responseId) return;
     if (seq > response.playedSeq) {
       response.playedSeq = seq;
+      response.progressReported = true;
       const cumulative = response.seqMs.get(seq);
       if (cumulative !== undefined) response.playedMsReported = cumulative;
       // Bound retention: sequence→ms entries at or below the played mark are no

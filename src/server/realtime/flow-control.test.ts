@@ -120,6 +120,24 @@ describe('server output flow control (issue 15)', () => {
     expect(r.audioSeqs()).toHaveLength(20);
   });
 
+  it('lets consumption alone govern release once the client has reported progress (a paused client is not flooded)', async () => {
+    const r = await rig();
+    for (let i = 0; i < 40; i++) r.emitAudio(1000);
+    expect(r.audioSeqs()).toHaveLength(12);
+    // The client reports real progress through seq 4, then pauses (no further reports).
+    await r.conv.handle({ type: 'playback_progress', responseId: 1, seq: 4 });
+    expect(r.audioSeqs()).toHaveLength(16);
+    // Wall-clock keeps running but consumption does not: nothing more is released,
+    // so the paused client's bounded hold queue cannot overflow.
+    r.setNow(60_000);
+    await r.conv.handle({ type: 'playback_progress', responseId: 1, seq: 4 });
+    expect(r.audioSeqs()).toHaveLength(16);
+    expect(r.diagCodes()).not.toContain('output_truncated');
+    // Resuming consumption releases the next window.
+    await r.conv.handle({ type: 'playback_progress', responseId: 1, seq: 16 });
+    expect(r.audioSeqs()).toHaveLength(28);
+  });
+
   it('truncates explicitly with a bufferedMs diagnostic when the outbox bound is exceeded', async () => {
     const r = await rig();
     // 15 frames of 10s each = 150s generated; the client plays nothing, so the
