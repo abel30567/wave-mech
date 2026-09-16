@@ -1,1038 +1,2078 @@
-diff --git a/src/server/index.ts b/src/server/index.ts
-index 3233737..cea669b 100644
---- a/src/server/index.ts
-+++ b/src/server/index.ts
-@@ -176,6 +176,10 @@ const server = createServer(async (request, response) => {
-     if (!hosts.has(request.headers.host ?? '') || !origins.has(request.headers.origin ?? '') || !validBootstrapCookie(request) || !ownerId) {
-       response.writeHead(403).end('Origin not permitted.'); return;
-     }
-+    const sessionOwnerId = gptLive.getSessionOwnerId();
-+    if (sessionOwnerId && sessionOwnerId !== ownerId) {
-+      response.writeHead(403).end('Not session owner.'); return;
-+    }
-     const chunks: Buffer[] = [];
-     let size = 0;
-     request.on('data', (chunk: Buffer) => { size += chunk.length; if (size <= 4096) chunks.push(chunk); });
-@@ -199,7 +203,7 @@ const server = createServer(async (request, response) => {
-     const ownerId = ownerOf(request);
-     if (!ownerId) { response.writeHead(403).end(); return; }
-     response.setHeader('Content-Type', 'application/json');
--    response.end(JSON.stringify(gptLive.getDiagnostics()));
-+    response.end(JSON.stringify(gptLive.getDiagnostics(ownerId)));
-     return;
-   }
-   if (pathname.startsWith('/api/')) { response.writeHead(404).end(); return; }
-diff --git a/src/server/live/session.test.ts b/src/server/live/session.test.ts
-index 0f54a90..e68f640 100644
---- a/src/server/live/session.test.ts
-+++ b/src/server/live/session.test.ts
-@@ -407,7 +407,7 @@ describe('GptLiveManager', () => {
-     }
+diff --git a/docs/issue-15-default-speech-report.md b/docs/issue-15-default-speech-report.md
+new file mode 100644
+index 0000000..d90b9b5
+--- /dev/null
++++ b/docs/issue-15-default-speech-report.md
+@@ -0,0 +1,78 @@
++# Issue 15 — default-mode speech realtime & flow-control report
++
++Branch: `agent/issue-15-default-speech-20260916`
++Base SHA: `218f578acf9a5b9add7b85f956e24d05fb3c0a5b` (branch `feat/issue-15-realtime-repair`)
++Tested code SHA: `6d93d742d99415cc0cc2c089a317fd10e1c08e9f` (this doc/artifact commit adds no code)
++Model: claude-opus-4-8
++
++## Status: COMPLETE (all five behaviours implemented and tested; all suites green)
++
++## Commands & outcomes
++
++| Command | Result |
++| --- | --- |
++| `npm ci` | ok (0 vulnerabilities) |
++| `npm run check` (`tsc --noEmit`) | pass |
++| `WAVE_CLAUDE_BIN=/nonexistent-wave-fixture npm test` | **494 passed / 30 files** (was 475 at base) |
++| `npm run build` | pass (client bundle built) |
++| `npx playwright install --with-deps chromium` | ok |
++| `npm run test:e2e` | **25 passed** (chromium) |
++
++Node 22.23.2 (`.node-version`). No network, no real CLI, no live ElevenLabs/Anthropic/OpenAI calls, no credentials.
++
++## What changed (all within owned paths)
++
++1. **Speak only useful text** (`src/server/realtime/session.ts`).
++   - Pre-tool narration is streamed to TTS for fast first audio.
++   - On the first tool of a turn, streamed narration is gated (kept in the transcript, no longer synthesized) and the open preamble stream is ended (EOS) immediately rather than left open across the tool wait.
++   - When a turn used tools, only the concise final answer delivered via `onResult` is synthesized (never the preamble/interim narration). Absent final text says nothing more and is reported.
++   - No-tool turns keep the existing streaming behaviour.
++   - `ConversationOptions.harness(onEvent, onResult?)` gained the optional `onResult` hook (coordinator wires it; tolerates absence).
++
++2. **Cut first-audio latency** (`src/server/speech/index.ts`, `protocol.ts`).
++   - `prewarm()` pre-opens the TTS `stream-input` socket (token fetch + ws open) when inference starts, fenced by the synthesis epoch so a cancel cannot leak a late socket.
++   - Warm socket kept alive with the single-space keepalive (never an empty string) plus the documented `inactivity_timeout=180` query param. An idle warm-socket close is treated as benign (`tts_idle_closed`, not `tts_error`) and reopened lazily on the next write.
++   - `flush` frame (`{ text: '', flush: true }`) is sent at sentence boundaries; EOS (`{ text: '' }`) is kept distinct. Frame shapes verified against the ElevenLabs stream-input docs.
++
++3. **Consumption-based output flow control** (`src/shared/realtime*.ts`, `src/server/realtime/session.ts`, `src/client/realtime/{client,audio}.ts`).
++   - New `playback_progress { responseId, seq }` command; `REALTIME_VERSION` unchanged at 2 (backward-compatible).
++   - Server: bounded per-response outbox (120 s); frames forwarded only while the client's unplayed window is below 12 s; released on progress or, for old clients that never report, a realtime time-based fallback (no stall). Outbox-bound overflow marks the response `output_truncated` with a `bufferedMs` diagnostic (coalesced) instead of a silent drop.
++   - Client: bounded look-ahead of ≤12 s of AudioBufferSource nodes, the rest held in a bounded queue fed by what the server releases; progress reported from `onended` (throttled ≤500 ms + on drain). The old 30 s `playback_overflow` drop path is removed; exceeding the hold bound is diagnosed (`output_truncated`) and fenced, never dropped.
++
++4. **Fence audio on failure** (`src/client/realtime/audio.ts`).
++   - Cancel/interrupt stops and disconnects the response's scheduled source nodes **and** drops its held (unscheduled) frames before ownership is released, so no old audio plays under a new turn. Pause/resume, reconnect and barge-in preserved.
++
++5. **Diagnostics with units** — new codes `speech_gated`, `final_answer_synthesized`, `tts_prewarmed`, `output_truncated`, `tts_idle_closed`; `bufferedMs` used for buffered audio; existing `tts_first_audio`/`first_audio_received`/`first_playback_scheduled` retained; overflow/truncation coalesced to one record per response. No text/URLs/provider bodies in diagnostics.
++
++## Measured fixture-path first-audio latency (before/after)
++
++Measured on the fixture speech path with a simulated 40 ms token-fetch + websocket-handshake latency (the local fixture otherwise opens instantly), 8 runs each, time from the first `writeText` to the first audio frame:
++
++| Path | First-audio latency |
++| --- | --- |
++| Cold (no prewarm — socket opens on first text) | **~44.0 ms** |
++| Warm (prewarm during inference) | **~0.6 ms** |
++| Improvement | **~43 ms** (the socket-open cost is moved off the critical path) |
++
++The absolute number scales with real token/handshake latency; the mechanism removes it from the time-to-first-audio entirely.
++
++## Tests added / updated (failing-before / passing-after regressions)
++
++- `src/server/realtime/gating.test.ts` (new): preamble spoken → narration gated at tool → only final answer synthesized; no-tool unchanged; `onResult` absent tolerated; interrupt during the tool wait cancels both epochs and never speaks the late final.
++- `src/server/realtime/flow-control.test.ts` (new): window-bounded forwarding, progress-driven release, old-client time-based fallback, outbox-bound truncation with `bufferedMs`.
++- `src/client/realtime/integration.test.ts` (new): 60 s of audio through the **real** client controller + audio scheduler coupled to the server coordinator over an in-memory transport — complete ordered delivery, ≤12-node look-ahead, progress-driven release, genuine `played` completion.
++- `src/server/speech/speech.test.ts`: prewarm-once-and-fenced-by-cancel, sentence-boundary flush, non-empty keepalive, idle-close-is-benign + lazy reopen (this last one replaces the pre-issue-15 assertion that an idle close was an error — a behaviour the brief explicitly overturns).
++- `src/client/realtime/audio.test.ts`: bounded look-ahead + hold (no drop) with progress up to the declared last seq; hold-bound overflow diagnosed not dropped; held-frame fence on cancel. Replaces the two pre-issue-15 assertions that encoded the removed 30 s silent-drop path.
++- `tests/unit/{realtime-wire,speech-contract}.test.ts`: `playback_progress` parsing; `ttsForceFlushFrame`/`inactivity_timeout` contract.
++- `src/server/realtime/session.test.ts`: the detach test now asserts the real invariant (no audio grows after detach) instead of "never any audio", since prewarm+preamble-EOS can legitimately deliver heard audio before the detach.
++
++No existing assertion was weakened merely to pass; the three updated tests encode behaviour the brief mandates changing, and each is strengthened where possible.
++
++## Limitations / notes for main
++
++- **Prewarm wiring for the latency win in production**: `prewarm()` is exposed on the speech adapter and called by the coordinator via the optional `RealtimeSpeech.prewarm?()`. `src/server/index.ts` (main-owned, not edited) must map `prewarm` into its `RealtimeSpeech` adapter (one line, mirroring the other methods) for the latency benefit to apply in the live path; the coordinator tolerates its absence. Likewise main should pass `onResult` into `ConversationOptions.harness`. Both are additive optionals.
++- **Reconnect re-drive**: the existing coordinator deliberately suppresses a detached response's audio (`audioInterrupted`) and does not resume unheard TTS on reattach (per the p2 contract "no automatic replay of possibly heard audio"). The flow-control outbox therefore does not re-drive delivery after a reconnect; this preserves the established suppress-on-detach contract rather than replaying possibly-heard audio. If full post-reconnect re-drive from the last acknowledged progress is desired, it would relax that suppression and is called out here rather than changed unilaterally.
++
++## NOT COMPLETE
++
++None. All five section-3 behaviours and their mandatory tests are implemented and green.
+diff --git a/src/client/realtime/audio.test.ts b/src/client/realtime/audio.test.ts
+index 3d01bdf..b7db131 100644
+--- a/src/client/realtime/audio.test.ts
++++ b/src/client/realtime/audio.test.ts
+@@ -154,6 +154,7 @@ function makeOptions(): HandsFreeAudioOptions & { calls: Record<string, unknown[
+     onState: [],
+     onError: [],
+     onDiscontinuity: [],
++    onProgress: [],
+   };
+   const diagnostics: import('../../shared/diagnostics.js').DiagnosticInput[] = [];
+   const record =
+@@ -168,6 +169,7 @@ function makeOptions(): HandsFreeAudioOptions & { calls: Record<string, unknown[
+     onState: record('onState'),
+     onError: record('onError'),
+     onDiscontinuity: record('onDiscontinuity'),
++    onProgress: record('onProgress'),
+     onDiagnostic: (d: import('../../shared/diagnostics.js').DiagnosticInput) => diagnostics.push(d),
+     onPcm(pcm: ArrayBuffer): void {
+       calls.onPcm.push([pcm]);
+@@ -312,13 +314,24 @@ describe('createHandsFreeAudio output', () => {
+     await expect(again).resolves.toBe('played');
    });
  
--  it('does not confirm closure from reason strings alone', async () => {
-+  it('retains diagnostic snapshot after closure with valid final seconds', async () => {
-     const keyFile = path.join(workDir, 'test-api.key');
-     await writeFile(keyFile, 'sk-test-key-12345-abcdef', { mode: 0o600 });
+-  it('bounds scheduled output nodes and reports overflow honestly (never played)', async () => {
+-    const { audio, ctx } = await build();
+-    // One-second buffers that never drain: past the 30 s ceiling, allocation
+-    // stops so a slow/suspended context cannot retain unlimited nodes.
++  it('schedules only a bounded look-ahead, holds the rest, and never drops audio', async () => {
++    const { audio, ctx, opts } = await build();
++    // 40 one-second buffers. At most the look-ahead is scheduled as live nodes;
++    // the rest is held (never dropped) and scheduled as earlier nodes end.
+     for (let i = 0; i < 40; i += 1) audio.enqueueOutput(outputBase64(16000), 16000, 5, i);
+-    expect(ctx.live.size).toBe(30);
+-    await expect(audio.finishOutput(5, 39)).resolves.toBe('interrupted');
++    expect(ctx.live.size).toBe(12);
++
++    const done = audio.finishOutput(5, 39);
++    // Drain in waves: every finished node schedules the next held frame and
++    // reports consumption progress. Nothing is lost; completion is a true played.
++    for (let guard = 0; guard < 60 && ctx.live.size > 0; guard += 1) {
++      ctx.finishAll();
++      await flush();
++    }
++    await expect(done).resolves.toBe('played');
++    // Progress was reported for the whole response, up to the declared last seq.
++    const progress = opts.calls.onProgress as Array<[number, number]>;
++    expect(progress.at(-1)).toEqual([5, 39]);
+   });
  
-@@ -438,9 +438,45 @@ describe('GptLiveManager', () => {
+   it('fences a cancelled generation so its late output is rejected', async () => {
+@@ -336,6 +349,29 @@ describe('createHandsFreeAudio output', () => {
+     expect(ctx.live.size).toBe(1);
+   });
  
-     await new Promise(resolve => setTimeout(resolve, 50));
- 
--    const diagAfter = manager.getDiagnostics();
--    expect(diagAfter.closureConfirmed).toBeNull();
-     expect(manager.hasActiveSession).toBe(false);
-+    const diagAfter = manager.getDiagnostics();
-+    expect(diagAfter.closureConfirmed).toBe(true);
-+    expect(diagAfter.cumulativeVoiceSeconds).toBe(42);
-+    expect(diagAfter.closureReason).toBe('close_requested');
++  it('fences held (unscheduled) frames on cancel so old audio cannot enter the next response', async () => {
++    const { audio, ctx } = await build();
++    // 20 one-second frames for response 1: only the look-ahead is scheduled, the
++    // rest are held pending. A barge-in/error cancels response 1.
++    for (let i = 0; i < 20; i += 1) audio.enqueueOutput(outputBase64(16000), 16000, 1, i);
++    expect(ctx.live.size).toBe(12);
++    audio.cancelOutput(1);
++    // Every scheduled source stopped; nothing lingers.
++    expect(ctx.live.size).toBe(0);
++    await expect(audio.finishOutput(1, 19)).resolves.toBe('interrupted');
++
++    // A fresh, higher generation schedules cleanly with no leftover response-1
++    // audio bleeding in from the held queue.
++    audio.enqueueOutput(outputBase64(16000), 16000, 2, 0);
++    expect(ctx.live.size).toBe(1);
++    for (const node of ctx.live) {
++      expect((node as { responseId?: number }).responseId).toBe(2);
++    }
++    const done = audio.finishOutput(2, 0);
++    ctx.finishAll();
++    await expect(done).resolves.toBe('played');
 +  });
 +
-+  it('diagnostics return empty for non-owning caller after closure', async () => {
-+    const keyFile = path.join(workDir, 'test-api.key');
-+    await writeFile(keyFile, 'sk-test-key-12345-abcdef', { mode: 0o600 });
-+
-+    let sidebandHandler: ProviderEventHandler | null = null;
-+    const { provider } = createMockProvider({
-+      onAttachSideband: (handler) => { sidebandHandler = handler; },
-+    });
-+
-+    const manager = new GptLiveManager({
-+      enabled: true,
-+      apiKeyFile: keyFile,
-+      budgetFile: path.join(workDir, 'budget.json'),
-+      maxSessionSeconds: 60,
-+      configuredModel: 'claude-opus-4-6[1m]',
-+      nodeExecutable: process.execPath,
-+      providerFactory: () => provider,
-+      harnessFactory: createMockHarnessFactory(),
-+    });
-+    await manager.initialize();
-+
-+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
-+
-+    sidebandHandler!.onSessionClosed('close_requested', { seconds: 42 });
-+    await new Promise(resolve => setTimeout(resolve, 50));
-+
-+    const ownerDiag = manager.getDiagnostics('owner-1');
-+    expect(ownerDiag.closureConfirmed).toBe(true);
-+
-+    const otherDiag = manager.getDiagnostics('other-owner');
-+    expect(otherDiag.sessionId).toBeNull();
-+    expect(otherDiag.transcript).toEqual([]);
+   it('cancels only the targeted response, leaving others scheduled', async () => {
+     const { audio, ctx } = await build();
+     audio.enqueueOutput(outputBase64(8000), 16000, 1, 0);
+@@ -441,10 +477,18 @@ describe('createHandsFreeAudio diagnostics', () => {
+     expect(opts.diagnostics.some((d) => d.code === 'playback_cancelled')).toBe(true);
    });
  
-   it('accumulates usage by max, not sum', async () => {
-diff --git a/src/server/live/session.ts b/src/server/live/session.ts
-index c826f9d..358f2e4 100644
---- a/src/server/live/session.ts
-+++ b/src/server/live/session.ts
-@@ -61,6 +61,7 @@ interface ActiveTrialSession {
-   processedDelegationIds: Set<string>;
-   pendingResult: string | null;
-   sendSettling: boolean;
-+  inputCursor: number;
-   inputWaiters: Array<() => void>;
-   transcript: GptLiveTranscriptEntry[];
-   cumulativeVoiceSeconds: number;
-@@ -82,6 +83,8 @@ export class GptLiveManager {
-   private apiKey: string | null = null;
-   private active: ActiveTrialSession | null = null;
-   private slotTaken = false;
-+  private lastDiagnosticSnapshot: GptLiveDiagnostics | null = null;
-+  private lastSessionOwnerId: string | null = null;
+-  it('emits playback_overflow when ceiling is exceeded', async () => {
+-    const { audio, opts } = await build();
+-    for (let i = 0; i < 40; i += 1) audio.enqueueOutput(outputBase64(16000), 16000, 5, i);
+-    expect(opts.diagnostics.some((d) => d.code === 'playback_overflow')).toBe(true);
++  it('has no silent drop path: an exceeded hold bound is diagnosed, never dropped', async () => {
++    const { audio, opts, ctx } = await build();
++    // Far more than the hold bound while nothing drains. The legacy 30 s silent
++    // drop path is gone; exceeding the bound is a protocol violation to diagnose
++    // (output_truncated) and fence, and completion is honestly interrupted.
++    for (let i = 0; i < 60; i += 1) audio.enqueueOutput(outputBase64(16000), 16000, 5, i);
++    expect(opts.diagnostics.some((d) => d.code === 'playback_overflow')).toBe(false);
++    const truncated = opts.diagnostics.find((d) => d.code === 'output_truncated');
++    expect(truncated).toBeDefined();
++    expect(truncated!.bufferedMs).toBeGreaterThan(0);
++    expect(ctx.live.size).toBeLessThanOrEqual(12);
++    await expect(audio.finishOutput(5, 59)).resolves.toBe('interrupted');
+   });
  
-   constructor(options: GptLiveManagerOptions) {
-     this.options = {
-@@ -265,6 +268,7 @@ export class GptLiveManager {
-         processedDelegationIds: new Set(),
-         pendingResult: null,
-         sendSettling: false,
-+        inputCursor: 0,
-         inputWaiters: [],
-         transcript: [],
-         cumulativeVoiceSeconds: 0,
-@@ -500,8 +504,9 @@ export class GptLiveManager {
+   it('does not break playback when diagnostic callback throws', async () => {
+diff --git a/src/client/realtime/audio.ts b/src/client/realtime/audio.ts
+index e898cd1..0299af1 100644
+--- a/src/client/realtime/audio.ts
++++ b/src/client/realtime/audio.ts
+@@ -20,11 +20,14 @@ const ASSET_BASE = '/vad/';
+ // hold more than ~120 s of audio. At 16 kHz PCM16 that is 2 bytes/sample.
+ const MAX_UTTERANCE_BYTES = PCM_RATE * 2 * 120;
+ 
+-// Playback is bounded so a slow or suspended AudioContext cannot retain an
+-// unlimited number of scheduled buffer sources. Once this many seconds of
+-// undrained output has been scheduled we stop allocating and mark the response
+-// so its completion reports honestly (interrupted, never "played").
+-const MAX_OUTPUT_SECONDS = 30;
++// Consumption-based output scheduling (issue 15, section 3). At most a small
++// look-ahead of AudioBufferSource nodes is scheduled at once; everything else is
++// held in a bounded queue and scheduled as earlier nodes end (which is also when
++// consumption progress is reported). There is NO silent 30 s drop path: the hold
++// queue is bounded and, if it would ever be exceeded, that is a protocol
++// violation to diagnose, never audio to discard.
++const LOOKAHEAD_SECONDS = 12;
++const MAX_HOLD_SECONDS = 30;
+ 
+ // A small, bounded pre-buffer margin absorbs uneven PCM arrival. When the
+ // schedule has caught up to (or fallen behind) the playback clock, a fresh
+@@ -35,13 +38,26 @@ const MAX_OUTPUT_SECONDS = 30;
+ const PREBUFFER_MARGIN_SECONDS = 0.06;
+ 
+ interface OutputResponse {
+-  active: number;
++  /** Nodes scheduled and not yet ended. */
++  scheduled: number;
+   declared: boolean;
++  /** The last audio sequence the server declared for this response. */
++  declaredLastSeq: number;
++  /** Highest sequence whose node has finished playing. */
++  endedSeq: number;
+   cancelled: boolean;
+   overflowed: boolean;
+   settle?: (result: 'played' | 'interrupted' | 'paused') => void;
+ }
+ 
++interface HeldFrame {
++  responseId: number;
++  seq: number;
++  samples: Float32Array;
++  sampleRate: number;
++  duration: number;
++}
++
+ /**
+  * Hands-free capture + playback over one shared microphone stream and
+  * AudioContext that live for the whole session. A confirmed VAD onset prefixes
+@@ -213,7 +229,11 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
+   };
+ 
+   let nextStartTime = 0;
+-  let queuedOutputSeconds = 0;
++  // Seconds of audio scheduled as live source nodes (the bounded look-ahead) and
++  // seconds held in the pending queue awaiting a scheduling slot.
++  let scheduledSeconds = 0;
++  let heldSeconds = 0;
++  const pending: HeldFrame[] = [];
+   const sources = new Set<AudioBufferSourceNode>();
+   const responses = new Map<number, OutputResponse>();
+   let firstAudioForResponse = -1;
+@@ -230,12 +250,14 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
+     if (responseId > highestResponseId) highestResponseId = responseId;
+     let response = responses.get(responseId);
+     if (!response) {
+-      response = { active: 0, declared: false, cancelled: false, overflowed: false };
++      response = { scheduled: 0, declared: false, declaredLastSeq: 0, endedSeq: 0, cancelled: false, overflowed: false };
+       responses.set(responseId, response);
+     }
+     return response;
+   };
+ 
++  const hasPending = (responseId: number): boolean => pending.some((f) => f.responseId === responseId);
++
+   // Resolve a pending completion and, for terminal results, drop the bookkeeping
+   // so the response map cannot grow without bound. 'paused' is not terminal: the
+   // entry is retained so a resumed drain can settle it.
+@@ -253,7 +275,73 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
+     if (!response?.settle) return;
+     if (response.cancelled || response.overflowed) finalize(responseId, 'interrupted');
+     else if (context.state !== 'running') finalize(responseId, 'paused');
+-    else if (response.declared && response.active === 0) finalize(responseId, 'played');
++    else if (response.declared && response.endedSeq >= response.declaredLastSeq && response.scheduled === 0 && !hasPending(responseId)) {
++      finalize(responseId, 'played');
++    }
++  };
++
++  // Schedule the next held frame as an AudioBufferSource on the shared context.
++  const scheduleFrame = (frame: HeldFrame, response: OutputResponse): void => {
++    const buffer = context.createBuffer(1, frame.samples.length, frame.sampleRate);
++    buffer.getChannelData(0).set(frame.samples);
++    const node = context.createBufferSource();
++    node.buffer = buffer;
++    node.connect(context.destination);
++    const tag = node as { responseId?: number; seconds?: number; seq?: number; endAt?: number };
++    tag.responseId = frame.responseId;
++    tag.seconds = frame.duration;
++    tag.seq = frame.seq;
++    response.scheduled += 1;
++    scheduledSeconds += frame.duration;
++    sources.add(node);
++    node.onended = (): void => {
++      node.disconnect();
++      sources.delete(node);
++      response.scheduled -= 1;
++      scheduledSeconds = Math.max(0, scheduledSeconds - frame.duration);
++      if (frame.seq > response.endedSeq) response.endedSeq = frame.seq;
++      // Report consumption: the highest sequence that has actually played. This
++      // is what drives the server to release the next window of audio.
++      try {
++        options.onProgress?.(frame.responseId, frame.seq);
++      } catch {
++        /* progress reporting must not break playback */
++      }
++      pumpSchedule();
++      maybeSettle(frame.responseId);
++    };
++    const startAt = nextStartTime > context.currentTime
++      ? nextStartTime
++      : context.currentTime + PREBUFFER_MARGIN_SECONDS;
++    node.start(startAt);
++    nextStartTime = startAt + buffer.duration;
++    tag.endAt = nextStartTime;
++  };
++
++  // Drain the pending queue into scheduled nodes up to the bounded look-ahead,
++  // skipping frames for cancelled/stale/overflowed responses.
++  const pumpSchedule = (): void => {
++    while (pending.length > 0 && scheduledSeconds < LOOKAHEAD_SECONDS) {
++      const frame = pending[0];
++      const response = responses.get(frame.responseId);
++      if (isStale(frame.responseId) || !response || response.cancelled || response.overflowed) {
++        pending.shift();
++        heldSeconds = Math.max(0, heldSeconds - frame.duration);
++        continue;
++      }
++      pending.shift();
++      heldSeconds = Math.max(0, heldSeconds - frame.duration);
++      scheduleFrame(frame, response);
++    }
++  };
++
++  const dropPending = (predicate: (frame: HeldFrame) => boolean): void => {
++    for (let i = pending.length - 1; i >= 0; i--) {
++      if (predicate(pending[i])) {
++        heldSeconds = Math.max(0, heldSeconds - pending[i].duration);
++        pending.splice(i, 1);
++      }
++    }
+   };
+ 
+   // Observe context state changes after a drain has begun — not only at the
+@@ -315,20 +403,19 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
+ 
+     enqueueOutput(audio: string, sampleRate: number, responseId: number, seq: number): void {
+       if (closed) return;
+-      void seq; // ordering is guaranteed by the server's sequential delivery
+       // Reject output for a superseded generation even after its entry is gone.
+       if (isStale(responseId)) return;
+       const response = responseFor(responseId);
+-      if (response.cancelled) return;
++      if (response.cancelled || response.overflowed) return;
+       const samples = decodePcm16Base64(audio);
+       if (samples.length === 0) return;
+       const duration = samples.length / sampleRate;
+-      // Bound retention: a slow or suspended context must not accumulate an
+-      // unlimited number of scheduled nodes. Drop past the ceiling and flag the
+-      // response so its completion is reported honestly rather than as played.
+-      if (queuedOutputSeconds + duration > MAX_OUTPUT_SECONDS) {
++      // Bounded hold queue. With server-side flow control the client's unplayed
++      // window is bounded, so this should never fill; if it would, that is a
++      // protocol violation to DIAGNOSE and fence, never audio to silently drop.
++      if (heldSeconds + duration > MAX_HOLD_SECONDS) {
+         response.overflowed = true;
+-        emitDiagnostic({ source: 'audio', code: 'playback_overflow', count: Math.round(queuedOutputSeconds) });
++        emitDiagnostic({ source: 'audio', code: 'output_truncated', bufferedMs: Math.round(heldSeconds * 1000), responseId });
+         maybeSettle(responseId);
+         return;
+       }
+@@ -336,44 +423,16 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
+         firstAudioForResponse = responseId;
+         emitDiagnostic({ source: 'audio', code: 'first_playback_scheduled', sampleRate });
+       }
+-      const buffer = context.createBuffer(1, samples.length, sampleRate);
+-      buffer.getChannelData(0).set(samples);
+-      const node = context.createBufferSource();
+-      node.buffer = buffer;
+-      node.connect(context.destination);
+-      // Tag the node so per-response cancellation can stop only its own sources
+-      // and reclaim the right amount of the output budget.
+-      (node as { responseId?: number; seconds?: number }).responseId = responseId;
+-      (node as { responseId?: number; seconds?: number }).seconds = duration;
+-      response.active += 1;
+-      queuedOutputSeconds += duration;
+-      sources.add(node);
+-      node.onended = (): void => {
+-        node.disconnect();
+-        sources.delete(node);
+-        response.active -= 1;
+-        queuedOutputSeconds = Math.max(0, queuedOutputSeconds - duration);
+-        maybeSettle(responseId);
+-      };
+-      // If the schedule is still ahead of the playback clock, append contiguously
+-      // (nextStartTime); otherwise we are starting fresh or have fallen behind, so
+-      // give a small bounded pre-buffer margin to soak up arrival jitter without
+-      // an underrun. This never delays a schedule that is already running ahead.
+-      const startAt = nextStartTime > context.currentTime
+-        ? nextStartTime
+-        : context.currentTime + PREBUFFER_MARGIN_SECONDS;
+-      node.start(startAt);
+-      nextStartTime = startAt + buffer.duration;
+-      // Record the scheduled end so a targeted cancel can recompute the fence
+-      // from the sources that actually survive.
+-      (node as { responseId?: number; seconds?: number; endAt?: number }).endAt = nextStartTime;
++      pending.push({ responseId, seq, samples, sampleRate, duration });
++      heldSeconds += duration;
++      pumpSchedule();
+     },
+ 
+     finishOutput(responseId: number, lastSeq: number): Promise<'played' | 'interrupted' | 'paused'> {
+-      void lastSeq;
+       if (closed || isStale(responseId)) return Promise.resolve('interrupted');
+       const response = responseFor(responseId);
+       response.declared = true;
++      response.declaredLastSeq = lastSeq;
+       if (response.cancelled || response.overflowed) {
+         finalize(responseId, 'interrupted');
+         return Promise.resolve('interrupted');
+@@ -381,7 +440,9 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
+       // Suspended at declaration time: keep the entry so a resumed drain can
+       // still complete the obligation (do not delete on 'paused').
+       if (context.state !== 'running') return Promise.resolve('paused');
+-      if (response.active === 0) {
++      // Played only once every declared sequence has actually finished playing —
++      // never a false acknowledgement while frames are still queued or in flight.
++      if (response.endedSeq >= lastSeq && response.scheduled === 0 && !hasPending(responseId)) {
+         responses.delete(responseId);
+         return Promise.resolve('played');
+       }
+@@ -392,6 +453,11 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
+ 
+     cancelOutput(responseId?: number): void {
+       emitDiagnostic({ source: 'audio', code: 'playback_cancelled', count: sources.size });
++      // Drop any held (unscheduled) frames for the cancelled generation so they
++      // can never enter a later response.
++      dropPending((frame) => responseId === undefined || frame.responseId === responseId);
++      // Stop and disconnect the cancelled response's scheduled source nodes before
++      // ownership is released, so no old audio keeps playing under a new turn.
+       for (const node of [...sources]) {
+         const tagged = node as { responseId?: number; seconds?: number };
+         if (responseId !== undefined && tagged.responseId !== responseId) continue;
+@@ -403,13 +469,15 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
+         }
+         node.disconnect();
+         sources.delete(node);
+-        queuedOutputSeconds = Math.max(0, queuedOutputSeconds - (tagged.seconds ?? 0));
++        scheduledSeconds = Math.max(0, scheduledSeconds - (tagged.seconds ?? 0));
+       }
+       // A full cancel clears the playback clock; a targeted cancel recomputes
+       // the fence from the sources that actually survive.
+       if (responseId === undefined) {
+         nextStartTime = 0;
+-        queuedOutputSeconds = 0;
++        scheduledSeconds = 0;
++        heldSeconds = 0;
++        pending.length = 0;
+       } else {
+         // When no source survives (the cancelled response was the only scheduled
+         // output) this collapses to 0 so new speech starts immediately instead of
+@@ -427,9 +495,11 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
+       for (const [id, response] of [...responses]) {
+         if (responseId !== undefined && id !== responseId) continue;
+         response.cancelled = true;
+-        response.active = 0;
++        response.scheduled = 0;
+         finalize(id, 'interrupted');
+       }
++      // Freed look-ahead may let a surviving response's held frames schedule now.
++      pumpSchedule();
+     },
+ 
+     async resume(): Promise<void> {
+@@ -453,6 +523,8 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
+       } else {
+         context.onstatechange = null;
+       }
++      pending.length = 0;
++      heldSeconds = 0;
+       for (const id of [...responses.keys()]) finalize(id, 'interrupted');
+       try {
+         await vad.destroy();
+diff --git a/src/client/realtime/client.ts b/src/client/realtime/client.ts
+index a396977..986b32c 100644
+--- a/src/client/realtime/client.ts
++++ b/src/client/realtime/client.ts
+@@ -21,6 +21,9 @@ import { OutstandingAudio } from './outstanding.js';
+ const RECONNECT_DELAY_MS = 750;
+ const STALL_SOFT_MS = 2000;
+ const STALL_HARD_MS = 5000;
++// Consumption feedback cadence: report the highest played sequence at most this
++// often (and on drain) so the server can release the next window of audio.
++const PROGRESS_INTERVAL_MS = 500;
+ const WS_OPEN = 1;
+ 
+ type ViewPhase = ConversationView['phase'];
+@@ -93,6 +96,11 @@ class Client implements ConversationClient {
+   private stallSoft: ReturnType<typeof setTimeout> | undefined;
+   private stallHard: ReturnType<typeof setTimeout> | undefined;
+ 
++  // Throttled consumption feedback.
++  private progressSentAt = 0;
++  private progressTimer: ReturnType<typeof setTimeout> | undefined;
++  private latestProgress: { responseId: number; seq: number } | null = null;
++
+   constructor(options: ConversationClientOptions) {
+     this.options = options;
+     this.socketFactory = options.socketFactory ?? ((url) => new WebSocket(url));
+@@ -150,6 +158,7 @@ class Client implements ConversationClient {
+       onError: this.onAudioError,
+       onDiscontinuity: this.onDiscontinuity,
+       onDiagnostic: event => this.recordDiagnostic(event),
++      onProgress: this.onOutputProgress,
+     });
+     this.audioCreating = creating;
+     void creating.then(
+@@ -238,6 +247,9 @@ class Client implements ConversationClient {
+     this.clearStall();
+     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+     this.reconnectTimer = undefined;
++    if (this.progressTimer) clearTimeout(this.progressTimer);
++    this.progressTimer = undefined;
++    this.latestProgress = null;
+     if (this.socketOpen()) this.send({ type: 'end' });
+     try {
+       this.socket?.close();
+@@ -327,6 +339,37 @@ class Client implements ConversationClient {
+     this.emit();
+   };
+ 
++  /**
++   * Consumption feedback from the audio scheduler: the highest sequence that has
++   * finished playing. Coalesced and throttled to at most one report per
++   * PROGRESS_INTERVAL_MS so the server releases the next window without a flood.
++   */
++  private onOutputProgress = (responseId: number, seq: number): void => {
++    if (this.ended) return;
++    this.latestProgress = { responseId, seq };
++    const elapsed = Date.now() - this.progressSentAt;
++    if (elapsed >= PROGRESS_INTERVAL_MS) {
++      this.flushProgress();
++    } else if (!this.progressTimer) {
++      this.progressTimer = setTimeout(() => {
++        this.progressTimer = undefined;
++        this.flushProgress();
++      }, PROGRESS_INTERVAL_MS - elapsed);
++    }
++  };
++
++  private flushProgress(): void {
++    if (this.progressTimer) {
++      clearTimeout(this.progressTimer);
++      this.progressTimer = undefined;
++    }
++    const progress = this.latestProgress;
++    if (!progress) return;
++    this.latestProgress = null;
++    this.progressSentAt = Date.now();
++    this.send({ type: 'playback_progress', responseId: progress.responseId, seq: progress.seq });
++  }
++
+   private onDiscontinuity = (): void => {
+     this.recordDiagnostic({ source: 'audio', code: 'input_discontinuity', turnId: this.input?.turnId });
+     const input = this.input;
+@@ -481,6 +524,8 @@ class Client implements ConversationClient {
+       this.emit();
        return;
      }
- 
--    // send() resolved — the turn is complete. Deliver stored result as commentary.
-+    // send() resolved — the turn is complete. Advance cursor and deliver result.
-     session.sendSettling = false;
-+    session.inputCursor = session.transcript.length;
-     if (!this.active || this.active.sessionId !== sessionId) return;
-     const resultText = session.pendingResult;
-     session.pendingResult = null;
-@@ -555,12 +560,17 @@ export class GptLiveManager {
-   }
- 
-   private assembleUserContext(session: ActiveTrialSession): string {
--    const userEntries = session.transcript.filter(t => t.role === 'user');
--    if (userEntries.length === 0) return '';
-+    const freshEntries: GptLiveTranscriptEntry[] = [];
-+    for (let i = session.inputCursor; i < session.transcript.length; i++) {
-+      if (session.transcript[i].role === 'user') {
-+        freshEntries.push(session.transcript[i]);
-+      }
-+    }
-+    if (freshEntries.length === 0) return '';
-     const parts: string[] = [];
-     let byteLen = 0;
--    for (let i = userEntries.length - 1; i >= 0 && byteLen < 2000; i--) {
--      const t = userEntries[i].text;
-+    for (let i = freshEntries.length - 1; i >= 0 && byteLen < 2000; i--) {
-+      const t = freshEntries[i].text;
-       if (!t) continue;
-       parts.unshift(t);
-       byteLen += Buffer.byteLength(t, 'utf8');
-@@ -675,6 +685,9 @@ export class GptLiveManager {
- 
-     await this.safeSave();
- 
-+    this.lastDiagnosticSnapshot = this.buildDiagnostics(session);
-+    this.lastSessionOwnerId = session.ownerId;
-+
-     const confirmed = session.closureConfirmed === true;
-     const closureReason = session.closureReason ?? 'unknown';
-     const resolve = session.closingResolve;
-@@ -684,26 +697,56 @@ export class GptLiveManager {
-     if (resolve) resolve();
-   }
- 
--  getDiagnostics(): GptLiveDiagnostics {
--    const session = this.active;
-+  private buildDiagnostics(session: ActiveTrialSession): GptLiveDiagnostics {
-     return {
--      sessionId: session?.sessionId ?? null,
-+      sessionId: session.sessionId,
-       voiceModel: GPT_LIVE_VOICE_MODEL,
-       backendModel: GPT_LIVE_BACKEND_MODEL,
--      cumulativeVoiceSeconds: session?.cumulativeVoiceSeconds ?? 0,
--      estimatedCostUsd: session
--        ? (session.cumulativeVoiceSeconds / 60) * GPT_LIVE_PRICE_PER_MINUTE
--        : 0,
--      closureConfirmed: session?.closureConfirmed ?? null,
--      closureReason: session?.closureReason ?? null,
--      delegationsProcessed: session?.processedDelegationIds.size ?? 0,
-+      cumulativeVoiceSeconds: session.cumulativeVoiceSeconds,
-+      estimatedCostUsd: (session.cumulativeVoiceSeconds / 60) * GPT_LIVE_PRICE_PER_MINUTE,
-+      closureConfirmed: session.closureConfirmed,
-+      closureReason: session.closureReason,
-+      delegationsProcessed: session.processedDelegationIds.size,
-       delegationsSkipped: 0,
--      transcript: session
--        ? session.transcript.map(t => ({ ...t }))
--        : [],
-+      transcript: session.transcript.map(t => ({ ...t })),
-     };
-   }
- 
-+  getDiagnostics(ownerId?: string): GptLiveDiagnostics {
-+    if (this.active) {
-+      if (ownerId && this.active.ownerId !== ownerId) {
-+        return this.emptyDiagnostics();
-+      }
-+      return this.buildDiagnostics(this.active);
-+    }
-+    if (this.lastDiagnosticSnapshot) {
-+      if (ownerId && this.lastSessionOwnerId !== ownerId) {
-+        return this.emptyDiagnostics();
-+      }
-+      return this.lastDiagnosticSnapshot;
-+    }
-+    return this.emptyDiagnostics();
-+  }
-+
-+  private emptyDiagnostics(): GptLiveDiagnostics {
-+    return {
-+      sessionId: null,
-+      voiceModel: GPT_LIVE_VOICE_MODEL,
-+      backendModel: GPT_LIVE_BACKEND_MODEL,
-+      cumulativeVoiceSeconds: 0,
-+      estimatedCostUsd: 0,
-+      closureConfirmed: null,
-+      closureReason: null,
-+      delegationsProcessed: 0,
-+      delegationsSkipped: 0,
-+      transcript: [],
-+    };
-+  }
-+
-+  getSessionOwnerId(): string | null {
-+    return this.active?.ownerId ?? this.lastSessionOwnerId;
-+  }
-+
-   async shutdown(): Promise<void> {
-     if (!this.active) return;
-     const session = this.active;
-diff --git a/tests/unit/contract-verification.test.ts b/tests/unit/contract-verification.test.ts
++    // Report final consumption on drain before acknowledging completion.
++    this.flushProgress();
+     if (result === 'played') {
+       this.send({ type: 'playback_done', responseId, lastSeq });
+     } else {
+diff --git a/src/client/realtime/integration.test.ts b/src/client/realtime/integration.test.ts
 new file mode 100644
-index 0000000..3b9ab13
+index 0000000..31d6fbc
 --- /dev/null
-+++ b/tests/unit/contract-verification.test.ts
-@@ -0,0 +1,693 @@
-+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-+import { tmpdir } from 'node:os';
-+import { mkdir, rm, writeFile } from 'node:fs/promises';
-+import path from 'node:path';
-+import { randomBytes } from 'node:crypto';
-+import { GptLiveManager, splitUtf8Chunks, type GptLiveSessionCallbacks, type HarnessFactory } from '../../src/server/live/session.js';
-+import { GptLiveBudget } from '../../src/server/live/budget.js';
-+import type { LiveProvider, ProviderEventHandler } from '../../src/server/live/provider.js';
-+import type { HarnessSession, HarnessOptions } from '../../src/shared/contracts.js';
++++ b/src/client/realtime/integration.test.ts
+@@ -0,0 +1,285 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { PCM_RATE, type ConversationView, type RealtimeCommand, type RealtimeEvent } from '../../shared/realtime.js';
++import { decodeAudio } from '../../shared/realtime-wire.js';
++import { createConversationClient } from './client.js';
++import { createConversation } from '../../server/realtime/session.js';
++import type { HarnessEvent } from '../../shared/contracts.js';
++import type { RealtimeHarness, RealtimeSpeech } from '../../shared/realtime.js';
 +
-+function tmpDir(): string {
-+  return path.join(tmpdir(), `wave-contract-${randomBytes(4).toString('hex')}`);
++// Full coupling of the ACTUAL client controller + audio scheduler to the server
++// coordinator over an in-memory transport. 45–90 s of generated audio is
++// delivered much faster than realtime and must arrive complete, in order, with
++// bounded buffers at every stage, no silent tail loss, no false `played`
++// acknowledgement, and observable progress-driven release.
++
++// --- browser boundary fakes (AudioContext / MediaStream / VAD) --------------
++
++vi.mock('@ricky0123/vad-web', () => ({
++  MicVAD: {
++    new: async () => ({
++      async start(): Promise<void> {},
++      async pause(): Promise<void> {},
++      async destroy(): Promise<void> {},
++    }),
++  },
++}));
++
++class FakeSourceNode {
++  buffer: { duration: number; length: number; sampleRate: number; getChannelData(): Float32Array } | null = null;
++  onended: (() => void) | null = null;
++  responseId?: number;
++  seconds?: number;
++  seq?: number;
++  endAt?: number;
++  constructor(private readonly ctx: FakeAudioContext) {}
++  connect(): void {}
++  disconnect(): void {}
++  start(): void {
++    this.ctx.live.add(this);
++  }
++  stop(): void {
++    this.ctx.live.delete(this);
++  }
 +}
 +
-+function noopCallbacks(): GptLiveSessionCallbacks {
-+  return {
-+    onTranscriptDelta: vi.fn(),
-+    onDelegationCreated: vi.fn(),
-+    onUsageUpdate: vi.fn(),
-+    onSessionClosed: vi.fn(),
-+    onError: vi.fn(),
-+  };
++class FakeAudioContext {
++  state: 'running' | 'suspended' | 'closed' = 'running';
++  currentTime = 0;
++  readonly destination = {};
++  readonly sampleRate: number;
++  onstatechange: (() => void) | null = null;
++  readonly live = new Set<FakeSourceNode>();
++  constructor(options?: { sampleRate?: number }) {
++    this.sampleRate = options?.sampleRate ?? 48000;
++  }
++  createBuffer(_channels: number, length: number, rate: number): { duration: number; length: number; sampleRate: number; getChannelData(): Float32Array } {
++    const data = new Float32Array(length);
++    return { duration: length / rate, length, sampleRate: rate, getChannelData: () => data };
++  }
++  createBufferSource(): FakeSourceNode {
++    return new FakeSourceNode(this);
++  }
++  addEventListener(): void {}
++  removeEventListener(): void {}
++  async resume(): Promise<void> {
++    this.state = 'running';
++  }
++  async close(): Promise<void> {
++    this.state = 'closed';
++  }
++  /** Play (end) every scheduled node, advancing the playback clock. */
++  playAll(): void {
++    for (const node of [...this.live]) {
++      this.currentTime = Math.max(this.currentTime, node.endAt ?? this.currentTime);
++      this.live.delete(node);
++      node.onended?.();
++    }
++  }
 +}
 +
-+function createMockHarnessFactory(): HarnessFactory {
-+  return (options: HarnessOptions): HarnessSession => {
-+    let started = false;
-+    return {
-+      async start() { started = true; options.onEvent({ type: 'ready' }); },
-+      async send(text: string) {
-+        if (!started) throw new Error('Not started');
-+        options.onEvent({ type: 'text', text: `Response: ${text}` });
-+        if (options.onResult) options.onResult(`Response: ${text}`);
-+      },
-+      async close() { started = false; },
-+    };
-+  };
-+}
++let contexts: FakeAudioContext[] = [];
 +
-+function createProvider(opts?: {
-+  sessionId?: string;
-+  onAttach?: (handler: ProviderEventHandler) => void;
-+}): LiveProvider {
-+  return {
-+    async createSession() {
-+      return {
-+        providerSessionId: opts?.sessionId ?? 'prov-contract',
-+        answerSdp: 'v=0\r\ncontract-answer',
-+      };
-+    },
-+    async attachSideband(_sid, handler) {
-+      opts?.onAttach?.(handler);
-+      return { close() {} };
-+    },
-+    sendThinking() {},
-+    sendCommentary() {},
-+    closeSession() {},
-+    async hangup() {},
-+    destroy() {},
-+  };
-+}
-+
-+async function enabledManager(workDir: string, provOpts?: Parameters<typeof createProvider>[0], hf?: HarnessFactory) {
-+  const keyFile = path.join(workDir, 'api.key');
-+  await writeFile(keyFile, 'sk-test-contract-key-12345', { mode: 0o600 });
-+  const manager = new GptLiveManager({
-+    enabled: true,
-+    apiKeyFile: keyFile,
-+    budgetFile: path.join(workDir, 'budget.json'),
-+    maxSessionSeconds: 60,
-+    configuredModel: 'claude-opus-4-6[1m]',
-+    nodeExecutable: process.execPath,
-+    providerFactory: () => createProvider(provOpts),
-+    harnessFactory: hf ?? createMockHarnessFactory(),
++beforeEach(() => {
++  contexts = [];
++  const micTrack = { stop: vi.fn(), enabled: true };
++  const stream = { getTracks: () => [micTrack], getAudioTracks: () => [micTrack] };
++  vi.stubGlobal('navigator', { mediaDevices: { getUserMedia: async () => stream } });
++  vi.stubGlobal('AudioContext', class extends FakeAudioContext {
++    constructor(options?: { sampleRate?: number }) {
++      super(options);
++      contexts.push(this);
++    }
 +  });
-+  await manager.initialize();
-+  return manager;
-+}
-+
-+// ============================================================================
-+// PRIORITY 1: End + diagnostics ACTUAL CONTRACT
-+// ============================================================================
-+describe('contract: End + diagnostics lifecycle', () => {
-+  let workDir: string;
-+
-+  beforeEach(async () => {
-+    workDir = tmpDir();
-+    await mkdir(workDir, { recursive: true });
-+  });
-+  afterEach(async () => {
-+    await rm(workDir, { recursive: true, force: true });
-+  });
-+
-+  it('diagnostics retain final closure/usage/transcript after finishCleanup clears active', async () => {
-+    let sidebandHandler: ProviderEventHandler | null = null;
-+    const manager = await enabledManager(workDir, {
-+      onAttach: (h) => { sidebandHandler = h; },
-+    });
-+
-+    const callbacks = noopCallbacks();
-+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', callbacks);
-+    await new Promise(r => setTimeout(r, 50));
-+
-+    manager.handleInputTranscript('hello test');
-+    manager.handleUsageUpdate(25.5);
-+
-+    sidebandHandler!.onSessionClosed('close_requested', { seconds: 30 });
-+    await new Promise(r => setTimeout(r, 50));
-+
-+    expect(manager.hasActiveSession).toBe(false);
-+
-+    const diag = manager.getDiagnostics();
-+    expect(diag.sessionId).not.toBeNull();
-+    expect(diag.closureConfirmed).toBe(true);
-+    expect(diag.closureReason).toBe('close_requested');
-+    expect(diag.cumulativeVoiceSeconds).toBe(30);
-+    expect(diag.transcript.length).toBeGreaterThan(0);
-+    expect(diag.transcript.some(t => t.text === 'hello test')).toBe(true);
-+  });
-+
-+  it('diagnostics return owner-bound snapshot — non-owner gets empty', async () => {
-+    let sidebandHandler: ProviderEventHandler | null = null;
-+    const manager = await enabledManager(workDir, {
-+      onAttach: (h) => { sidebandHandler = h; },
-+    });
-+
-+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
-+    await new Promise(r => setTimeout(r, 50));
-+
-+    manager.handleInputTranscript('private info');
-+    sidebandHandler!.onSessionClosed('close_requested', { seconds: 10 });
-+    await new Promise(r => setTimeout(r, 50));
-+
-+    expect(manager.getDiagnostics('owner-1').transcript.length).toBeGreaterThan(0);
-+    expect(manager.getDiagnostics('other-owner').transcript).toEqual([]);
-+    expect(manager.getDiagnostics('other-owner').sessionId).toBeNull();
-+  });
-+
-+  it('End during async start (unmount) properly cleans up', async () => {
-+    let harnessStartResolve: (() => void) | null = null;
-+    const slowHarness: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
-+      async start() {
-+        await new Promise<void>(resolve => { harnessStartResolve = resolve; });
-+        options.onEvent({ type: 'ready' });
-+      },
-+      async send(text: string) {
-+        if (options.onResult) options.onResult(`ok: ${text}`);
-+      },
-+      async close() {},
-+    });
-+
-+    const keyFile = path.join(workDir, 'api.key');
-+    await writeFile(keyFile, 'sk-test-contract-key-12345', { mode: 0o600 });
-+    const manager = new GptLiveManager({
-+      enabled: true,
-+      apiKeyFile: keyFile,
-+      budgetFile: path.join(workDir, 'budget.json'),
-+      maxSessionSeconds: 60,
-+      configuredModel: 'claude-opus-4-6[1m]',
-+      nodeExecutable: process.execPath,
-+      providerFactory: () => createProvider(),
-+      harnessFactory: slowHarness,
-+    });
-+    await manager.initialize();
-+
-+    const p = manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
-+    await new Promise(r => setTimeout(r, 50));
-+
-+    // Resolve the harness start so creation completes
-+    harnessStartResolve!();
-+    const result = await p;
-+
-+    // Immediately close
-+    await manager.closeSession(result.sessionId, 'unmount');
-+
-+    await vi.waitFor(() => {
-+      expect(manager.hasActiveSession).toBe(false);
-+    }, { timeout: 20_000 });
-+
-+    const diag = manager.getDiagnostics('owner-1');
-+    expect(diag.sessionId).not.toBeNull();
-+  }, 25_000);
 +});
 +
-+// ============================================================================
-+// PRIORITY 2: Fresh input — per-delegation cursor
-+// ============================================================================
-+describe('contract: fresh-input cursor prevents stale replay', () => {
-+  let workDir: string;
-+
-+  beforeEach(async () => {
-+    workDir = tmpDir();
-+    await mkdir(workDir, { recursive: true });
-+  });
-+  afterEach(async () => {
-+    await rm(workDir, { recursive: true, force: true });
-+  });
-+
-+  it('prior user request is NOT re-sent when new delegation arrives without fresh input', async () => {
-+    const sentTexts: string[] = [];
-+    let sendGate: (() => void) | null = null;
-+
-+    const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
-+      async start() { options.onEvent({ type: 'ready' }); },
-+      async send(text: string) {
-+        sentTexts.push(text);
-+        await new Promise<void>(resolve => { sendGate = resolve; });
-+        if (options.onResult) options.onResult(`ok: ${text}`);
-+      },
-+      async close() {},
-+    });
-+
-+    const manager = await enabledManager(workDir, undefined, harnessFactory);
-+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
-+
-+    // First delegation with input
-+    manager.handleInputTranscript('buy 100 shares of AAPL');
-+    manager.handleDelegationCreated('deleg-1', 1000);
-+
-+    await vi.waitFor(() => expect(sentTexts.length).toBe(1));
-+    expect(sentTexts[0]).toBe('buy 100 shares of AAPL');
-+
-+    // Settle first delegation
-+    sendGate!();
-+    await new Promise(r => setTimeout(r, 50));
-+
-+    // New delegation arrives WITHOUT new input
-+    manager.handleDelegationCreated('deleg-2', 2000);
-+
-+    // Wait past the input timeout
-+    await new Promise(r => setTimeout(r, 4000));
-+
-+    // Second delegation should NOT have sent the old "buy 100 shares" input
-+    expect(sentTexts.length).toBe(1);
-+
-+    await manager.shutdown();
-+  }, 10000);
-+
-+  it('new input after 500ms is NOT lost', async () => {
-+    const sentTexts: string[] = [];
-+
-+    const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
-+      async start() { options.onEvent({ type: 'ready' }); },
-+      async send(text: string) {
-+        sentTexts.push(text);
-+        if (options.onResult) options.onResult(`ok: ${text}`);
-+      },
-+      async close() {},
-+    });
-+
-+    const manager = await enabledManager(workDir, undefined, harnessFactory);
-+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
-+
-+    // Delegation arrives first
-+    manager.handleDelegationCreated('deleg-late', 500);
-+
-+    // Input arrives after 800ms
-+    await new Promise(r => setTimeout(r, 800));
-+    manager.handleInputTranscript('delayed request');
-+
-+    await vi.waitFor(() => expect(sentTexts.length).toBe(1), { timeout: 2000 });
-+    expect(sentTexts[0]).toBe('delayed request');
-+
-+    await manager.shutdown();
-+  });
-+
-+  it('fragmented new input across delta events is properly assembled', async () => {
-+    const sentTexts: string[] = [];
-+    let sendGate: (() => void) | null = null;
-+
-+    const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
-+      async start() { options.onEvent({ type: 'ready' }); },
-+      async send(text: string) {
-+        sentTexts.push(text);
-+        await new Promise<void>(resolve => { sendGate = resolve; });
-+        if (options.onResult) options.onResult(`ok: ${text}`);
-+      },
-+      async close() {},
-+    });
-+
-+    const manager = await enabledManager(workDir, undefined, harnessFactory);
-+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
-+
-+    // First delegation
-+    manager.handleInputTranscript('first request');
-+    manager.handleDelegationCreated('deleg-1', 1000);
-+
-+    await vi.waitFor(() => expect(sentTexts.length).toBe(1));
-+    sendGate!();
-+    await new Promise(r => setTimeout(r, 50));
-+
-+    // Second delegation with fragmented new input
-+    manager.handleInputTranscript('what ');
-+    manager.handleInputTranscript('is the ');
-+    manager.handleInputTranscript('weather?');
-+    manager.handleDelegationCreated('deleg-2', 2000);
-+
-+    await vi.waitFor(() => expect(sentTexts.length).toBe(2));
-+    expect(sentTexts[1]).toBe('what is the weather?');
-+
-+    sendGate!();
-+    await manager.shutdown();
-+  });
-+
-+  it('close while input is queued does not process delegation', async () => {
-+    let sendCalled = false;
-+
-+    const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
-+      async start() { options.onEvent({ type: 'ready' }); },
-+      async send() { sendCalled = true; },
-+      async close() {},
-+    });
-+
-+    const manager = await enabledManager(workDir, undefined, harnessFactory);
-+    const { sessionId } = await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
-+
-+    // Delegation without input — waiting for input
-+    manager.handleDelegationCreated('deleg-pending', 500);
-+    await new Promise(r => setTimeout(r, 50));
-+
-+    // Close while waiting
-+    await manager.closeSession(sessionId, 'test');
-+
-+    await vi.waitFor(() => {
-+      expect(manager.hasActiveSession).toBe(false);
-+    }, { timeout: 20_000 });
-+
-+    expect(sendCalled).toBe(false);
-+  }, 25_000);
++afterEach(() => {
++  vi.unstubAllGlobals();
 +});
 +
-+// ============================================================================
-+// PRIORITY 3: Final result delivery
-+// ============================================================================
-+describe('contract: final result delivery via commentary', () => {
-+  let workDir: string;
++// --- in-memory transport bridging client socket <-> server coordinator ------
 +
-+  beforeEach(async () => {
-+    workDir = tmpDir();
-+    await mkdir(workDir, { recursive: true });
++const SAMPLE_RATE = 24000;
++function audioFrame(ms: number): string {
++  return Buffer.alloc(Math.round((ms / 1000) * SAMPLE_RATE * 2), 1).toString('base64');
++}
++
++interface Bridge {
++  client: ReturnType<typeof createConversationClient>;
++  emitAudio(ms: number): void;
++  resolveSend(): void;
++  pump(): Promise<void>;
++  advance(ms: number): void;
++  serverAudioSeqs(): number[];
++  view(): ConversationView;
++}
++
++async function bridge(): Promise<Bridge> {
++  let clock = 0;
++  const toClient: RealtimeEvent[] = [];
++  const toServer: Array<RealtimeCommand | { audio: ReturnType<typeof decodeAudio> }> = [];
++  const serverAudioSeqs: number[] = [];
++
++  const harness: RealtimeHarness = {
++    start: async () => {},
++    send: () => new Promise<void>((resolve) => { resolveSend = resolve; }),
++    interrupt: async () => {},
++    close: async () => {},
++  };
++  let resolveSend: () => void = () => {};
++  let onAudio: (audio: string, sampleRate: number) => void = () => {};
++  const speech: RealtimeSpeech = {
++    startRecognition: async () => {},
++    writeAudio: () => true,
++    commitRecognition: async () => '',
++    prewarm: () => {},
++    writeText: () => {},
++    finishSpeech: async () => {},
++    cancelSpeech: () => {},
++    abortRecognition: () => {},
++    close: () => {},
++  };
++
++  const conv = createConversation({
++    id: 'itg-1',
++    mode: 'fixture',
++    now: () => clock,
++    harness: (_e: (event: HarnessEvent) => void) => harness,
++    speech: (callbacks) => {
++      onAudio = callbacks.onAudio;
++      return speech;
++    },
 +  });
-+  afterEach(async () => {
-+    await rm(workDir, { recursive: true, force: true });
++  await conv.start();
++  conv.attach((event) => {
++    if (event.type === 'audio') serverAudioSeqs.push(event.seq);
++    toClient.push(event);
 +  });
 +
-+  it('commentary preserves full text without truncation for <=500 byte chunks', async () => {
-+    const commentaryCalls: [string, string | null][] = [];
-+    const longResult = 'A'.repeat(1200);
-+
-+    const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
-+      async start() { options.onEvent({ type: 'ready' }); },
-+      async send() {
-+        if (options.onResult) options.onResult(longResult);
++  // A minimal WebSocket stand-in that routes client output to the coordinator.
++  let socketRef: { onopen: (() => void) | null; onmessage: ((e: { data: unknown }) => void) | null; onclose: (() => void) | null; onerror: (() => void) | null } | null = null;
++  const socketFactory = (): WebSocket => {
++    const socket = {
++      readyState: 1,
++      binaryType: 'arraybuffer',
++      onopen: null as (() => void) | null,
++      onmessage: null as ((e: { data: unknown }) => void) | null,
++      onclose: null as (() => void) | null,
++      onerror: null as (() => void) | null,
++      send(data: string | ArrayBuffer): void {
++        if (typeof data === 'string') toServer.push(JSON.parse(data) as RealtimeCommand);
++        else toServer.push({ audio: decodeAudio(data) });
 +      },
-+      async close() {},
-+    });
-+
-+    const provider: LiveProvider = {
-+      async createSession() {
-+        return { providerSessionId: 'prov-chunk', answerSdp: 'v=0\r\nanswer' };
-+      },
-+      async attachSideband() { return { close() {} }; },
-+      sendThinking() {},
-+      sendCommentary(content, delegationId) {
-+        commentaryCalls.push([content, delegationId]);
-+      },
-+      closeSession() {},
-+      async hangup() {},
-+      destroy() {},
++      close(): void {},
 +    };
++    socketRef = socket;
++    queueMicrotask(() => socket.onopen?.());
++    return socket as unknown as WebSocket;
++  };
 +
-+    const keyFile = path.join(workDir, 'api.key');
-+    await writeFile(keyFile, 'sk-test-contract-key-12345', { mode: 0o600 });
-+    const manager = new GptLiveManager({
-+      enabled: true,
-+      apiKeyFile: keyFile,
-+      budgetFile: path.join(workDir, 'budget.json'),
-+      maxSessionSeconds: 60,
-+      configuredModel: 'claude-opus-4-6[1m]',
-+      nodeExecutable: process.execPath,
-+      providerFactory: () => provider,
-+      harnessFactory,
-+    });
-+    await manager.initialize();
++  const views: ConversationView[] = [];
++  const client = createConversationClient({
++    url: 'wss://local/itg',
++    speechAvailable: true,
++    refreshAccess: async () => {},
++    onChange: (view) => views.push(view),
++    socketFactory,
++    audioFactory: (opts) => import('./audio.js').then((m) => m.createHandsFreeAudio(opts)),
++  });
 +
-+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
-+    manager.handleInputTranscript('go');
-+    manager.handleDelegationCreated('deleg-1', 1000);
++  async function pump(): Promise<void> {
++    // Drain both directions until stable; delivery is queued (never reentrant).
++    for (let guard = 0; guard < 10000; guard++) {
++      if (toServer.length > 0) {
++        const msg = toServer.shift()!;
++        if ('audio' in msg) conv.audio(msg.audio);
++        else await conv.handle(msg);
++        continue;
++      }
++      if (toClient.length > 0) {
++        const event = toClient.shift()!;
++        socketRef?.onmessage?.({ data: JSON.stringify(event) });
++        continue;
++      }
++      // Let any awaited microtasks (audio creation, finishOutput) settle.
++      await Promise.resolve();
++      if (toServer.length === 0 && toClient.length === 0) return;
++    }
++    throw new Error('pump did not settle');
++  }
 +
-+    await vi.waitFor(() => expect(commentaryCalls.length).toBeGreaterThanOrEqual(2));
++  await client.start();
++  await pump();
++  // The real hands-free audio is created asynchronously (dynamic import + a few
++  // awaits). Wait until the AudioContext exists so no output frame is dropped
++  // before playback is ready.
++  for (let i = 0; i < 200 && contexts.length === 0; i++) {
++    await new Promise((r) => setTimeout(r, 0));
++    await pump();
++  }
++  await pump();
 +
-+    const fullText = commentaryCalls.map(([c]) => c).join('');
-+    expect(fullText).toBe(longResult);
++  return {
++    client,
++    emitAudio: (ms) => onAudio(audioFrame(ms), SAMPLE_RATE),
++    resolveSend: () => resolveSend(),
++    pump,
++    advance: (ms) => { clock += ms; },
++    serverAudioSeqs: () => serverAudioSeqs,
++    view: () => views[views.length - 1],
++  };
++}
 +
-+    for (const [content] of commentaryCalls) {
-+      expect(Buffer.byteLength(content, 'utf8')).toBeLessThanOrEqual(500);
++describe('client <-> coordinator output flow control integration (issue 15)', () => {
++  it('delivers ~60s of audio complete, ordered and bounded, much faster than realtime', async () => {
++    const b = await bridge();
++
++    // Start a typed turn; the coordinator opens a response.
++    b.client.sendText('play a long answer');
++    await b.pump();
++
++    // Generate 60 seconds of audio in 1 s frames while the client has played none.
++    const TOTAL = 60;
++    for (let i = 0; i < TOTAL; i++) b.emitAudio(1000);
++    await b.pump();
++
++    // The server released only a bounded window up front (never all 60s).
++    expect(b.serverAudioSeqs().length).toBeGreaterThan(0);
++    expect(b.serverAudioSeqs().length).toBeLessThan(TOTAL);
++    // The client scheduled only a bounded look-ahead of live nodes.
++    const ctx = contexts[0];
++    expect(ctx.live.size).toBeLessThanOrEqual(12);
++    let maxLive = ctx.live.size;
++
++    // Finish inference: the coordinator declares the response and keeps draining.
++    b.resolveSend();
++    await b.pump();
++
++    // Drive playback much faster than realtime. Fake timers let the throttled
++    // progress reports and the server's time-based drain fire deterministically.
++    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
++    try {
++      for (let guard = 0; guard < 500; guard++) {
++        ctx.playAll(); // play everything scheduled -> onended -> progress
++        b.advance(2000); // also exercise the server realtime-fallback window
++        vi.advanceTimersByTime(600); // fire throttled progress + drain timers
++        await b.pump(); // deliver progress -> server releases the next window
++        maxLive = Math.max(maxLive, ctx.live.size);
++        if (b.view().phase !== 'speaking' && b.view().phase !== 'thinking') break;
++      }
++    } finally {
++      vi.useRealTimers();
 +    }
 +
-+    await manager.shutdown();
-+  });
++    // Every generated sequence was delivered by the server, exactly once, in order.
++    const delivered = b.serverAudioSeqs();
++    expect(delivered).toEqual(Array.from({ length: TOTAL }, (_, i) => i + 1));
++    // Buffers stayed bounded at every stage (never the full 60 s at once).
++    expect(maxLive).toBeLessThanOrEqual(12);
++    expect(ctx.live.size).toBe(0);
++    // The turn completed as a genuine played drain (listening again), not stalled,
++    // and progress-driven release was observed throughout.
++    expect(['listening', 'muted', 'paused']).toContain(b.view().phase);
 +
-+  it('provider sendCommentary error does not crash session', async () => {
-+    let commentaryCallCount = 0;
-+
-+    const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
-+      async start() { options.onEvent({ type: 'ready' }); },
-+      async send() {
-+        if (options.onResult) options.onResult('result text');
-+      },
-+      async close() {},
-+    });
-+
-+    const provider: LiveProvider = {
-+      async createSession() {
-+        return { providerSessionId: 'prov-err', answerSdp: 'v=0\r\nanswer' };
-+      },
-+      async attachSideband() { return { close() {} }; },
-+      sendThinking() {},
-+      sendCommentary() {
-+        commentaryCallCount++;
-+        throw new Error('Transport error');
-+      },
-+      closeSession() {},
-+      async hangup() {},
-+      destroy() {},
-+    };
-+
-+    const keyFile = path.join(workDir, 'api.key');
-+    await writeFile(keyFile, 'sk-test-contract-key-12345', { mode: 0o600 });
-+    const manager = new GptLiveManager({
-+      enabled: true,
-+      apiKeyFile: keyFile,
-+      budgetFile: path.join(workDir, 'budget.json'),
-+      maxSessionSeconds: 60,
-+      configuredModel: 'claude-opus-4-6[1m]',
-+      nodeExecutable: process.execPath,
-+      providerFactory: () => provider,
-+      harnessFactory,
-+    });
-+    await manager.initialize();
-+
-+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
-+    manager.handleInputTranscript('go');
-+    manager.handleDelegationCreated('deleg-1', 1000);
-+
-+    await new Promise(r => setTimeout(r, 200));
-+
-+    expect(commentaryCallCount).toBeGreaterThan(0);
-+    await manager.shutdown();
-+  });
-+
-+  it('End during commentary append does not crash', async () => {
-+    let sendGate: (() => void) | null = null;
-+
-+    const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
-+      async start() { options.onEvent({ type: 'ready' }); },
-+      async send() {
-+        await new Promise<void>(resolve => { sendGate = resolve; });
-+        if (options.onResult) options.onResult('result during close');
-+      },
-+      async close() { sendGate?.(); },
-+    });
-+
-+    const commentaryCalls: string[] = [];
-+    const provider: LiveProvider = {
-+      async createSession() {
-+        return { providerSessionId: 'prov-end', answerSdp: 'v=0\r\nanswer' };
-+      },
-+      async attachSideband() { return { close() {} }; },
-+      sendThinking() {},
-+      sendCommentary(c) { commentaryCalls.push(c); },
-+      closeSession() {},
-+      async hangup() {},
-+      destroy() {},
-+    };
-+
-+    const keyFile = path.join(workDir, 'api.key');
-+    await writeFile(keyFile, 'sk-test-contract-key-12345', { mode: 0o600 });
-+    const manager = new GptLiveManager({
-+      enabled: true,
-+      apiKeyFile: keyFile,
-+      budgetFile: path.join(workDir, 'budget.json'),
-+      maxSessionSeconds: 60,
-+      configuredModel: 'claude-opus-4-6[1m]',
-+      nodeExecutable: process.execPath,
-+      providerFactory: () => provider,
-+      harnessFactory,
-+    });
-+    await manager.initialize();
-+
-+    const { sessionId } = await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
-+    manager.handleInputTranscript('go');
-+    manager.handleDelegationCreated('deleg-1', 1000);
-+
-+    await vi.waitFor(() => expect(sendGate).not.toBeNull());
-+
-+    // Close during in-flight send
-+    await manager.closeSession(sessionId, 'test');
-+    await new Promise(r => setTimeout(r, 200));
-+
-+    // Should not have sent commentary (session was closed)
-+    expect(commentaryCalls).toHaveLength(0);
++    await b.client.end();
 +  });
 +});
+diff --git a/src/server/realtime/flow-control.test.ts b/src/server/realtime/flow-control.test.ts
+new file mode 100644
+index 0000000..4642f4f
+--- /dev/null
++++ b/src/server/realtime/flow-control.test.ts
+@@ -0,0 +1,136 @@
++import { describe, expect, it } from 'vitest';
++import { createConversation } from './session.js';
++import type { HarnessEvent } from '../../shared/contracts.js';
++import type {
++  RealtimeEvent,
++  RealtimeHarness,
++  RealtimeSpeech,
++  RetainedConversation,
++} from '../../shared/realtime.js';
 +
-+// ============================================================================
-+// PRIORITY 4: Billing/transport stop conditions
-+// ============================================================================
-+describe('contract: billing stop conditions', () => {
-+  let workDir: string;
++// Deterministic server-side output flow-control tests. A controllable clock and
++// a captured onAudio callback let us inject exact amounts of generated audio and
++// assert the bounded, consumption-based release without any timers or network.
 +
-+  beforeEach(async () => {
-+    workDir = tmpDir();
-+    await mkdir(workDir, { recursive: true });
++const SAMPLE_RATE = 24000;
++// A base64 frame whose decoded PCM16 length is exactly `ms` of audio.
++function audioFrame(ms: number): string {
++  const bytes = Math.round((ms / 1000) * SAMPLE_RATE * 2);
++  return Buffer.alloc(bytes, 1).toString('base64');
++}
++
++interface Rig {
++  conv: RetainedConversation;
++  events: RealtimeEvent[];
++  emitAudio(ms: number): void;
++  setNow(ms: number): void;
++  audioSeqs(): number[];
++  diagCodes(): string[];
++  diag(code: string): Extract<RealtimeEvent, { type: 'diagnostic' }>['event'] | undefined;
++}
++
++async function rig(): Promise<Rig> {
++  const events: RealtimeEvent[] = [];
++  let clock = 0;
++
++  const harness: RealtimeHarness = {
++    start: async () => {},
++    send: () => new Promise<void>(() => {}), // stays pending: response stays active
++    interrupt: async () => {},
++    close: async () => {},
++  };
++
++  let onAudio: (audio: string, sampleRate: number) => void = () => {};
++  const speech: RealtimeSpeech = {
++    startRecognition: async () => {},
++    writeAudio: () => true,
++    commitRecognition: async () => '',
++    prewarm: () => {},
++    writeText: () => {},
++    finishSpeech: async () => {},
++    cancelSpeech: () => {},
++    abortRecognition: () => {},
++    close: () => {},
++  };
++
++  const conv = createConversation({
++    id: 'flow-1',
++    mode: 'fixture',
++    now: () => clock,
++    harness: (_event: (event: HarnessEvent) => void) => harness,
++    speech: (callbacks) => {
++      onAudio = callbacks.onAudio;
++      return speech;
++    },
 +  });
-+  afterEach(async () => {
-+    await rm(workDir, { recursive: true, force: true });
++  conv.attach((event) => events.push(event));
++  await conv.start();
++  await conv.handle({ type: 'text', turnId: 1, text: 'go' });
++
++  return {
++    conv,
++    events,
++    emitAudio: (ms) => onAudio(audioFrame(ms), SAMPLE_RATE),
++    setNow: (ms) => {
++      clock = ms;
++    },
++    audioSeqs: () =>
++      events.filter((e): e is Extract<RealtimeEvent, { type: 'audio' }> => e.type === 'audio').map((e) => e.seq),
++    diagCodes: () =>
++      events.filter((e): e is Extract<RealtimeEvent, { type: 'diagnostic' }> => e.type === 'diagnostic').map((e) => e.event.code),
++    diag: (code) =>
++      events
++        .filter((e): e is Extract<RealtimeEvent, { type: 'diagnostic' }> => e.type === 'diagnostic')
++        .map((e) => e.event)
++        .find((e) => e.code === code),
++  };
++}
++
++describe('server output flow control (issue 15)', () => {
++  it('forwards only within the unplayed window and releases more on playback_progress', async () => {
++    const r = await rig();
++    // Generate 20s of audio in 1s frames while the client has played nothing.
++    for (let i = 0; i < 20; i++) r.emitAudio(1000);
++    // At most the 12s window is forwarded up front; the rest is held.
++    expect(r.audioSeqs()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
++
++    // The client reports playing through seq 6 (6s): the window frees by 6s.
++    await r.conv.handle({ type: 'playback_progress', responseId: 1, seq: 6 });
++    expect(r.audioSeqs()).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
++
++    // Playing through the end releases everything.
++    await r.conv.handle({ type: 'playback_progress', responseId: 1, seq: 20 });
++    expect(r.audioSeqs()).toHaveLength(20);
 +  });
 +
-+  it('unknown create BEFORE session ID blocks across restart', async () => {
-+    const budgetFile = path.join(workDir, 'budget.json');
-+    const budget1 = new GptLiveBudget(budgetFile);
-+    await budget1.load();
-+    budget1.reserve('unknown-sess', 300);
-+    budget1.markCreationAttempted('unknown-sess');
-+    await budget1.save();
++  it('drains for an old client that never reports progress via the realtime time-based window', async () => {
++    const r = await rig();
++    for (let i = 0; i < 20; i++) r.emitAudio(1000);
++    expect(r.audioSeqs()).toHaveLength(12); // window-bounded at first
 +
-+    const budget2 = new GptLiveBudget(budgetFile);
-+    await budget2.load();
-+    budget2.reconcileOrphans();
++    // No progress ever arrives; realtime advances 6s. A pump (any progress ping,
++    // here the benign seq 0) applies the time-based estimate so delivery does not
++    // stall for an old client.
++    r.setNow(6000);
++    await r.conv.handle({ type: 'playback_progress', responseId: 1, seq: 0 });
++    expect(r.audioSeqs()).toHaveLength(18);
 +
-+    expect(budget2.hasUncertainClosure).toBe(true);
-+    expect(budget2.canReserve(60)).toBe(false);
++    r.setNow(20000);
++    await r.conv.handle({ type: 'playback_progress', responseId: 1, seq: 0 });
++    expect(r.audioSeqs()).toHaveLength(20);
 +  });
 +
-+  it('persist-failure latch blocks new sessions permanently', async () => {
-+    const budget = new GptLiveBudget('/dev/null/impossible.json');
++  it('truncates explicitly with a bufferedMs diagnostic when the outbox bound is exceeded', async () => {
++    const r = await rig();
++    // 15 frames of 10s each = 150s generated; the client plays nothing, so the
++    // held outbox exceeds the 120s bound and the response is truncated once.
++    for (let i = 0; i < 15; i++) r.emitAudio(10_000);
 +
-+    const validBudget = new GptLiveBudget(path.join(workDir, 'tmp.json'));
-+    await validBudget.load();
-+    (budget as any).ledger = (validBudget as any).ledger;
-+
-+    await expect(budget.save()).rejects.toThrow();
-+    expect(budget.saveFailed).toBe(true);
-+    expect(budget.hasUncertainClosure).toBe(true);
-+    expect(budget.canReserve(60)).toBe(false);
++    expect(r.diagCodes().filter((c) => c === 'output_truncated')).toHaveLength(1); // coalesced
++    const truncated = r.diag('output_truncated');
++    expect(truncated).toBeDefined();
++    expect(truncated!.bufferedMs).toBeGreaterThanOrEqual(100_000);
++    // Nothing beyond the bound was forwarded, and it was not dropped silently.
++    expect(r.conv.snapshot().response?.audioInterrupted).toBe(true);
 +  });
-+
-+  it('valid >300s actual usage is retained in finalize', async () => {
-+    const budget = new GptLiveBudget(path.join(workDir, 'budget.json'));
-+    await budget.load();
-+    budget.reserve('s', 300);
-+    budget.finalize('s', 500, true);
-+    expect(budget.cumulativeUsageUsd).toBeCloseTo((500 / 60) * 0.05, 6);
-+    expect(budget.hasUncertainClosure).toBe(false);
-+  });
-+
-+  it('corrupt ledger with negative cumulative is rejected', async () => {
-+    const budgetFile = path.join(workDir, 'budget.json');
-+    await writeFile(budgetFile, JSON.stringify({
-+      cumulativeUsageUsd: -1,
-+      reservations: [],
-+      lastUpdated: '',
-+    }), { mode: 0o600 });
-+
-+    const budget = new GptLiveBudget(budgetFile);
-+    await expect(budget.load()).rejects.toThrow();
-+  });
-+
-+  it('sideband socket error causes safe teardown with uncertain lockout', async () => {
-+    let sidebandHandler: ProviderEventHandler | null = null;
-+    const manager = await enabledManager(workDir, {
-+      onAttach: (h) => { sidebandHandler = h; },
-+    });
-+
-+    const callbacks = noopCallbacks();
-+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', callbacks);
-+    await new Promise(r => setTimeout(r, 50));
-+
-+    sidebandHandler!.onError('sideband_error', 'WebSocket closed');
-+
-+    await vi.waitFor(() => {
-+      expect(manager.hasActiveSession).toBe(false);
-+    }, { timeout: 20_000 });
-+
-+    expect(callbacks.onError).toHaveBeenCalled();
-+  }, 25_000);
-+
-+  it('no automatic paid POST retries — maxRetries:0 in provider constructor', async () => {
-+    const provider = createProvider();
-+    expect(provider).toBeDefined();
-+  });
-+
-+  it('sync-close race: closeSession is idempotent', async () => {
-+    const manager = await enabledManager(workDir);
-+    const { sessionId } = await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
-+
-+    // Concurrent close calls
-+    await Promise.all([
-+      manager.closeSession(sessionId, 'user_ended'),
-+      manager.closeSession(sessionId, 'deadline'),
-+    ]);
-+
-+    await vi.waitFor(() => {
-+      expect(manager.hasActiveSession).toBe(false);
-+    }, { timeout: 20_000 });
-+  }, 25_000);
 +});
+diff --git a/src/server/realtime/gating.test.ts b/src/server/realtime/gating.test.ts
+new file mode 100644
+index 0000000..2c9d796
+--- /dev/null
++++ b/src/server/realtime/gating.test.ts
+@@ -0,0 +1,242 @@
++import { describe, expect, it } from 'vitest';
++import { createConversation } from './session.js';
++import type { HarnessEvent } from '../../shared/contracts.js';
++import type {
++  RealtimeEvent,
++  RealtimeHarness,
++  RealtimeSpeech,
++  RetainedConversation,
++} from '../../shared/realtime.js';
 +
-+// ============================================================================
-+// PRIORITY 5: Scope/credentials/cleanup
-+// ============================================================================
-+describe('contract: scope, credentials, cleanup', () => {
-+  let workDir: string;
++// Deterministic coordinator tests for issue-15 narration gating. A hand-driven
++// fake harness and fake speech adapter (no network, no CLI, no timers) let us
++// order streamed text, tool starts, onResult and send resolution exactly and
++// assert precisely what is synthesized.
 +
-+  beforeEach(async () => {
-+    workDir = tmpDir();
-+    await mkdir(workDir, { recursive: true });
++interface Fakes {
++  conv: RetainedConversation;
++  events: RealtimeEvent[];
++  emit(event: HarnessEvent): void;
++  result(text: string): void;
++  resolveSend(): void;
++  rejectSend(): void;
++  interruptCalls: number;
++  speech: {
++    writes: string[];
++    finishCount: number;
++    prewarmCount: number;
++    cancelCount: number;
++  };
++  synthesized(): string;
++}
++
++function setup(): Fakes {
++  const events: RealtimeEvent[] = [];
++  let onEvent: (event: HarnessEvent) => void = () => {};
++  let onResult: ((text: string) => void) | undefined;
++  let resolveSend!: () => void;
++  let rejectSend!: () => void;
++  let interruptCalls = 0;
++
++  const harness: RealtimeHarness = {
++    start: async () => {},
++    send: () =>
++      new Promise<void>((resolve, reject) => {
++        resolveSend = resolve;
++        rejectSend = () => reject(new Error('send_failed'));
++      }),
++    interrupt: async () => {
++      interruptCalls += 1;
++    },
++    close: async () => {},
++  };
++
++  const writes: string[] = [];
++  let finishCount = 0;
++  let prewarmCount = 0;
++  let cancelCount = 0;
++  let onAudio: (audio: string, sampleRate: number) => void = () => {};
++  // Text written since the last finishSpeech; a finish "synthesizes" it as one
++  // audio frame (base64 of the utf8 text) so the coordinator emits observable
++  // audio without a real provider.
++  let buffer = '';
++
++  const speech: RealtimeSpeech = {
++    startRecognition: async () => {},
++    writeAudio: () => true,
++    commitRecognition: async () => '',
++    prewarm: () => {
++      prewarmCount += 1;
++    },
++    writeText: (text: string) => {
++      writes.push(text);
++      buffer += text;
++    },
++    finishSpeech: async () => {
++      finishCount += 1;
++      if (buffer) {
++        onAudio(Buffer.from(buffer, 'utf8').toString('base64'), 24000);
++        buffer = '';
++      }
++    },
++    cancelSpeech: () => {
++      cancelCount += 1;
++      buffer = '';
++    },
++    abortRecognition: () => {},
++    close: () => {},
++  };
++
++  const conv = createConversation({
++    id: 'gate-1',
++    mode: 'fixture',
++    harness: (event, result) => {
++      onEvent = event;
++      onResult = result;
++      return harness;
++    },
++    speech: (callbacks) => {
++      onAudio = callbacks.onAudio;
++      return speech;
++    },
 +  });
-+  afterEach(async () => {
-+    await rm(workDir, { recursive: true, force: true });
++  conv.attach((event) => events.push(event));
++
++  return {
++    conv,
++    events,
++    emit: (event) => onEvent(event),
++    result: (text) => onResult?.(text),
++    resolveSend: () => resolveSend(),
++    rejectSend: () => rejectSend(),
++    get interruptCalls() {
++      return interruptCalls;
++    },
++    speech: {
++      writes,
++      get finishCount() {
++        return finishCount;
++      },
++      get prewarmCount() {
++        return prewarmCount;
++      },
++      get cancelCount() {
++        return cancelCount;
++      },
++    },
++    synthesized: () =>
++      events
++        .filter((e): e is Extract<RealtimeEvent, { type: 'audio' }> => e.type === 'audio')
++        .map((e) => Buffer.from(e.audio, 'base64').toString('utf8'))
++        .join(''),
++  };
++}
++
++/**
++ * Flush microtasks until the response settles. Everything in these fakes is
++ * timer-free (promises resolve on microtasks), so the inference chain completes
++ * within a bounded number of `await` ticks — no real or virtual clock needed.
++ */
++async function settle(events: RealtimeEvent[]): Promise<void> {
++  for (let i = 0; i < 100; i++) {
++    if (events.some((e) => e.type === 'response_done' || e.type === 'response_cancelled')) return;
++    await Promise.resolve();
++  }
++}
++
++const diagCodes = (events: RealtimeEvent[]): string[] =>
++  events
++    .filter((e): e is Extract<RealtimeEvent, { type: 'diagnostic' }> => e.type === 'diagnostic')
++    .map((e) => e.event.code);
++
++describe('coordinator narration gating (issue 15)', () => {
++  it('speaks the preamble, gates narration once a tool starts, then speaks only the final answer', async () => {
++    const f = setup();
++    await f.conv.start();
++    const turn = f.conv.handle({ type: 'text', turnId: 1, text: 'go' });
++    // Pre-tool narration is synthesized for fast first audio.
++    f.emit({ type: 'text', text: 'Let me look that up. ' });
++    // Tool starts: further streamed narration is gated and the preamble stream
++    // is ended right away.
++    f.emit({ type: 'tool', name: 'WebSearch', status: 'running', callId: 'c1' });
++    f.emit({ type: 'text', text: 'The answer is 42.' }); // post-tool narration — gated
++    f.result('The answer is 42.');
++    f.resolveSend();
++    await turn;
++    await settle(f.events);
++
++    // Only the preamble and the concise final answer were synthesized; the gated
++    // streamed copy of the answer was not spoken twice.
++    expect(f.speech.writes).toEqual(['Let me look that up. ', 'The answer is 42.']);
++    expect(f.synthesized()).toBe('Let me look that up. The answer is 42.');
++    // The preamble stream was ended at the tool, and a fresh stream flushed the final.
++    expect(f.speech.finishCount).toBe(2);
++    expect(f.speech.prewarmCount).toBe(1);
++    // Transcript keeps ALL text, including the gated copy.
++    const texts = f.events.filter((e) => e.type === 'text');
++    expect(texts).toHaveLength(2);
++    const codes = diagCodes(f.events);
++    expect(codes).toContain('speech_gated');
++    expect(codes).toContain('final_answer_synthesized');
 +  });
 +
-+  it('diagnostics never expose server credentials or SDP answers', async () => {
-+    const manager = await enabledManager(workDir);
-+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++  it('leaves a no-tool turn on the existing streaming path (no gating, no re-speak)', async () => {
++    const f = setup();
++    await f.conv.start();
++    const turn = f.conv.handle({ type: 'text', turnId: 1, text: 'go' });
++    f.emit({ type: 'text', text: 'Simple direct answer.' });
++    f.result('Simple direct answer.');
++    f.resolveSend();
++    await turn;
++    await settle(f.events);
 +
-+    const diag = manager.getDiagnostics();
-+    const serialized = JSON.stringify(diag);
-+    // Server credentials (API key, SDP offer/answer) must not appear
-+    expect(serialized).not.toContain('sk-test-contract-key');
-+    expect(serialized).not.toMatch(/\banswerSdp\b/);
-+    expect(serialized).not.toMatch(/\bofferSdp\b/);
-+    expect(serialized).not.toMatch(/\bapi[Kk]ey\b/);
-+
-+    await manager.shutdown();
++    // Streamed once, never re-synthesized from onResult.
++    expect(f.speech.writes).toEqual(['Simple direct answer.']);
++    expect(f.speech.finishCount).toBe(1);
++    const codes = diagCodes(f.events);
++    expect(codes).not.toContain('speech_gated');
++    expect(codes).not.toContain('final_answer_synthesized');
 +  });
 +
-+  it('transcript entries are bounded to MAX_TRANSCRIPT_ENTRIES', async () => {
-+    const manager = await enabledManager(workDir);
-+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
++  it('tolerates an absent onResult after tools: says nothing more and reports it', async () => {
++    const f = setup();
++    await f.conv.start();
++    const turn = f.conv.handle({ type: 'text', turnId: 1, text: 'go' });
++    f.emit({ type: 'text', text: 'Working on it. ' });
++    f.emit({ type: 'tool', name: 'WebSearch', status: 'running', callId: 'c1' });
++    f.emit({ type: 'text', text: 'silent result' }); // gated
++    // No onResult delivered at all.
++    f.resolveSend();
++    await turn;
++    await settle(f.events);
 +
-+    for (let i = 0; i < 600; i++) {
-+      manager.handleInputTranscript(`msg-${i}`);
++    expect(f.speech.writes).toEqual(['Working on it. ']); // only the preamble
++    expect(f.synthesized()).toBe('Working on it. ');
++    // Reported rather than re-speaking the narration.
++    expect(diagCodes(f.events)).toContain('final_answer_synthesized');
++  });
++
++  it('interrupt during the tool wait cancels both epochs and never speaks the late final', async () => {
++    const f = setup();
++    await f.conv.start();
++    const turn = f.conv.handle({ type: 'text', turnId: 1, text: 'go' });
++    f.emit({ type: 'text', text: 'Let me check. ' });
++    f.emit({ type: 'tool', name: 'WebSearch', status: 'running', callId: 'c1' });
++
++    // Barge-in while the tool is still running (send is pending).
++    await f.conv.handle({ type: 'interrupt', responseId: 1 });
++    expect(f.interruptCalls).toBe(1);
++    expect(f.speech.cancelCount).toBeGreaterThanOrEqual(1);
++
++    // A late final result and the eventual send resolution must not synthesize.
++    f.result('Late final answer.');
++    f.resolveSend();
++    await turn;
++    await settle(f.events);
++
++    expect(f.speech.writes).not.toContain('Late final answer.');
++    expect(f.synthesized()).not.toContain('Late final answer.');
++    expect(f.events.some((e) => e.type === 'response_cancelled')).toBe(true);
++    expect(f.events.some((e) => e.type === 'response_done')).toBe(false);
++  });
++});
+diff --git a/src/server/realtime/session.test.ts b/src/server/realtime/session.test.ts
+index 133f735..bd496f8 100644
+--- a/src/server/realtime/session.test.ts
++++ b/src/server/realtime/session.test.ts
+@@ -70,6 +70,7 @@ async function build(options: BuildOptions = {}): Promise<Built> {
+             startRecognition: () => s.startRecognition(),
+             writeAudio: (pcm) => s.acceptAudio!(pcm),
+             commitRecognition: () => s.commitRecognition(),
++            prewarm: () => s.prewarm(),
+             writeText: (text) => s.writeText(text),
+             finishSpeech: () => s.finishSpeech(),
+             close: () => s.close(),
+@@ -404,11 +405,16 @@ describe('createConversation — detach / attach recovery', () => {
+     await b.conv.handle({ type: 'text', turnId: 1, text: 'slow one' });
+     await vi.waitFor(() => expect(only(b.events, 'text')).not.toHaveLength(0));
+     b.conv.detach();
++    // Whatever audio was emitted while attached is legitimately heard; the fence
++    // is that NO further audio is synthesized once the sink is gone.
++    const audioAtDetach = only(b.events, 'audio').length;
+ 
+     await vi.waitFor(() => expect(b.conv.snapshot().response?.finished).toBe(true), { timeout: 2000 });
+     const snap = b.conv.snapshot();
+     expect(snap.response?.audioInterrupted).toBe(true);
+-    expect(snap.response?.lastAudioSeq).toBe(0);
++    // No unheard audio was produced after detach.
++    expect(only(b.events, 'audio').length).toBe(audioAtDetach);
++    expect(snap.response?.lastAudioSeq).toBe(audioAtDetach);
+     expect(snap.messages.some((m) => m.role === 'assistant' && m.text === 'Hello café 🌊 world')).toBe(true);
+   });
+ 
+diff --git a/src/server/realtime/session.ts b/src/server/realtime/session.ts
+index 3dd0ef5..d248065 100644
+--- a/src/server/realtime/session.ts
++++ b/src/server/realtime/session.ts
+@@ -20,6 +20,37 @@ const MAX_INPUT_BYTES = PCM_RATE * 2 * 120;
+ const MAX_MESSAGES = 200;
+ const FINGERPRINT_WINDOW = 256;
+ 
++// Consumption-based output flow control (issue 15, section 3, bullet 3).
++// The server forwards audio to the client only while the client's unplayed
++// window is below OUTPUT_WINDOW_MS, releasing more as playback_progress (or, for
++// old clients that never report, the realtime time-based estimate) advances.
++// The per-response outbox of generated-but-unforwarded audio is bounded; past
++// the bound the response is explicitly truncated with a diagnostic, never
++// dropped silently.
++const OUTPUT_WINDOW_MS = 12_000;
++const OUTBOX_BOUND_MS = 120_000;
++// Poll cadence for the time-based fallback so an old client (no progress) still
++// drains instead of stalling once the window fills.
++const OUTBOX_DRAIN_POLL_MS = 250;
++
++/** Byte length of a base64 payload without decoding it. */
++function base64ByteLength(b64: string): number {
++  const len = b64.length;
++  if (len === 0) return 0;
++  let padding = 0;
++  if (b64.charCodeAt(len - 1) === 61) padding = b64.charCodeAt(len - 2) === 61 ? 2 : 1;
++  return Math.max(0, (len * 3) / 4 - padding);
++}
++
++/** Milliseconds of mono PCM16 audio carried by a base64 frame at `sampleRate`. */
++function pcm16DurationMs(audioBase64: string, sampleRate: number): number {
++  if (sampleRate <= 0) return 0;
++  const samples = Math.floor(base64ByteLength(audioBase64) / 2);
++  return (samples / sampleRate) * 1000;
++}
++
++interface OutboxFrame { seq: number; audio: string; sampleRate: number; ms: number }
++
+ type InputStatus = 'recording' | 'committing' | 'committed' | 'aborted' | 'failed';
+ 
+ interface ActiveInput {
+@@ -43,6 +74,36 @@ interface ActiveResponse {
+   inferenceActive: boolean;
+   awaitingPlayback: boolean;
+   assistantIndex: number | undefined;
++  /** A tool has started in this turn: streamed narration is no longer spoken. */
++  toolStarted: boolean;
++  /** Pre-tool narration has been written to an open synthesis stream. */
++  narrationOpen: boolean;
++  /** The speech_gated diagnostic has been recorded once for this turn. */
++  gatedNarration: boolean;
++  /** Concise final answer text delivered via onResult (spoken after tools). */
++  finalText: string | undefined;
++  /** In-flight end-of-sequence of the preamble stream, awaited before the final. */
++  preambleFinish: Promise<void> | undefined;
++  // --- output flow control --------------------------------------------------
++  /** Generated-but-not-yet-forwarded audio frames (the bounded outbox). */
++  outbox: OutboxFrame[];
++  /** Milliseconds of audio currently held in the outbox. */
++  outboxMs: number;
++  /** Cumulative generated ms indexed by audio sequence (for progress math). */
++  seqMs: Map<number, number>;
++  /** Total generated ms, and total forwarded ms/seq to the client. */
++  generatedMs: number;
++  forwardedMs: number;
++  forwardedSeq: number;
++  /** Highest played seq and its cumulative ms as reported via playback_progress. */
++  playedSeq: number;
++  playedMsReported: number;
++  /** Wall-clock at first forward, for the old-client time-based fallback. */
++  firstForwardAt: number | undefined;
++  /** The outbox bound was exceeded: the response is explicitly truncated. */
++  truncated: boolean;
++  /** Timer re-driving the time-based drain while a backlog remains. */
++  drainTimer: ReturnType<typeof setTimeout> | undefined;
+ }
+ 
+ /** Cheap order-sensitive checksum used only to spot conflicting duplicate frames. */
+@@ -104,7 +165,10 @@ class Conversation implements RetainedConversation {
+     if (this.startPromise) return this.startPromise;
+     if (this.closed) return Promise.reject(new Error('Conversation is closed.'));
+ 
+-    this.harness = this.options.harness((event) => this.onHarness(event));
++    this.harness = this.options.harness(
++      (event) => this.onHarness(event),
++      (text) => this.onResult(text),
++    );
+     if (this.options.speech) {
+       this.speech = this.options.speech({
+         onPartial: (text) => this.onPartial(text),
+@@ -155,6 +219,7 @@ class Conversation implements RetainedConversation {
+     if (this.closePromise) return this.closePromise;
+     this.closed = true;
+     this.phase = 'closed';
++    if (this.response) this.clearDrain(this.response);
+     this.recordDiagnostic({ source: 'server', code: 'session_closed' });
+     this.closePromise = (async () => {
+       try {
+@@ -203,6 +268,9 @@ class Conversation implements RetainedConversation {
+         case 'playback_done':
+           this.onPlaybackDone(command.responseId, command.skipped === true);
+           return;
++        case 'playback_progress':
++          this.onPlaybackProgress(command.responseId, command.seq);
++          return;
+         case 'end':
+           await this.close();
+           return;
+@@ -446,6 +514,22 @@ class Conversation implements RetainedConversation {
+       inferenceActive: true,
+       awaitingPlayback: false,
+       assistantIndex: undefined,
++      toolStarted: false,
++      narrationOpen: false,
++      gatedNarration: false,
++      finalText: undefined,
++      preambleFinish: undefined,
++      outbox: [],
++      outboxMs: 0,
++      seqMs: new Map(),
++      generatedMs: 0,
++      forwardedMs: 0,
++      forwardedSeq: 0,
++      playedSeq: 0,
++      playedMsReported: 0,
++      firstForwardAt: undefined,
++      truncated: false,
++      drainTimer: undefined,
+     };
+     // A response created while detached has no audience for TTS; suppress it up
+     // front so we never synthesize unheard audio.
+@@ -454,6 +538,16 @@ class Conversation implements RetainedConversation {
+     this.input = undefined;
+     this.setPhase('thinking');
+     this.recordDiagnostic({ source: 'server', code: 'turn_start', turnId, responseId: response.responseId });
++    // Pre-open the TTS socket in parallel with inference so first audio is fast.
++    // The adapter fences the open on its own synthesis epoch, so a cancellation
++    // cannot leak a late-opened socket into a replacement turn.
++    if (this.speech && !response.ttsSuppressed) {
++      try {
++        this.speech.prewarm?.();
++      } catch {
++        /* prewarm is best-effort latency; never fail the turn on it */
++      }
++    }
+     this.inference = this.runInference(response, text);
+   }
+ 
+@@ -479,11 +573,43 @@ class Conversation implements RetainedConversation {
+ 
+     // Flush and await final TTS unless output was suppressed (detached / no audience).
+     if (this.speech && !response.ttsSuppressed) {
+-      try {
+-        await this.speech.finishSpeech();
+-      } catch {
+-        if (response.cancelled || this.closed) return;
+-        response.audioInterrupted = true;
++      // A tool ended the preamble stream mid-turn; let that finalize (its audio
++      // has already streamed) before opening a fresh stream for the final answer.
++      if (response.preambleFinish) {
++        try {
++          await response.preambleFinish;
++        } catch {
++          /* preamble finalize faults are already reflected on the response */
++        }
++        response.preambleFinish = undefined;
++      }
++      if (response.cancelled || this.closed) return;
++
++      if (response.toolStarted) {
++        // Tools ran: speak only the concise final answer delivered via onResult,
++        // never the gated preamble/interim narration.
++        if (response.finalText) {
++          try {
++            this.speech.writeText(response.finalText);
++            await this.speech.finishSpeech();
++            this.recordDiagnostic({ source: 'server', code: 'final_answer_synthesized', turnId: response.turnId, responseId: response.responseId });
++          } catch {
++            if (response.cancelled || this.closed) return;
++            response.audioInterrupted = true;
++          }
++        } else {
++          // No concise final text: say nothing more and report it rather than
++          // re-speaking the narration.
++          this.recordDiagnostic({ source: 'server', code: 'final_answer_synthesized', turnId: response.turnId, responseId: response.responseId, count: 0 });
++        }
++      } else {
++        // No tools ran: flush the streamed narration and await its final audio.
++        try {
++          await this.speech.finishSpeech();
++        } catch {
++          if (response.cancelled || this.closed) return;
++          response.audioInterrupted = true;
++        }
+       }
+     }
+     if (response.cancelled || this.closed) return;
+@@ -510,6 +636,7 @@ class Conversation implements RetainedConversation {
+     if (response.cancelled) return;
+     response.cancelled = true;
+     response.audioInterrupted = true;
++    this.clearDrain(response);
+     this.setPhase('interrupting');
+     this.recordDiagnostic({ source: 'server', code: 'interruption', responseId, turnId: response.turnId });
+ 
+@@ -543,10 +670,18 @@ class Conversation implements RetainedConversation {
+     if (!this.closed) this.setPhase('idle');
+   }
+ 
++  private clearDrain(response: ActiveResponse): void {
++    if (response.drainTimer) {
++      clearTimeout(response.drainTimer);
++      response.drainTimer = undefined;
++    }
++  }
++
+   private onPlaybackDone(responseId: number, skipped: boolean): void {
+     const response = this.response;
+     if (!response || response.responseId !== responseId || !response.awaitingPlayback) return;
+     response.awaitingPlayback = false;
++    this.clearDrain(response);
+     if (skipped) response.audioInterrupted = true;
+     if (!this.closed && this.phase === 'speaking') this.setPhase('idle');
+   }
+@@ -564,12 +699,24 @@ class Conversation implements RetainedConversation {
+         if (!response || !response.inferenceActive || response.cancelled) return;
+         this.appendAssistant(response, event.text);
+         this.emit({ type: 'text', turnId: response.turnId, responseId: response.responseId, text: event.text });
++        // Speak only what a listener wants to hear: stream pre-tool narration for
++        // fast first audio, but once a tool has started keep the text in the
++        // transcript only and stop feeding synthesis (the concise final answer is
++        // spoken later via onResult).
+         if (this.speech && !response.ttsSuppressed) {
+-          try {
+-            this.speech.writeText(event.text);
+-          } catch {
+-            response.audioInterrupted = true;
+-            this.emitNotice('tts_error', 'Speech output failed for this response.');
++          if (response.toolStarted) {
++            if (!response.gatedNarration) {
++              response.gatedNarration = true;
++              this.recordDiagnostic({ source: 'server', code: 'speech_gated', turnId: response.turnId, responseId: response.responseId });
++            }
++          } else {
++            try {
++              this.speech.writeText(event.text);
++              response.narrationOpen = true;
++            } catch {
++              response.audioInterrupted = true;
++              this.emitNotice('tts_error', 'Speech output failed for this response.');
++            }
+           }
+         }
+         return;
+@@ -582,6 +729,22 @@ class Conversation implements RetainedConversation {
+         this.recordDiagnostic({ source: 'server', code: event.status === 'running' ? 'tool_start' : 'tool_result',
+           callId: event.callId, tool: event.name, status: event.status, durationMs: event.durationMs,
+           reason: event.reason, statusCode: event.statusCode, turnId: response.turnId, responseId: response.responseId });
++        if (event.status === 'running' && !response.toolStarted) {
++          response.toolStarted = true;
++          // End (end-of-sequence) the open preamble stream right away rather than
++          // leaving it open and idle across the tool wait; its audio has already
++          // been streamed. A fresh stream is opened lazily for the final answer.
++          if (this.speech && !response.ttsSuppressed && response.narrationOpen && !response.preambleFinish) {
++            response.narrationOpen = false;
++            try {
++              response.preambleFinish = this.speech.finishSpeech().catch(() => {
++                response.audioInterrupted = true;
++              });
++            } catch {
++              /* best-effort; a fresh stream still serves the final answer */
++            }
++          }
++        }
+         return;
+       }
+       case 'result': {
+@@ -610,22 +773,102 @@ class Conversation implements RetainedConversation {
+     }
+   }
+ 
++  /**
++   * The final assistant text of a turn (text after the last tool call). Captured
++   * on the active response so runInference can speak the concise answer once
++   * tools have run. Tolerated as absent — main wires it optionally.
++   */
++  private onResult(text: string): void {
++    if (this.closed) return;
++    const response = this.response;
++    if (!response || response.cancelled) return;
++    const trimmed = text.trim();
++    if (trimmed) response.finalText = trimmed;
++  }
++
+   private onAudio(audio: string, sampleRate: number): void {
+     if (this.closed) return;
+     const response = this.response;
+     // Epoch fence: drop audio for a cancelled/suppressed or superseded response.
+-    if (!response || response.cancelled || response.ttsSuppressed || response.finished) return;
++    if (!response || response.cancelled || response.ttsSuppressed) return;
++    // Once explicitly truncated, stop accepting further generated audio.
++    if (response.truncated) return;
++
++    const ms = pcm16DurationMs(audio, sampleRate);
++    // Bound the per-response outbox: if generation has outrun consumption past
++    // the bound, truncate explicitly with a diagnostic rather than buffering
++    // without limit or dropping silently. Coalesced to one record per response.
++    if (response.outboxMs + ms > OUTBOX_BOUND_MS) {
++      response.truncated = true;
++      response.audioInterrupted = true;
++      this.recordDiagnostic({ source: 'server', code: 'output_truncated', turnId: response.turnId, responseId: response.responseId, bufferedMs: Math.round(response.outboxMs) });
++      return;
 +    }
 +
-+    const diag = manager.getDiagnostics();
-+    expect(diag.transcript.length).toBeLessThanOrEqual(500);
+     const seq = ++response.audioSeq;
+     response.lastAudioSeq = seq;
+     if (this.phase === 'thinking') this.setPhase('speaking');
+-    this.emit({
+-      type: 'audio',
+-      turnId: response.turnId,
+-      responseId: response.responseId,
+-      seq,
+-      audio,
+-      sampleRate,
+-    });
++    response.generatedMs += ms;
++    response.seqMs.set(seq, response.generatedMs);
++    response.outbox.push({ seq, audio, sampleRate, ms });
++    response.outboxMs += ms;
++    this.pumpOutbox(response);
++  }
 +
-+    await manager.shutdown();
-+  });
++  /** Highest played ms: the max of reported progress and the realtime estimate. */
++  private playedMs(response: ActiveResponse): number {
++    const byProgress = response.playedMsReported;
++    const byTime = response.firstForwardAt === undefined ? 0 : Math.min(response.forwardedMs, this.now() - response.firstForwardAt);
++    return Math.max(byProgress, byTime);
++  }
 +
-+  it('getSessionOwnerId returns owner for active and recently-closed sessions', async () => {
-+    let sidebandHandler: ProviderEventHandler | null = null;
-+    const manager = await enabledManager(workDir, {
-+      onAttach: (h) => { sidebandHandler = h; },
-+    });
++  /**
++   * Forward outbox frames while the client's unplayed window is below the
++   * threshold, then re-arm the time-based drain if a backlog remains so an old
++   * client that never reports progress still drains instead of stalling.
++   */
++  private pumpOutbox(response: ActiveResponse): void {
++    if (this.closed || response.cancelled || response.ttsSuppressed) return;
++    const played = this.playedMs(response);
++    while (response.outbox.length > 0 && response.forwardedMs - played < OUTPUT_WINDOW_MS) {
++      const frame = response.outbox.shift() as OutboxFrame;
++      response.outboxMs = Math.max(0, response.outboxMs - frame.ms);
++      if (response.firstForwardAt === undefined) response.firstForwardAt = this.now();
++      response.forwardedMs += frame.ms;
++      response.forwardedSeq = frame.seq;
++      this.emit({ type: 'audio', turnId: response.turnId, responseId: response.responseId, seq: frame.seq, audio: frame.audio, sampleRate: frame.sampleRate });
++    }
++    this.scheduleOutboxDrain(response);
++  }
 +
-+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
-+    expect(manager.getSessionOwnerId()).toBe('owner-1');
++  private scheduleOutboxDrain(response: ActiveResponse): void {
++    if (response.drainTimer) {
++      clearTimeout(response.drainTimer);
++      response.drainTimer = undefined;
++    }
++    if (this.closed || response.cancelled || response.outbox.length === 0) return;
++    response.drainTimer = setTimeout(() => {
++      response.drainTimer = undefined;
++      if (this.closed || this.response !== response || response.cancelled) return;
++      this.pumpOutbox(response);
++    }, OUTBOX_DRAIN_POLL_MS);
++    (response.drainTimer as { unref?: () => void }).unref?.();
++  }
 +
-+    sidebandHandler!.onSessionClosed('done', { seconds: 5 });
-+    await new Promise(r => setTimeout(r, 50));
++  private onPlaybackProgress(responseId: number, seq: number): void {
++    const response = this.response;
++    if (!response || response.responseId !== responseId) return;
++    if (seq > response.playedSeq) {
++      response.playedSeq = seq;
++      const cumulative = response.seqMs.get(seq);
++      if (cumulative !== undefined) response.playedMsReported = cumulative;
++      // Bound retention: sequence→ms entries at or below the played mark are no
++      // longer needed for the window math.
++      for (const key of response.seqMs.keys()) {
++        if (key < seq) response.seqMs.delete(key);
++      }
++    }
++    this.pumpOutbox(response);
+   }
+ 
+   private onSpeechError(message: string): void {
+diff --git a/src/server/speech/fixtures/eleven-labs.ts b/src/server/speech/fixtures/eleven-labs.ts
+index 2f557d9..db168a0 100644
+--- a/src/server/speech/fixtures/eleven-labs.ts
++++ b/src/server/speech/fixtures/eleven-labs.ts
+@@ -39,6 +39,10 @@ export interface Fixture {
+   close(): Promise<void>;
+   /** Tokens observed on incoming connections, to assert they are forwarded. */
+   readonly seenTokens: string[];
++  /** Raw JSON frames received on TTS sockets, to assert keepalive/flush shapes. */
++  readonly ttsFrames: string[];
++  /** Count of TTS sockets opened, to assert prewarm/reopen behaviour. */
++  readonly ttsConnections: () => number;
+ }
+ 
+ function send(ws: WebSocket, payload: unknown): void {
+@@ -47,6 +51,8 @@ function send(ws: WebSocket, payload: unknown): void {
+ 
+ export async function startFixture(options: FixtureOptions = {}): Promise<Fixture> {
+   const seenTokens: string[] = [];
++  const ttsFrames: string[] = [];
++  let ttsConnections = 0;
+   const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+   await new Promise<void>((resolve) => server.once('listening', resolve));
+   const { port } = server.address() as AddressInfo;
+@@ -57,13 +63,19 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
+     if (token) seenTokens.push(token);
+ 
+     if (url.pathname.startsWith('/stt')) handleStt(ws, options);
+-    else handleTts(ws, options);
++    else {
++      ttsConnections += 1;
++      ws.on('message', (data) => ttsFrames.push(data.toString()));
++      handleTts(ws, options);
++    }
+   });
+ 
+   return {
+     sttEndpoint: `ws://127.0.0.1:${port}/stt?model_id=scribe_v2_realtime&commit_strategy=manual`,
+     ttsEndpoint: `ws://127.0.0.1:${port}/tts/{voiceId}/stream-input?model_id=eleven_flash_v2_5`,
+     seenTokens,
++    ttsFrames,
++    ttsConnections: () => ttsConnections,
+     close(): Promise<void> {
+       return new Promise((resolve, reject) => {
+         for (const client of server.clients) client.terminate();
+diff --git a/src/server/speech/index.ts b/src/server/speech/index.ts
+index 4feb4ba..9a87f25 100644
+--- a/src/server/speech/index.ts
++++ b/src/server/speech/index.ts
+@@ -10,6 +10,7 @@ import {
+   sttChunkFrame,
+   sttCommitFrame,
+   ttsFlushFrame,
++  ttsForceFlushFrame,
+   ttsInitFrame,
+   ttsTextFrame,
+   withSttToken,
+@@ -172,7 +173,7 @@ function rawToString(data: RawData): string {
+   return Buffer.from(data as ArrayBuffer).toString('utf8');
+ }
+ 
+-export function createSpeech(options: SpeechOptions, tuning: SpeechTuning = {}): SpeechSession {
++export function createSpeech(options: SpeechOptions, tuning: SpeechTuning = {}): SpeechSession & { prewarm(): void } {
+   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+   const sttEndpoint = options.endpoints?.stt ?? DEFAULT_STT_ENDPOINT;
+   const ttsEndpoint = options.endpoints?.tts ?? DEFAULT_TTS_ENDPOINT;
+@@ -399,9 +400,17 @@ export function createSpeech(options: SpeechOptions, tuning: SpeechTuning = {}):
+     if (tts || ttsStarting) return;
+     const generation = ttsGeneration;
+     const socket = new SpeechSocket(handleTtsFrame, (message) => {
++      // A warm-but-idle socket dropped by the provider's inactivity timeout (a
++      // clean close while we are not finalizing) is NOT a synthesis error: the
++      // next writeText reopens lazily. Only surface real failures.
++      const idleClose = message === 'speech_socket_closed' && !pendingFinish;
++      if (tts === socket) teardownTts();
++      if (idleClose) {
++        emitDiagnostic({ source: 'speech', code: 'tts_idle_closed' });
++        return;
++      }
+       settleFinish(new Error(message));
+       options.onError(message);
+-      if (tts === socket) teardownTts();
+     });
+     tts = socket;
+     socket.send(ttsInitFrame());
+@@ -427,6 +436,19 @@ export function createSpeech(options: SpeechOptions, tuning: SpeechTuning = {}):
+     });
+   };
+ 
++  /**
++   * Pre-open the TTS stream-input socket (token fetch + websocket open) so the
++   * first synthesized audio arrives sooner. Idempotent within a turn (a second
++   * call while a socket is open/opening is a no-op) and fenced by the synthesis
++   * epoch, so a cancel that races the open drops the orphaned socket.
++   */
++  const prewarm = (): void => {
++    if (closed || tts || ttsStarting) return;
++    ttsFirstAudio = false;
++    ensureTts();
++    emitDiagnostic({ source: 'speech', code: 'tts_prewarmed' });
++  };
 +
-+    expect(manager.hasActiveSession).toBe(false);
-+    expect(manager.getSessionOwnerId()).toBe('owner-1');
-+  });
+   const writeText = (text: string): void => {
+     if (closed || !text) return;
+     if (!tts && !ttsStarting) ttsFirstAudio = false;
+@@ -435,9 +457,14 @@ export function createSpeech(options: SpeechOptions, tuning: SpeechTuning = {}):
+     let end = textBuffer.length;
+     while (end > 0 && !/\s/.test(textBuffer[end - 1])) end--;
+     if (!end) return;
++    const chunk = textBuffer.slice(0, end);
+     ensureTts();
+-    tts?.send(ttsTextFrame(textBuffer.slice(0, end)));
++    tts?.send(ttsTextFrame(chunk));
+     textBuffer = textBuffer.slice(end);
++    // Force generation at a sentence boundary so a short first sentence is
++    // synthesized immediately instead of waiting for the provider's buffer
++    // threshold. Only whole sentences flush; mid-sentence fragments do not.
++    if (/[.!?…][)\]"'”’]*\s*$/.test(chunk)) tts?.send(ttsForceFlushFrame());
+     // Real text resets the idle window; re-arm so the next tool wait is covered.
+     armTtsKeepAlive();
+   };
+@@ -500,6 +527,7 @@ export function createSpeech(options: SpeechOptions, tuning: SpeechTuning = {}):
+     abortRecognition,
+     cancelSpeech,
+     commitRecognition,
++    prewarm,
+     writeText,
+     finishSpeech,
+     close,
+diff --git a/src/server/speech/protocol.ts b/src/server/speech/protocol.ts
+index 28ea5b9..0936e32 100644
+--- a/src/server/speech/protocol.ts
++++ b/src/server/speech/protocol.ts
+@@ -15,9 +15,13 @@ export const DEFAULT_STT_ENDPOINT =
+   'wss://api.elevenlabs.io/v1/speech-to-text/realtime' +
+   '?model_id=scribe_v2_realtime&audio_format=pcm_16000&commit_strategy=manual';
+ 
++// `inactivity_timeout` (documented, max 180 s) keeps the stream-input socket
++// open across a long tool wait so a warm socket survives instead of being
++// dropped at the 20 s default; we pin the documented maximum.
++export const TTS_INACTIVITY_TIMEOUT_SECONDS = 180;
+ export const DEFAULT_TTS_ENDPOINT =
+   'wss://api.elevenlabs.io/v1/text-to-speech/{voiceId}/stream-input' +
+-  '?model_id=eleven_flash_v2_5&output_format=pcm_24000';
++  `?model_id=eleven_flash_v2_5&output_format=pcm_24000&inactivity_timeout=${TTS_INACTIVITY_TIMEOUT_SECONDS}`;
+ 
+ export const TTS_SAMPLE_RATE = 24000;
+ export const STT_SAMPLE_RATE = 16000;
+@@ -105,11 +109,20 @@ export function ttsTextFrame(text: string): string {
+   return JSON.stringify({ text });
+ }
+ 
+-/** Empty text is the documented end-of-input signal; flush alone keeps the stream open. */
++/** Empty text is the documented end-of-input signal (EOS): it closes generation. */
+ export function ttsFlushFrame(): string {
+   return JSON.stringify({ text: '' });
+ }
+ 
++/**
++ * Force generation of already-buffered text without ending the stream. The
++ * documented `flush` flag (paired with empty text) makes a short first sentence
++ * synthesize immediately instead of waiting for the provider's buffer threshold.
++ */
++export function ttsForceFlushFrame(): string {
++  return JSON.stringify({ text: '', flush: true });
++}
 +
-+  it('default/trial mode exclusion: hasActiveSession blocks default WebSocket', async () => {
-+    const manager = await enabledManager(workDir);
-+    await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
-+
-+    expect(manager.hasActiveSession).toBe(true);
-+
-+    await manager.shutdown();
-+  });
-+
-+  it('no implicit model swap: diagnostics correctly report voice vs backend model', () => {
-+    const manager = new GptLiveManager({
-+      enabled: false,
-+      apiKeyFile: '/dev/null',
-+      budgetFile: '/tmp/no-budget.json',
-+      maxSessionSeconds: 300,
-+      configuredModel: 'claude-opus-4-6[1m]',
-+      nodeExecutable: process.execPath,
-+    });
-+
-+    const diag = manager.getDiagnostics();
-+    expect(diag.voiceModel).toBe('gpt-live-1');
-+    expect(diag.backendModel).toBe('claude-opus-4-6[1m]');
-+    expect(diag.voiceModel).not.toBe(diag.backendModel);
+ // ---- TTS inbound frames ----------------------------------------------------
+ 
+ export interface TtsEvent {
+diff --git a/src/server/speech/speech.test.ts b/src/server/speech/speech.test.ts
+index b0d4c05..75f8932 100644
+--- a/src/server/speech/speech.test.ts
++++ b/src/server/speech/speech.test.ts
+@@ -276,19 +276,91 @@ describe('synthesis idle keepalive (long tool waits)', () => {
+     expect(h.errors).toEqual([]);
+   });
+ 
+-  it('reports the dropped socket honestly when idle exceeds the keepalive window', async () => {
++  it('treats an idle warm-socket close as benign and reopens lazily on the next write', async () => {
+     // With keepalives effectively disabled (interval far longer than the idle
+-    // window), the same tool wait lets the server close the socket. The adapter
+-    // must surface that drop as an error and must not synthesize phantom audio —
+-    // this is exactly the failure the keepalive above prevents.
++    // window), a long tool wait lets the provider close the warm socket. An idle
++    // close mid-wait is NOT a synthesis error — it must not surface as tts_error —
++    // and no phantom audio is faked for the dropped preamble. The next writeText
++    // reopens lazily on a fresh socket/token and the answer still synthesizes.
+     const h = await makeHarness({ ttsInactivityMs: 60 }, {}, { ttsKeepAliveMs: 10_000 });
+     h.session.writeText('preamble ');
+     await delay(150); // exceeds the 60 ms idle window with no keepalive
+-    // The drop is reported, not swallowed.
+-    expect(h.errors).toContain('speech_socket_closed');
+-    // The lost preamble is never faked as delivered audio.
+-    await h.session.finishSpeech().catch(() => undefined);
+-    expect(h.audio).toEqual([]);
++    // The idle drop is swallowed as benign, never reported as an error.
++    expect(h.errors).toEqual([]);
++    // Lazy reopen: a subsequent write establishes a fresh socket and synthesizes.
++    h.session.writeText('answer ');
++    await h.session.finishSpeech();
++    expect(decode(h.audio.at(-1)!.audio)).toContain('answer');
++    // A second token proves the dropped socket was reopened, not silently reused.
++    expect(h.tokenCalls.filter((k) => k === 'tts_websocket').length).toBeGreaterThanOrEqual(2);
++    expect(h.errors).toEqual([]);
 +  });
 +});
-diff --git a/tests/unit/delegation-regression.test.ts b/tests/unit/delegation-regression.test.ts
-index 1951958..99d4d57 100644
---- a/tests/unit/delegation-regression.test.ts
-+++ b/tests/unit/delegation-regression.test.ts
-@@ -135,16 +135,18 @@ describe('delegation serialization holds until send settles (issue 2)', () => {
-     await rm(workDir, { recursive: true, force: true });
++
++describe('synthesis prewarm, sentence flush and keepalive shape (issue 15)', () => {
++  it('prewarms the TTS socket once per turn and is fenced by cancel', async () => {
++    const diagnostics: import('../../shared/diagnostics.js').DiagnosticInput[] = [];
++    const h = await makeHarness({}, { onDiagnostic: (e) => diagnostics.push(e) });
++    h.session.prewarm();
++    h.session.prewarm(); // idempotent within the turn: still one socket
++    await delay(30);
++    expect(h.fixture.ttsConnections()).toBe(1);
++    expect(diagnostics.filter((d) => d.code === 'tts_prewarmed')).toHaveLength(1);
++
++    // A cancel that races the prewarm fences it: the warm socket is dropped and a
++    // later response opens a genuinely fresh one.
++    h.session.cancelSpeech!();
++    h.session.writeText('after cancel ');
++    await h.session.finishSpeech();
++    expect(decode(h.audio.map((v) => v.audio).join(''))).toContain('after cancel');
++    expect(h.errors).toEqual([]);
++  });
++
++  it('warms first audio: prewarm opens before any text so writeText reuses the socket', async () => {
++    const h = await makeHarness();
++    h.session.prewarm();
++    await delay(30); // socket is already open and warm
++    h.session.writeText('First sentence. ');
++    await h.session.finishSpeech();
++    // A single socket/token served the whole response — prewarm + reuse.
++    expect(h.tokenCalls.filter((k) => k === 'tts_websocket')).toHaveLength(1);
++    expect(h.errors).toEqual([]);
++  });
++
++  it('flushes at a sentence boundary but not mid-sentence', async () => {
++    const h = await makeHarness();
++    h.session.writeText('Hello there. '); // ends a sentence -> flush expected
++    h.session.writeText('still going '); // mid-sentence -> no flush
++    await delay(20);
++    const flushes = h.fixture.ttsFrames.filter((f) => {
++      const m = JSON.parse(f) as { text?: string; flush?: boolean };
++      return m.flush === true;
++    });
++    expect(flushes).toHaveLength(1);
++    await h.session.finishSpeech();
++    expect(h.errors).toEqual([]);
++  });
++
++  it('never sends an empty-string keepalive (empty text is EOS, not a keepalive)', async () => {
++    // Keepalive far below the idle window; any ping must be a single space, never
++    // an empty string (which would end generation).
++    const h = await makeHarness({ ttsInactivityMs: 120 }, {}, { ttsKeepAliveMs: 20 });
++    h.session.writeText('preamble ');
++    await delay(120); // several keepalive intervals during a simulated tool wait
++    h.session.writeText('answer ');
++    await h.session.finishSpeech();
++    // Before the EOS at finish, no frame carried an empty text without a flush
++    // flag (that shape is EOS and must never appear as a keepalive).
++    const framesBeforeEos = [...h.fixture.ttsFrames];
++    for (const raw of framesBeforeEos) {
++      const m = JSON.parse(raw) as { text?: string; flush?: boolean };
++      if (m.text === '' && m.flush !== true) {
++        // The only legitimate empty-text frame is the terminating EOS; assert it
++        // is the last frame, never an intermediate keepalive.
++        expect(raw).toBe(framesBeforeEos.at(-1));
++      }
++    }
++    expect(h.errors).toEqual([]);
    });
+ });
  
--  it('two sequential delegations: second waits for first send to settle', async () => {
-+  it('two sequential delegations: second waits for first send to settle and uses fresh input', async () => {
-     let sendCount = 0;
-     let concurrentSends = 0;
-     let maxConcurrent = 0;
-     let sendGate: (() => void) | null = null;
-+    const sentTexts: string[] = [];
+diff --git a/src/shared/realtime-wire.ts b/src/shared/realtime-wire.ts
+index 60a513b..8cb2562 100644
+--- a/src/shared/realtime-wire.ts
++++ b/src/shared/realtime-wire.ts
+@@ -30,13 +30,15 @@ export function parseRealtimeCommand(value: unknown): RealtimeCommand {
+   const fields: Record<string, string[]> = {
+     hello: ['type', 'version', 'sessionId'], record: ['type', 'turnId'], finish: ['type', 'turnId', 'lastSeq'],
+     text: ['type', 'turnId', 'text'], abort_input: ['type', 'turnId', 'reason'], interrupt: ['type', 'responseId'],
+-    playback_done: ['type', 'responseId', 'lastSeq', 'skipped'], ping: ['type', 'id'], end: ['type'],
++    playback_done: ['type', 'responseId', 'lastSeq', 'skipped'], playback_progress: ['type', 'responseId', 'seq'],
++    ping: ['type', 'id'], end: ['type'],
+   };
+   if (typeof command.type !== 'string' || !Object.hasOwn(fields, command.type)) throw new Error('Unknown conversation command.');
+   if (Object.keys(command).some(key => !fields[command.type as string].includes(key))) throw new Error('Unexpected command fields.');
+   if (['record', 'finish', 'text', 'abort_input'].includes(command.type) && !uint(command.turnId, 1)) throw new Error('Invalid turn identifier.');
+-  if (['interrupt', 'playback_done'].includes(command.type) && !uint(command.responseId, 1)) throw new Error('Invalid response identifier.');
++  if (['interrupt', 'playback_done', 'playback_progress'].includes(command.type) && !uint(command.responseId, 1)) throw new Error('Invalid response identifier.');
+   if (['finish', 'playback_done'].includes(command.type) && !uint(command.lastSeq, 0, MAX_AUDIO_SEQUENCE)) throw new Error('Invalid completion sequence.');
++  if (command.type === 'playback_progress' && !uint(command.seq, 0, MAX_AUDIO_SEQUENCE)) throw new Error('Invalid progress sequence.');
+   if (command.type === 'hello' && (command.version !== REALTIME_VERSION || (command.sessionId !== undefined && (typeof command.sessionId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(command.sessionId))))) throw new Error('Unsupported session handshake.');
+   if (command.type === 'text' && (typeof command.text !== 'string' || !command.text.trim() || command.text.length > 12000)) throw new Error('Invalid message text.');
+   if (command.type === 'abort_input' && !['overflow', 'muted', 'interrupted', 'discontinuity'].includes(command.reason as string)) throw new Error('Invalid input cancellation.');
+diff --git a/src/shared/realtime.ts b/src/shared/realtime.ts
+index 3737c79..418c559 100644
+--- a/src/shared/realtime.ts
++++ b/src/shared/realtime.ts
+@@ -41,6 +41,8 @@ export type RealtimeCommand =
+   | { type: 'abort_input'; turnId: number; reason: 'overflow' | 'muted' | 'interrupted' | 'discontinuity' }
+   | { type: 'interrupt'; responseId: number }
+   | { type: 'playback_done'; responseId: number; lastSeq: number; skipped?: boolean }
++  /** Consumption feedback: the highest audio sequence the client has actually played. */
++  | { type: 'playback_progress'; responseId: number; seq: number }
+   | { type: 'ping'; id: number }
+   | { type: 'end' };
  
-     const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
-       async start() { options.onEvent({ type: 'ready' }); },
-       async send(text: string) {
-         sendCount++;
-+        sentTexts.push(text);
-         concurrentSends++;
-         maxConcurrent = Math.max(maxConcurrent, concurrentSends);
-         await new Promise<void>(resolve => { sendGate = resolve; });
-@@ -190,30 +192,29 @@ describe('delegation serialization holds until send settles (issue 2)', () => {
-     manager.handleInputTranscript('do task one');
-     manager.handleDelegationCreated('deleg-s1', 1000);
- 
--    // Wait for send to be called
-     await vi.waitFor(() => expect(sendCount).toBe(1));
- 
-     // Queue second delegation while first is in progress
--    manager.handleInputTranscript(' and also task two');
-     manager.handleDelegationCreated('deleg-s2', 2000);
- 
--    // First send still in progress — second must not have started
-     expect(sendCount).toBe(1);
-     expect(maxConcurrent).toBe(1);
- 
--    // Settle first send
-+    // Settle first send — cursor advances past "do task one"
-     sendGate!();
-     await vi.waitFor(() => expect(commentaryCalls.length).toBeGreaterThanOrEqual(1));
- 
--    // Wait for second send
-+    // Now provide fresh input for the second delegation
-+    manager.handleInputTranscript('do task two');
-+
-     await vi.waitFor(() => expect(sendCount).toBe(2));
- 
--    // Settle second
-     sendGate!();
-     await vi.waitFor(() => expect(commentaryCalls.length).toBeGreaterThanOrEqual(2));
- 
--    // Never had concurrent sends
-     expect(maxConcurrent).toBe(1);
-+    expect(sentTexts[0]).toBe('do task one');
-+    expect(sentTexts[1]).toBe('do task two');
- 
-     await manager.shutdown();
+@@ -69,11 +71,22 @@ export interface RealtimeSpeech extends Omit<SpeechSession, 'writeAudio'> {
+   writeAudio(pcm: Uint8Array): boolean;
+   abortRecognition(): void;
+   cancelSpeech(): void;
++  /**
++   * Optionally pre-open the TTS stream-input socket (token fetch + websocket
++   * open) so the first synthesized audio arrives sooner. Optional so main can
++   * wire it incrementally; the coordinator tolerates its absence.
++   */
++  prewarm?(): void;
+ }
+ export interface ConversationOptions {
+   id: string;
+   mode: 'live' | 'fixture';
+-  harness(onEvent: (event: HarnessEvent) => void): RealtimeHarness;
++  /**
++   * `onResult` delivers the final assistant text of a turn (the text after the
++   * last tool call). Optional so main can wire it in one line; the coordinator
++   * tolerates its absence and simply speaks nothing extra after tools.
++   */
++  harness(onEvent: (event: HarnessEvent) => void, onResult?: (text: string) => void): RealtimeHarness;
+   speech?: (callbacks: {
+     onPartial(text: string): void;
+     onAudio(audio: string, sampleRate: number): void;
+@@ -103,6 +116,8 @@ export interface HandsFreeAudioOptions {
+   onError(message: string): void;
+   onDiscontinuity(): void;
+   onDiagnostic?(event: DiagnosticInput): void;
++  /** Consumption feedback: the highest output sequence that has finished playing. */
++  onProgress?(responseId: number, seq: number): void;
+ }
+ export interface HandsFreeAudio {
+   setMode(mode: AudioMode): void;
+diff --git a/tests/unit/realtime-wire.test.ts b/tests/unit/realtime-wire.test.ts
+index 1ad0a09..99aaa1d 100644
+--- a/tests/unit/realtime-wire.test.ts
++++ b/tests/unit/realtime-wire.test.ts
+@@ -22,8 +22,16 @@ describe('versioned conversation wire contract', () => {
+     expect(parseRealtimeCommand({ type: 'hello', version: 2, sessionId: 'session-1' })).toEqual({ type: 'hello', version: 2, sessionId: 'session-1' });
+     expect(parseRealtimeCommand({ type: 'finish', turnId: 1, lastSeq: 3 })).toEqual({ type: 'finish', turnId: 1, lastSeq: 3 });
    });
-@@ -740,13 +741,15 @@ describe('event-driven input queue replaces sleep/drop (issue 4)', () => {
-     await manager.shutdown();
-   });
++  it('accepts consumption-based playback progress without bumping the wire version', () => {
++    expect(parseRealtimeCommand({ type: 'playback_progress', responseId: 2, seq: 5 })).toEqual({ type: 'playback_progress', responseId: 2, seq: 5 });
++    // seq 0 (nothing played yet) is a valid progress report.
++    expect(parseRealtimeCommand({ type: 'playback_progress', responseId: 1, seq: 0 })).toEqual({ type: 'playback_progress', responseId: 1, seq: 0 });
++  });
+   it.each([null, [], { type: 'finish', turnId: 1 }, { type: 'hello', version: 1 },
+     { type: 'playback_done', responseId: 1, lastSeq: 1, skipped: 'yes' },
++    { type: 'playback_progress', responseId: 0, seq: 1 },
++    { type: 'playback_progress', responseId: 1 },
++    { type: 'playback_progress', responseId: 1, seq: 5, extra: 1 },
+     { type: 'record', turnId: 1, owner: 'spoofed' }, { type: '__proto__' },
+   ])('rejects invalid controls: %j', (value) => { expect(() => parseRealtimeCommand(value)).toThrow(); });
+ });
+diff --git a/tests/unit/speech-contract.test.ts b/tests/unit/speech-contract.test.ts
+index cedebea..b12560c 100644
+--- a/tests/unit/speech-contract.test.ts
++++ b/tests/unit/speech-contract.test.ts
+@@ -1,13 +1,33 @@
+ import { describe, expect, it } from 'vitest';
+-import { parseSttEvent, sttChunkFrame, ttsFlushFrame } from '../../src/server/speech/protocol.js';
++import {
++  DEFAULT_TTS_ENDPOINT,
++  TTS_INACTIVITY_TIMEOUT_SECONDS,
++  parseSttEvent,
++  sttChunkFrame,
++  ttsFlushFrame,
++  ttsForceFlushFrame,
++} from '../../src/server/speech/protocol.js';
  
--  it('duplicate delegation IDs are deduped while preserving delayed task', async () => {
-+  it('duplicate delegation IDs are deduped while preserving delayed task with fresh input', async () => {
-     let sendCount = 0;
-+    let sendGate: (() => void) | null = null;
+ // Provider-reference examples, deliberately independent of the WS fixture.
+ // https://elevenlabs.io/docs/api-reference/speech-to-text/v-1-speech-to-text-realtime
++// https://elevenlabs.io/docs/api-reference/text-to-speech/v-1-text-to-speech-voice-id-stream-input
  
-     const harnessFactory: HarnessFactory = (options: HarnessOptions): HarnessSession => ({
-       async start() { options.onEvent({ type: 'ready' }); },
-       async send() {
-         sendCount++;
-+        await new Promise<void>(resolve => { sendGate = resolve; });
-         if (options.onResult) options.onResult('ok');
-       },
-       async close() {},
-@@ -782,16 +785,29 @@ describe('event-driven input queue replaces sleep/drop (issue 4)', () => {
-     await manager.createSession('owner-1', 'v=0\r\noffer', 'http://localhost', noopCallbacks());
-     manager.handleInputTranscript('hello');
+ it('ends TTS with empty text rather than combining EOS with a keep-open flush', () => {
+   expect(JSON.parse(ttsFlushFrame())).toEqual({ text: '' });
+ });
  
--    // Same ID sent twice
-+    // Same ID sent twice — should only process once
-     manager.handleDelegationCreated('deleg-dup', 1000);
-     manager.handleDelegationCreated('deleg-dup', 1000);
- 
--    // Different ID follows
-+    // Different ID queued
-     manager.handleDelegationCreated('deleg-new', 2000);
- 
--    await vi.waitFor(() => expect(sendCount).toBeGreaterThanOrEqual(2), { timeout: 3000 });
-+    await vi.waitFor(() => expect(sendCount).toBe(1));
++it('forces generation with the documented flush flag without ending the stream', () => {
++  // The keep-open flush is distinct from EOS: it carries the `flush` flag so a
++  // short first sentence synthesizes immediately, and does not close generation.
++  expect(JSON.parse(ttsForceFlushFrame())).toEqual({ text: '', flush: true });
++});
 +
-+    // Settle first — cursor advances
-+    sendGate!();
-+    await new Promise(resolve => setTimeout(resolve, 50));
++it('requests the documented inactivity_timeout (<=180s) so a warm socket survives tool waits', () => {
++  expect(TTS_INACTIVITY_TIMEOUT_SECONDS).toBeLessThanOrEqual(180);
++  const url = new URL(DEFAULT_TTS_ENDPOINT.replace('{voiceId}', 'v'));
++  expect(url.searchParams.get('inactivity_timeout')).toBe(String(TTS_INACTIVITY_TIMEOUT_SECONDS));
++});
 +
-+    // Provide fresh input for the second delegation
-+    manager.handleInputTranscript('world');
-+
-+    await vi.waitFor(() => expect(sendCount).toBe(2), { timeout: 3000 });
-+
-+    // Settle second
-+    sendGate!();
-+    await new Promise(resolve => setTimeout(resolve, 50));
- 
--    // Only 2 sends: deleg-dup once, deleg-new once
-+    // Exactly 2 sends: deleg-dup once, deleg-new once
-     expect(sendCount).toBe(2);
- 
-     await manager.shutdown();
+ describe('documented ElevenLabs STT contract', () => {
+   it('sends message_type, commit and sample_rate with audio chunks', () => {
+     expect(JSON.parse(sttChunkFrame('AQI='))).toEqual({
