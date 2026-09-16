@@ -41,6 +41,8 @@ export type RealtimeCommand =
   | { type: 'abort_input'; turnId: number; reason: 'overflow' | 'muted' | 'interrupted' | 'discontinuity' }
   | { type: 'interrupt'; responseId: number }
   | { type: 'playback_done'; responseId: number; lastSeq: number; skipped?: boolean }
+  /** Consumption feedback: the highest audio sequence the client has actually played. */
+  | { type: 'playback_progress'; responseId: number; seq: number }
   | { type: 'ping'; id: number }
   | { type: 'end' };
 

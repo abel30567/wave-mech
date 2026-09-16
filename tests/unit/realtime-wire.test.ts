@@ -22,8 +22,16 @@ describe('versioned conversation wire contract', () => {
     expect(parseRealtimeCommand({ type: 'hello', version: 2, sessionId: 'session-1' })).toEqual({ type: 'hello', version: 2, sessionId: 'session-1' });
     expect(parseRealtimeCommand({ type: 'finish', turnId: 1, lastSeq: 3 })).toEqual({ type: 'finish', turnId: 1, lastSeq: 3 });
   });
+  it('accepts consumption-based playback progress without bumping the wire version', () => {
+    expect(parseRealtimeCommand({ type: 'playback_progress', responseId: 2, seq: 5 })).toEqual({ type: 'playback_progress', responseId: 2, seq: 5 });
+    // seq 0 (nothing played yet) is a valid progress report.
+    expect(parseRealtimeCommand({ type: 'playback_progress', responseId: 1, seq: 0 })).toEqual({ type: 'playback_progress', responseId: 1, seq: 0 });
+  });
   it.each([null, [], { type: 'finish', turnId: 1 }, { type: 'hello', version: 1 },
     { type: 'playback_done', responseId: 1, lastSeq: 1, skipped: 'yes' },
+    { type: 'playback_progress', responseId: 0, seq: 1 },
+    { type: 'playback_progress', responseId: 1 },
+    { type: 'playback_progress', responseId: 1, seq: 5, extra: 1 },
     { type: 'record', turnId: 1, owner: 'spoofed' }, { type: '__proto__' },
   ])('rejects invalid controls: %j', (value) => { expect(() => parseRealtimeCommand(value)).toThrow(); });
 });

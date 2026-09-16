@@ -20,6 +20,37 @@ const MAX_INPUT_BYTES = PCM_RATE * 2 * 120;
 const MAX_MESSAGES = 200;
 const FINGERPRINT_WINDOW = 256;
 
+// Consumption-based output flow control (issue 15, section 3, bullet 3).
+// The server forwards audio to the client only while the client's unplayed
+// window is below OUTPUT_WINDOW_MS, releasing more as playback_progress (or, for
+// old clients that never report, the realtime time-based estimate) advances.
+// The per-response outbox of generated-but-unforwarded audio is bounded; past
+// the bound the response is explicitly truncated with a diagnostic, never
+// dropped silently.
+const OUTPUT_WINDOW_MS = 12_000;
+const OUTBOX_BOUND_MS = 120_000;
+// Poll cadence for the time-based fallback so an old client (no progress) still
+// drains instead of stalling once the window fills.
+const OUTBOX_DRAIN_POLL_MS = 250;
+
+/** Byte length of a base64 payload without decoding it. */
+function base64ByteLength(b64: string): number {
+  const len = b64.length;
+  if (len === 0) return 0;
+  let padding = 0;
+  if (b64.charCodeAt(len - 1) === 61) padding = b64.charCodeAt(len - 2) === 61 ? 2 : 1;
+  return Math.max(0, (len * 3) / 4 - padding);
+}
+
+/** Milliseconds of mono PCM16 audio carried by a base64 frame at `sampleRate`. */
+function pcm16DurationMs(audioBase64: string, sampleRate: number): number {
+  if (sampleRate <= 0) return 0;
+  const samples = Math.floor(base64ByteLength(audioBase64) / 2);
+  return (samples / sampleRate) * 1000;
+}
+
+interface OutboxFrame { seq: number; audio: string; sampleRate: number; ms: number }
+
 type InputStatus = 'recording' | 'committing' | 'committed' | 'aborted' | 'failed';
 
 interface ActiveInput {
@@ -53,6 +84,26 @@ interface ActiveResponse {
   finalText: string | undefined;
   /** In-flight end-of-sequence of the preamble stream, awaited before the final. */
   preambleFinish: Promise<void> | undefined;
+  // --- output flow control --------------------------------------------------
+  /** Generated-but-not-yet-forwarded audio frames (the bounded outbox). */
+  outbox: OutboxFrame[];
+  /** Milliseconds of audio currently held in the outbox. */
+  outboxMs: number;
+  /** Cumulative generated ms indexed by audio sequence (for progress math). */
+  seqMs: Map<number, number>;
+  /** Total generated ms, and total forwarded ms/seq to the client. */
+  generatedMs: number;
+  forwardedMs: number;
+  forwardedSeq: number;
+  /** Highest played seq and its cumulative ms as reported via playback_progress. */
+  playedSeq: number;
+  playedMsReported: number;
+  /** Wall-clock at first forward, for the old-client time-based fallback. */
+  firstForwardAt: number | undefined;
+  /** The outbox bound was exceeded: the response is explicitly truncated. */
+  truncated: boolean;
+  /** Timer re-driving the time-based drain while a backlog remains. */
+  drainTimer: ReturnType<typeof setTimeout> | undefined;
 }
 
 /** Cheap order-sensitive checksum used only to spot conflicting duplicate frames. */
@@ -168,6 +219,7 @@ class Conversation implements RetainedConversation {
     if (this.closePromise) return this.closePromise;
     this.closed = true;
     this.phase = 'closed';
+    if (this.response) this.clearDrain(this.response);
     this.recordDiagnostic({ source: 'server', code: 'session_closed' });
     this.closePromise = (async () => {
       try {
@@ -215,6 +267,9 @@ class Conversation implements RetainedConversation {
           return;
         case 'playback_done':
           this.onPlaybackDone(command.responseId, command.skipped === true);
+          return;
+        case 'playback_progress':
+          this.onPlaybackProgress(command.responseId, command.seq);
           return;
         case 'end':
           await this.close();
@@ -464,6 +519,17 @@ class Conversation implements RetainedConversation {
       gatedNarration: false,
       finalText: undefined,
       preambleFinish: undefined,
+      outbox: [],
+      outboxMs: 0,
+      seqMs: new Map(),
+      generatedMs: 0,
+      forwardedMs: 0,
+      forwardedSeq: 0,
+      playedSeq: 0,
+      playedMsReported: 0,
+      firstForwardAt: undefined,
+      truncated: false,
+      drainTimer: undefined,
     };
     // A response created while detached has no audience for TTS; suppress it up
     // front so we never synthesize unheard audio.
@@ -570,6 +636,7 @@ class Conversation implements RetainedConversation {
     if (response.cancelled) return;
     response.cancelled = true;
     response.audioInterrupted = true;
+    this.clearDrain(response);
     this.setPhase('interrupting');
     this.recordDiagnostic({ source: 'server', code: 'interruption', responseId, turnId: response.turnId });
 
@@ -603,10 +670,18 @@ class Conversation implements RetainedConversation {
     if (!this.closed) this.setPhase('idle');
   }
 
+  private clearDrain(response: ActiveResponse): void {
+    if (response.drainTimer) {
+      clearTimeout(response.drainTimer);
+      response.drainTimer = undefined;
+    }
+  }
+
   private onPlaybackDone(responseId: number, skipped: boolean): void {
     const response = this.response;
     if (!response || response.responseId !== responseId || !response.awaitingPlayback) return;
     response.awaitingPlayback = false;
+    this.clearDrain(response);
     if (skipped) response.audioInterrupted = true;
     if (!this.closed && this.phase === 'speaking') this.setPhase('idle');
   }
@@ -715,18 +790,85 @@ class Conversation implements RetainedConversation {
     if (this.closed) return;
     const response = this.response;
     // Epoch fence: drop audio for a cancelled/suppressed or superseded response.
-    if (!response || response.cancelled || response.ttsSuppressed || response.finished) return;
+    if (!response || response.cancelled || response.ttsSuppressed) return;
+    // Once explicitly truncated, stop accepting further generated audio.
+    if (response.truncated) return;
+
+    const ms = pcm16DurationMs(audio, sampleRate);
+    // Bound the per-response outbox: if generation has outrun consumption past
+    // the bound, truncate explicitly with a diagnostic rather than buffering
+    // without limit or dropping silently. Coalesced to one record per response.
+    if (response.outboxMs + ms > OUTBOX_BOUND_MS) {
+      response.truncated = true;
+      response.audioInterrupted = true;
+      this.recordDiagnostic({ source: 'server', code: 'output_truncated', turnId: response.turnId, responseId: response.responseId, bufferedMs: Math.round(response.outboxMs) });
+      return;
+    }
+
     const seq = ++response.audioSeq;
     response.lastAudioSeq = seq;
     if (this.phase === 'thinking') this.setPhase('speaking');
-    this.emit({
-      type: 'audio',
-      turnId: response.turnId,
-      responseId: response.responseId,
-      seq,
-      audio,
-      sampleRate,
-    });
+    response.generatedMs += ms;
+    response.seqMs.set(seq, response.generatedMs);
+    response.outbox.push({ seq, audio, sampleRate, ms });
+    response.outboxMs += ms;
+    this.pumpOutbox(response);
+  }
+
+  /** Highest played ms: the max of reported progress and the realtime estimate. */
+  private playedMs(response: ActiveResponse): number {
+    const byProgress = response.playedMsReported;
+    const byTime = response.firstForwardAt === undefined ? 0 : Math.min(response.forwardedMs, this.now() - response.firstForwardAt);
+    return Math.max(byProgress, byTime);
+  }
+
+  /**
+   * Forward outbox frames while the client's unplayed window is below the
+   * threshold, then re-arm the time-based drain if a backlog remains so an old
+   * client that never reports progress still drains instead of stalling.
+   */
+  private pumpOutbox(response: ActiveResponse): void {
+    if (this.closed || response.cancelled || response.ttsSuppressed) return;
+    const played = this.playedMs(response);
+    while (response.outbox.length > 0 && response.forwardedMs - played < OUTPUT_WINDOW_MS) {
+      const frame = response.outbox.shift() as OutboxFrame;
+      response.outboxMs = Math.max(0, response.outboxMs - frame.ms);
+      if (response.firstForwardAt === undefined) response.firstForwardAt = this.now();
+      response.forwardedMs += frame.ms;
+      response.forwardedSeq = frame.seq;
+      this.emit({ type: 'audio', turnId: response.turnId, responseId: response.responseId, seq: frame.seq, audio: frame.audio, sampleRate: frame.sampleRate });
+    }
+    this.scheduleOutboxDrain(response);
+  }
+
+  private scheduleOutboxDrain(response: ActiveResponse): void {
+    if (response.drainTimer) {
+      clearTimeout(response.drainTimer);
+      response.drainTimer = undefined;
+    }
+    if (this.closed || response.cancelled || response.outbox.length === 0) return;
+    response.drainTimer = setTimeout(() => {
+      response.drainTimer = undefined;
+      if (this.closed || this.response !== response || response.cancelled) return;
+      this.pumpOutbox(response);
+    }, OUTBOX_DRAIN_POLL_MS);
+    (response.drainTimer as { unref?: () => void }).unref?.();
+  }
+
+  private onPlaybackProgress(responseId: number, seq: number): void {
+    const response = this.response;
+    if (!response || response.responseId !== responseId) return;
+    if (seq > response.playedSeq) {
+      response.playedSeq = seq;
+      const cumulative = response.seqMs.get(seq);
+      if (cumulative !== undefined) response.playedMsReported = cumulative;
+      // Bound retention: sequence→ms entries at or below the played mark are no
+      // longer needed for the window math.
+      for (const key of response.seqMs.keys()) {
+        if (key < seq) response.seqMs.delete(key);
+      }
+    }
+    this.pumpOutbox(response);
   }
 
   private onSpeechError(message: string): void {

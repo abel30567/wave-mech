@@ -30,13 +30,15 @@ export function parseRealtimeCommand(value: unknown): RealtimeCommand {
   const fields: Record<string, string[]> = {
     hello: ['type', 'version', 'sessionId'], record: ['type', 'turnId'], finish: ['type', 'turnId', 'lastSeq'],
     text: ['type', 'turnId', 'text'], abort_input: ['type', 'turnId', 'reason'], interrupt: ['type', 'responseId'],
-    playback_done: ['type', 'responseId', 'lastSeq', 'skipped'], ping: ['type', 'id'], end: ['type'],
+    playback_done: ['type', 'responseId', 'lastSeq', 'skipped'], playback_progress: ['type', 'responseId', 'seq'],
+    ping: ['type', 'id'], end: ['type'],
   };
   if (typeof command.type !== 'string' || !Object.hasOwn(fields, command.type)) throw new Error('Unknown conversation command.');
   if (Object.keys(command).some(key => !fields[command.type as string].includes(key))) throw new Error('Unexpected command fields.');
   if (['record', 'finish', 'text', 'abort_input'].includes(command.type) && !uint(command.turnId, 1)) throw new Error('Invalid turn identifier.');
-  if (['interrupt', 'playback_done'].includes(command.type) && !uint(command.responseId, 1)) throw new Error('Invalid response identifier.');
+  if (['interrupt', 'playback_done', 'playback_progress'].includes(command.type) && !uint(command.responseId, 1)) throw new Error('Invalid response identifier.');
   if (['finish', 'playback_done'].includes(command.type) && !uint(command.lastSeq, 0, MAX_AUDIO_SEQUENCE)) throw new Error('Invalid completion sequence.');
+  if (command.type === 'playback_progress' && !uint(command.seq, 0, MAX_AUDIO_SEQUENCE)) throw new Error('Invalid progress sequence.');
   if (command.type === 'hello' && (command.version !== REALTIME_VERSION || (command.sessionId !== undefined && (typeof command.sessionId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(command.sessionId))))) throw new Error('Unsupported session handshake.');
   if (command.type === 'text' && (typeof command.text !== 'string' || !command.text.trim() || command.text.length > 12000)) throw new Error('Invalid message text.');
   if (command.type === 'abort_input' && !['overflow', 'muted', 'interrupted', 'discontinuity'].includes(command.reason as string)) throw new Error('Invalid input cancellation.');
