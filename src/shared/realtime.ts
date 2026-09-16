@@ -116,6 +116,8 @@ export interface HandsFreeAudioOptions {
   onError(message: string): void;
   onDiscontinuity(): void;
   onDiagnostic?(event: DiagnosticInput): void;
+  /** Consumption feedback: the highest output sequence that has finished playing. */
+  onProgress?(responseId: number, seq: number): void;
 }
 export interface HandsFreeAudio {
   setMode(mode: AudioMode): void;

@@ -20,11 +20,14 @@ const ASSET_BASE = '/vad/';
 // hold more than ~120 s of audio. At 16 kHz PCM16 that is 2 bytes/sample.
 const MAX_UTTERANCE_BYTES = PCM_RATE * 2 * 120;
 
-// Playback is bounded so a slow or suspended AudioContext cannot retain an
-// unlimited number of scheduled buffer sources. Once this many seconds of
-// undrained output has been scheduled we stop allocating and mark the response
-// so its completion reports honestly (interrupted, never "played").
-const MAX_OUTPUT_SECONDS = 30;
+// Consumption-based output scheduling (issue 15, section 3). At most a small
+// look-ahead of AudioBufferSource nodes is scheduled at once; everything else is
+// held in a bounded queue and scheduled as earlier nodes end (which is also when
+// consumption progress is reported). There is NO silent 30 s drop path: the hold
+// queue is bounded and, if it would ever be exceeded, that is a protocol
+// violation to diagnose, never audio to discard.
+const LOOKAHEAD_SECONDS = 12;
+const MAX_HOLD_SECONDS = 30;
 
 // A small, bounded pre-buffer margin absorbs uneven PCM arrival. When the
 // schedule has caught up to (or fallen behind) the playback clock, a fresh
@@ -35,11 +38,24 @@ const MAX_OUTPUT_SECONDS = 30;
 const PREBUFFER_MARGIN_SECONDS = 0.06;
 
 interface OutputResponse {
-  active: number;
+  /** Nodes scheduled and not yet ended. */
+  scheduled: number;
   declared: boolean;
+  /** The last audio sequence the server declared for this response. */
+  declaredLastSeq: number;
+  /** Highest sequence whose node has finished playing. */
+  endedSeq: number;
   cancelled: boolean;
   overflowed: boolean;
   settle?: (result: 'played' | 'interrupted' | 'paused') => void;
+}
+
+interface HeldFrame {
+  responseId: number;
+  seq: number;
+  samples: Float32Array;
+  sampleRate: number;
+  duration: number;
 }
 
 /**
@@ -213,7 +229,11 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
   };
 
   let nextStartTime = 0;
-  let queuedOutputSeconds = 0;
+  // Seconds of audio scheduled as live source nodes (the bounded look-ahead) and
+  // seconds held in the pending queue awaiting a scheduling slot.
+  let scheduledSeconds = 0;
+  let heldSeconds = 0;
+  const pending: HeldFrame[] = [];
   const sources = new Set<AudioBufferSourceNode>();
   const responses = new Map<number, OutputResponse>();
   let firstAudioForResponse = -1;
@@ -230,11 +250,13 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
     if (responseId > highestResponseId) highestResponseId = responseId;
     let response = responses.get(responseId);
     if (!response) {
-      response = { active: 0, declared: false, cancelled: false, overflowed: false };
+      response = { scheduled: 0, declared: false, declaredLastSeq: 0, endedSeq: 0, cancelled: false, overflowed: false };
       responses.set(responseId, response);
     }
     return response;
   };
+
+  const hasPending = (responseId: number): boolean => pending.some((f) => f.responseId === responseId);
 
   // Resolve a pending completion and, for terminal results, drop the bookkeeping
   // so the response map cannot grow without bound. 'paused' is not terminal: the
@@ -253,7 +275,73 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
     if (!response?.settle) return;
     if (response.cancelled || response.overflowed) finalize(responseId, 'interrupted');
     else if (context.state !== 'running') finalize(responseId, 'paused');
-    else if (response.declared && response.active === 0) finalize(responseId, 'played');
+    else if (response.declared && response.endedSeq >= response.declaredLastSeq && response.scheduled === 0 && !hasPending(responseId)) {
+      finalize(responseId, 'played');
+    }
+  };
+
+  // Schedule the next held frame as an AudioBufferSource on the shared context.
+  const scheduleFrame = (frame: HeldFrame, response: OutputResponse): void => {
+    const buffer = context.createBuffer(1, frame.samples.length, frame.sampleRate);
+    buffer.getChannelData(0).set(frame.samples);
+    const node = context.createBufferSource();
+    node.buffer = buffer;
+    node.connect(context.destination);
+    const tag = node as { responseId?: number; seconds?: number; seq?: number; endAt?: number };
+    tag.responseId = frame.responseId;
+    tag.seconds = frame.duration;
+    tag.seq = frame.seq;
+    response.scheduled += 1;
+    scheduledSeconds += frame.duration;
+    sources.add(node);
+    node.onended = (): void => {
+      node.disconnect();
+      sources.delete(node);
+      response.scheduled -= 1;
+      scheduledSeconds = Math.max(0, scheduledSeconds - frame.duration);
+      if (frame.seq > response.endedSeq) response.endedSeq = frame.seq;
+      // Report consumption: the highest sequence that has actually played. This
+      // is what drives the server to release the next window of audio.
+      try {
+        options.onProgress?.(frame.responseId, frame.seq);
+      } catch {
+        /* progress reporting must not break playback */
+      }
+      pumpSchedule();
+      maybeSettle(frame.responseId);
+    };
+    const startAt = nextStartTime > context.currentTime
+      ? nextStartTime
+      : context.currentTime + PREBUFFER_MARGIN_SECONDS;
+    node.start(startAt);
+    nextStartTime = startAt + buffer.duration;
+    tag.endAt = nextStartTime;
+  };
+
+  // Drain the pending queue into scheduled nodes up to the bounded look-ahead,
+  // skipping frames for cancelled/stale/overflowed responses.
+  const pumpSchedule = (): void => {
+    while (pending.length > 0 && scheduledSeconds < LOOKAHEAD_SECONDS) {
+      const frame = pending[0];
+      const response = responses.get(frame.responseId);
+      if (isStale(frame.responseId) || !response || response.cancelled || response.overflowed) {
+        pending.shift();
+        heldSeconds = Math.max(0, heldSeconds - frame.duration);
+        continue;
+      }
+      pending.shift();
+      heldSeconds = Math.max(0, heldSeconds - frame.duration);
+      scheduleFrame(frame, response);
+    }
+  };
+
+  const dropPending = (predicate: (frame: HeldFrame) => boolean): void => {
+    for (let i = pending.length - 1; i >= 0; i--) {
+      if (predicate(pending[i])) {
+        heldSeconds = Math.max(0, heldSeconds - pending[i].duration);
+        pending.splice(i, 1);
+      }
+    }
   };
 
   // Observe context state changes after a drain has begun — not only at the
@@ -315,20 +403,19 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
 
     enqueueOutput(audio: string, sampleRate: number, responseId: number, seq: number): void {
       if (closed) return;
-      void seq; // ordering is guaranteed by the server's sequential delivery
       // Reject output for a superseded generation even after its entry is gone.
       if (isStale(responseId)) return;
       const response = responseFor(responseId);
-      if (response.cancelled) return;
+      if (response.cancelled || response.overflowed) return;
       const samples = decodePcm16Base64(audio);
       if (samples.length === 0) return;
       const duration = samples.length / sampleRate;
-      // Bound retention: a slow or suspended context must not accumulate an
-      // unlimited number of scheduled nodes. Drop past the ceiling and flag the
-      // response so its completion is reported honestly rather than as played.
-      if (queuedOutputSeconds + duration > MAX_OUTPUT_SECONDS) {
+      // Bounded hold queue. With server-side flow control the client's unplayed
+      // window is bounded, so this should never fill; if it would, that is a
+      // protocol violation to DIAGNOSE and fence, never audio to silently drop.
+      if (heldSeconds + duration > MAX_HOLD_SECONDS) {
         response.overflowed = true;
-        emitDiagnostic({ source: 'audio', code: 'playback_overflow', count: Math.round(queuedOutputSeconds) });
+        emitDiagnostic({ source: 'audio', code: 'output_truncated', bufferedMs: Math.round(heldSeconds * 1000), responseId });
         maybeSettle(responseId);
         return;
       }
@@ -336,44 +423,16 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
         firstAudioForResponse = responseId;
         emitDiagnostic({ source: 'audio', code: 'first_playback_scheduled', sampleRate });
       }
-      const buffer = context.createBuffer(1, samples.length, sampleRate);
-      buffer.getChannelData(0).set(samples);
-      const node = context.createBufferSource();
-      node.buffer = buffer;
-      node.connect(context.destination);
-      // Tag the node so per-response cancellation can stop only its own sources
-      // and reclaim the right amount of the output budget.
-      (node as { responseId?: number; seconds?: number }).responseId = responseId;
-      (node as { responseId?: number; seconds?: number }).seconds = duration;
-      response.active += 1;
-      queuedOutputSeconds += duration;
-      sources.add(node);
-      node.onended = (): void => {
-        node.disconnect();
-        sources.delete(node);
-        response.active -= 1;
-        queuedOutputSeconds = Math.max(0, queuedOutputSeconds - duration);
-        maybeSettle(responseId);
-      };
-      // If the schedule is still ahead of the playback clock, append contiguously
-      // (nextStartTime); otherwise we are starting fresh or have fallen behind, so
-      // give a small bounded pre-buffer margin to soak up arrival jitter without
-      // an underrun. This never delays a schedule that is already running ahead.
-      const startAt = nextStartTime > context.currentTime
-        ? nextStartTime
-        : context.currentTime + PREBUFFER_MARGIN_SECONDS;
-      node.start(startAt);
-      nextStartTime = startAt + buffer.duration;
-      // Record the scheduled end so a targeted cancel can recompute the fence
-      // from the sources that actually survive.
-      (node as { responseId?: number; seconds?: number; endAt?: number }).endAt = nextStartTime;
+      pending.push({ responseId, seq, samples, sampleRate, duration });
+      heldSeconds += duration;
+      pumpSchedule();
     },
 
     finishOutput(responseId: number, lastSeq: number): Promise<'played' | 'interrupted' | 'paused'> {
-      void lastSeq;
       if (closed || isStale(responseId)) return Promise.resolve('interrupted');
       const response = responseFor(responseId);
       response.declared = true;
+      response.declaredLastSeq = lastSeq;
       if (response.cancelled || response.overflowed) {
         finalize(responseId, 'interrupted');
         return Promise.resolve('interrupted');
@@ -381,7 +440,9 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
       // Suspended at declaration time: keep the entry so a resumed drain can
       // still complete the obligation (do not delete on 'paused').
       if (context.state !== 'running') return Promise.resolve('paused');
-      if (response.active === 0) {
+      // Played only once every declared sequence has actually finished playing —
+      // never a false acknowledgement while frames are still queued or in flight.
+      if (response.endedSeq >= lastSeq && response.scheduled === 0 && !hasPending(responseId)) {
         responses.delete(responseId);
         return Promise.resolve('played');
       }
@@ -392,6 +453,11 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
 
     cancelOutput(responseId?: number): void {
       emitDiagnostic({ source: 'audio', code: 'playback_cancelled', count: sources.size });
+      // Drop any held (unscheduled) frames for the cancelled generation so they
+      // can never enter a later response.
+      dropPending((frame) => responseId === undefined || frame.responseId === responseId);
+      // Stop and disconnect the cancelled response's scheduled source nodes before
+      // ownership is released, so no old audio keeps playing under a new turn.
       for (const node of [...sources]) {
         const tagged = node as { responseId?: number; seconds?: number };
         if (responseId !== undefined && tagged.responseId !== responseId) continue;
@@ -403,13 +469,15 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
         }
         node.disconnect();
         sources.delete(node);
-        queuedOutputSeconds = Math.max(0, queuedOutputSeconds - (tagged.seconds ?? 0));
+        scheduledSeconds = Math.max(0, scheduledSeconds - (tagged.seconds ?? 0));
       }
       // A full cancel clears the playback clock; a targeted cancel recomputes
       // the fence from the sources that actually survive.
       if (responseId === undefined) {
         nextStartTime = 0;
-        queuedOutputSeconds = 0;
+        scheduledSeconds = 0;
+        heldSeconds = 0;
+        pending.length = 0;
       } else {
         // When no source survives (the cancelled response was the only scheduled
         // output) this collapses to 0 so new speech starts immediately instead of
@@ -427,9 +495,11 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
       for (const [id, response] of [...responses]) {
         if (responseId !== undefined && id !== responseId) continue;
         response.cancelled = true;
-        response.active = 0;
+        response.scheduled = 0;
         finalize(id, 'interrupted');
       }
+      // Freed look-ahead may let a surviving response's held frames schedule now.
+      pumpSchedule();
     },
 
     async resume(): Promise<void> {
@@ -453,6 +523,8 @@ export async function createHandsFreeAudio(options: HandsFreeAudioOptions): Prom
       } else {
         context.onstatechange = null;
       }
+      pending.length = 0;
+      heldSeconds = 0;
       for (const id of [...responses.keys()]) finalize(id, 'interrupted');
       try {
         await vad.destroy();

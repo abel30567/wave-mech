@@ -154,6 +154,7 @@ function makeOptions(): HandsFreeAudioOptions & { calls: Record<string, unknown[
     onState: [],
     onError: [],
     onDiscontinuity: [],
+    onProgress: [],
   };
   const diagnostics: import('../../shared/diagnostics.js').DiagnosticInput[] = [];
   const record =
@@ -168,6 +169,7 @@ function makeOptions(): HandsFreeAudioOptions & { calls: Record<string, unknown[
     onState: record('onState'),
     onError: record('onError'),
     onDiscontinuity: record('onDiscontinuity'),
+    onProgress: record('onProgress'),
     onDiagnostic: (d: import('../../shared/diagnostics.js').DiagnosticInput) => diagnostics.push(d),
     onPcm(pcm: ArrayBuffer): void {
       calls.onPcm.push([pcm]);
@@ -312,13 +314,24 @@ describe('createHandsFreeAudio output', () => {
     await expect(again).resolves.toBe('played');
   });
 
-  it('bounds scheduled output nodes and reports overflow honestly (never played)', async () => {
-    const { audio, ctx } = await build();
-    // One-second buffers that never drain: past the 30 s ceiling, allocation
-    // stops so a slow/suspended context cannot retain unlimited nodes.
+  it('schedules only a bounded look-ahead, holds the rest, and never drops audio', async () => {
+    const { audio, ctx, opts } = await build();
+    // 40 one-second buffers. At most the look-ahead is scheduled as live nodes;
+    // the rest is held (never dropped) and scheduled as earlier nodes end.
     for (let i = 0; i < 40; i += 1) audio.enqueueOutput(outputBase64(16000), 16000, 5, i);
-    expect(ctx.live.size).toBe(30);
-    await expect(audio.finishOutput(5, 39)).resolves.toBe('interrupted');
+    expect(ctx.live.size).toBe(12);
+
+    const done = audio.finishOutput(5, 39);
+    // Drain in waves: every finished node schedules the next held frame and
+    // reports consumption progress. Nothing is lost; completion is a true played.
+    for (let guard = 0; guard < 60 && ctx.live.size > 0; guard += 1) {
+      ctx.finishAll();
+      await flush();
+    }
+    await expect(done).resolves.toBe('played');
+    // Progress was reported for the whole response, up to the declared last seq.
+    const progress = opts.calls.onProgress as Array<[number, number]>;
+    expect(progress.at(-1)).toEqual([5, 39]);
   });
 
   it('fences a cancelled generation so its late output is rejected', async () => {
@@ -441,10 +454,18 @@ describe('createHandsFreeAudio diagnostics', () => {
     expect(opts.diagnostics.some((d) => d.code === 'playback_cancelled')).toBe(true);
   });
 
-  it('emits playback_overflow when ceiling is exceeded', async () => {
-    const { audio, opts } = await build();
-    for (let i = 0; i < 40; i += 1) audio.enqueueOutput(outputBase64(16000), 16000, 5, i);
-    expect(opts.diagnostics.some((d) => d.code === 'playback_overflow')).toBe(true);
+  it('has no silent drop path: an exceeded hold bound is diagnosed, never dropped', async () => {
+    const { audio, opts, ctx } = await build();
+    // Far more than the hold bound while nothing drains. The legacy 30 s silent
+    // drop path is gone; exceeding the bound is a protocol violation to diagnose
+    // (output_truncated) and fence, and completion is honestly interrupted.
+    for (let i = 0; i < 60; i += 1) audio.enqueueOutput(outputBase64(16000), 16000, 5, i);
+    expect(opts.diagnostics.some((d) => d.code === 'playback_overflow')).toBe(false);
+    const truncated = opts.diagnostics.find((d) => d.code === 'output_truncated');
+    expect(truncated).toBeDefined();
+    expect(truncated!.bufferedMs).toBeGreaterThan(0);
+    expect(ctx.live.size).toBeLessThanOrEqual(12);
+    await expect(audio.finishOutput(5, 59)).resolves.toBe('interrupted');
   });
 
   it('does not break playback when diagnostic callback throws', async () => {

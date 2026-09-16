@@ -21,6 +21,9 @@ import { OutstandingAudio } from './outstanding.js';
 const RECONNECT_DELAY_MS = 750;
 const STALL_SOFT_MS = 2000;
 const STALL_HARD_MS = 5000;
+// Consumption feedback cadence: report the highest played sequence at most this
+// often (and on drain) so the server can release the next window of audio.
+const PROGRESS_INTERVAL_MS = 500;
 const WS_OPEN = 1;
 
 type ViewPhase = ConversationView['phase'];
@@ -93,6 +96,11 @@ class Client implements ConversationClient {
   private stallSoft: ReturnType<typeof setTimeout> | undefined;
   private stallHard: ReturnType<typeof setTimeout> | undefined;
 
+  // Throttled consumption feedback.
+  private progressSentAt = 0;
+  private progressTimer: ReturnType<typeof setTimeout> | undefined;
+  private latestProgress: { responseId: number; seq: number } | null = null;
+
   constructor(options: ConversationClientOptions) {
     this.options = options;
     this.socketFactory = options.socketFactory ?? ((url) => new WebSocket(url));
@@ -150,6 +158,7 @@ class Client implements ConversationClient {
       onError: this.onAudioError,
       onDiscontinuity: this.onDiscontinuity,
       onDiagnostic: event => this.recordDiagnostic(event),
+      onProgress: this.onOutputProgress,
     });
     this.audioCreating = creating;
     void creating.then(
@@ -238,6 +247,9 @@ class Client implements ConversationClient {
     this.clearStall();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
+    if (this.progressTimer) clearTimeout(this.progressTimer);
+    this.progressTimer = undefined;
+    this.latestProgress = null;
     if (this.socketOpen()) this.send({ type: 'end' });
     try {
       this.socket?.close();
@@ -326,6 +338,37 @@ class Client implements ConversationClient {
     this.notice = message;
     this.emit();
   };
+
+  /**
+   * Consumption feedback from the audio scheduler: the highest sequence that has
+   * finished playing. Coalesced and throttled to at most one report per
+   * PROGRESS_INTERVAL_MS so the server releases the next window without a flood.
+   */
+  private onOutputProgress = (responseId: number, seq: number): void => {
+    if (this.ended) return;
+    this.latestProgress = { responseId, seq };
+    const elapsed = Date.now() - this.progressSentAt;
+    if (elapsed >= PROGRESS_INTERVAL_MS) {
+      this.flushProgress();
+    } else if (!this.progressTimer) {
+      this.progressTimer = setTimeout(() => {
+        this.progressTimer = undefined;
+        this.flushProgress();
+      }, PROGRESS_INTERVAL_MS - elapsed);
+    }
+  };
+
+  private flushProgress(): void {
+    if (this.progressTimer) {
+      clearTimeout(this.progressTimer);
+      this.progressTimer = undefined;
+    }
+    const progress = this.latestProgress;
+    if (!progress) return;
+    this.latestProgress = null;
+    this.progressSentAt = Date.now();
+    this.send({ type: 'playback_progress', responseId: progress.responseId, seq: progress.seq });
+  }
 
   private onDiscontinuity = (): void => {
     this.recordDiagnostic({ source: 'audio', code: 'input_discontinuity', turnId: this.input?.turnId });
@@ -481,6 +524,8 @@ class Client implements ConversationClient {
       this.emit();
       return;
     }
+    // Report final consumption on drain before acknowledging completion.
+    this.flushProgress();
     if (result === 'played') {
       this.send({ type: 'playback_done', responseId, lastSeq });
     } else {
