@@ -584,6 +584,13 @@ class Conversation implements RetainedConversation {
           reason: event.reason, statusCode: event.statusCode, turnId: response.turnId, responseId: response.responseId });
         return;
       }
+      case 'result': {
+        const response = this.response;
+        if (!response || response.cancelled) return;
+        this.recordDiagnostic({ source: 'server', code: 'backend_result', turnId: response.turnId, responseId: response.responseId,
+          durationMs: event.durationMs, count: event.numTurns });
+        return;
+      }
       case 'error': {
         // A turn-scoped error also rejects harness.send(), which runInference
         // handles. Only an error with no inference in flight is session-fatal.

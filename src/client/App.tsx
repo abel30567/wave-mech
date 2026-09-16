@@ -145,6 +145,8 @@ export default function App() {
           trialStatus={setup.gptLiveTrial}
           defaultModeActive={active}
           onModeSwitch={setVoiceMode}
+          mode={setup.mode}
+          buildId={setup.buildId}
         />}
       </section>
       <section className="conversation-panel" aria-label="Conversation">

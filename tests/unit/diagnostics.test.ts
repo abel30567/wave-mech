@@ -12,6 +12,11 @@ describe('bounded diagnostic metadata', () => {
     expect(clean).not.toHaveProperty('arguments');
   });
 
+  it('keeps an opaque delegation identifier but rejects one that could carry a payload', () => {
+    expect(safeDiagnostic({ source: 'server', code: 'delegation_started', delegationId: 'dlg_01AbC-xyz' })).toEqual({ source: 'server', code: 'delegation_started', delegationId: 'dlg_01AbC-xyz' });
+    expect(safeDiagnostic({ source: 'server', code: 'delegation_started', delegationId: 'balance is $1,234' })).toEqual({ source: 'server', code: 'delegation_started' });
+  });
+
   it('rejects free-text reasons, foreign tools, and invalid numeric metadata', () => {
     const clean = safeDiagnostic({ source: 'server', code: 'bad\nsecret', tool: 'mcp__unrelated__execute', reason: 'secret reason', durationMs: Infinity, gapMs: -5, callId: 'url?token=secret' } as unknown as DiagnosticInput);
     expect(clean).toEqual({ source: 'server', code: 'unknown' });

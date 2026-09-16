@@ -4,11 +4,15 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { HarnessEvent, HarnessOptions, HarnessSession } from '../../shared/contracts.js';
+import { DiagnosticLog } from '../../shared/diagnostics.js';
 import {
   GPT_LIVE_VOICE_MODEL,
   GPT_LIVE_BACKEND_MODEL,
   GPT_LIVE_MAX_SESSION_SECONDS,
   GPT_LIVE_PRICE_PER_MINUTE,
+  type GptLiveDelegationRecord,
+  type GptLiveDelegationStatus,
+  type GptLiveStopCause,
   type GptLiveTrialStatus,
   type GptLiveDiagnostics,
   type GptLiveTranscriptEntry,
@@ -24,6 +28,13 @@ const CLOSURE_TIMEOUT_MS = 15_000;
 const MAX_DELEGATION_QUEUE = 10;
 const DELEGATION_INPUT_TIMEOUT_MS = 3_000;
 const MAX_COMMENTARY_CHUNK_BYTES = 500;
+const MAX_DELEGATION_RECORDS = 50;
+const SAFE_MODEL_RE = /^claude-[a-z0-9.[\]-]{1,80}$/;
+const STOP_CAUSES: ReadonlySet<GptLiveStopCause> = new Set(['user_ended', 'deadline', 'budget_exceeded', 'provider_closed', 'sideband_error', 'sideband_failure', 'shutdown']);
+
+function toStopCause(reason: string): GptLiveStopCause {
+  return STOP_CAUSES.has(reason as GptLiveStopCause) ? reason as GptLiveStopCause : 'unknown';
+}
 
 export type HarnessFactory = (options: HarnessOptions) => HarnessSession;
 
@@ -75,6 +86,15 @@ interface ActiveTrialSession {
   sidebandHandle: SidebandHandle | null;
   closureTimer: ReturnType<typeof setTimeout> | null;
   callbacks: GptLiveSessionCallbacks;
+  /** Bounded structured lifecycle/tool/error records; same contract as default mode. */
+  diagnostics: DiagnosticLog;
+  deadlineAt: number;
+  endedAt: number | null;
+  /** Why the app stopped the session; never overwritten by the provider's closure reason. */
+  stopCause: GptLiveStopCause | null;
+  backendModel: string | null;
+  delegations: GptLiveDelegationRecord[];
+  lastResultMeta: { durationMs?: number; numTurns?: number } | null;
 }
 
 export class GptLiveManager {
@@ -190,6 +210,12 @@ export class GptLiveManager {
     let harness: ReturnType<typeof createHarness> | null = null;
     let provider: LiveProvider | null = null;
     let creationAttempted = false;
+    // The log exists before the harness/provider so startup records survive
+    // even when creation fails and no active session is ever installed.
+    const diagnostics = new DiagnosticLog('server');
+    const requestedAt = Date.now();
+    let backendModel: string | null = null;
+    diagnostics.record({ source: 'server', code: 'session_requested' });
 
     try {
       workspace = await mkdtemp(path.join(tmpdir(), 'wave-live-'));
@@ -199,7 +225,14 @@ export class GptLiveManager {
       const harnessOptions: HarnessOptions = {
         command: process.env.WAVE_CLAUDE_BIN ?? 'claude',
         env: harnessEnvironmentOverrides(),
-        onEvent: (event: HarnessEvent) => this.handleHarnessEvent(sessionId, event),
+        onEvent: (event: HarnessEvent) => {
+          if (event.type === 'ready') {
+            // Init arrives during start(), before the session is active.
+            if (event.model && SAFE_MODEL_RE.test(event.model)) backendModel = event.model;
+            diagnostics.record({ source: 'server', code: 'connection_ready' });
+          }
+          this.handleHarnessEvent(sessionId, event);
+        },
         onResult: (text: string) => this.handleHarnessResult(sessionId, text),
         args: [
           '-p', '--model', this.options.configuredModel,
@@ -244,7 +277,9 @@ export class GptLiveManager {
       await this.budget.save();
       creationAttempted = true;
 
+      const providerRequestedAt = Date.now();
       const result = await provider.createSession(sdp, instructions, clientEventRestrictions);
+      diagnostics.record({ source: 'server', code: 'provider_session_created', durationMs: Math.max(0, Date.now() - providerRequestedAt) });
 
       this.budget.setProviderSessionId(sessionId, result.providerSessionId);
       await this.budget.save();
@@ -254,11 +289,12 @@ export class GptLiveManager {
       }, this.options.maxSessionSeconds * 1000);
       if (typeof deadline.unref === 'function') deadline.unref();
 
+      const startedAt = Date.now();
       this.active = {
         sessionId,
         providerSessionId: result.providerSessionId,
         ownerId,
-        startedAt: Date.now(),
+        startedAt,
         deadline,
         harness,
         workspace,
@@ -282,12 +318,20 @@ export class GptLiveManager {
         sidebandHandle: null,
         closureTimer: null,
         callbacks,
+        diagnostics,
+        deadlineAt: startedAt + this.options.maxSessionSeconds * 1000,
+        endedAt: null,
+        stopCause: null,
+        backendModel,
+        delegations: [],
+        lastResultMeta: null,
       };
 
       void this.attachSideband(sessionId);
 
       return { sessionId, sdp: result.answerSdp };
     } catch (error) {
+      diagnostics.record({ source: 'server', code: 'session_create_failed', reason: creationAttempted ? 'provider' : 'unknown' });
       if (!creationAttempted) {
         this.budget.releaseUnstartedReservation(sessionId);
       } else {
@@ -297,6 +341,18 @@ export class GptLiveManager {
       if (provider) provider.destroy();
       if (harness) { try { await harness.close(); } catch { /* ignore */ } }
       if (workspace) await rm(workspace, { recursive: true, force: true });
+      // Retain the failed startup's records so Copy diagnostics can explain it.
+      this.lastDiagnosticSnapshot = {
+        ...this.emptyDiagnostics(),
+        sessionId,
+        maxSessionSeconds: this.options.maxSessionSeconds,
+        startedAt: requestedAt,
+        endedAt: Date.now(),
+        stopCause: 'unknown',
+        backendReportedModel: backendModel,
+        diagnostics: diagnostics.snapshot(),
+      };
+      this.lastSessionOwnerId = ownerId;
       this.slotTaken = false;
       const safeMessage = error instanceof Error
         ? sanitizeErrorMessage(error.message)
@@ -331,13 +387,16 @@ export class GptLiveManager {
           },
           onError: (_code, _message) => {
             if (this.active && this.active.sessionId === sessionId) {
+              session.diagnostics.record({ source: 'server', code: 'provider_error', reason: 'provider' });
               session.callbacks.onError('Provider error occurred.');
               void this.closeSession(sessionId, 'sideband_error');
             }
           },
         },
       );
+      session.diagnostics.record({ source: 'server', code: 'sideband_attached' });
     } catch {
+      session.diagnostics.record({ source: 'server', code: 'sideband_failed', reason: 'network' });
       session.callbacks.onError('Failed to attach sideband connection.');
       void this.closeSession(sessionId, 'sideband_failure');
     }
@@ -349,9 +408,13 @@ export class GptLiveManager {
 
     const validFinalSeconds = typeof finalSeconds === 'number'
       && Number.isFinite(finalSeconds) && finalSeconds >= 0;
+    // A closure the app never requested is provider-initiated.
+    if (!session.stopCause) this.setStopCause(session, 'provider_closed');
+
     if (validFinalSeconds) {
       session.cumulativeVoiceSeconds = Math.max(session.cumulativeVoiceSeconds, finalSeconds);
     } else {
+      session.diagnostics.record({ source: 'server', code: 'closure_unconfirmed', reason: 'provider' });
       session.closureConfirmed = false;
       session.closureReason = reason;
       this.budget.finalize(sessionId, 0, false);
@@ -360,6 +423,7 @@ export class GptLiveManager {
       return;
     }
 
+    session.diagnostics.record({ source: 'server', code: 'closure_confirmed', durationMs: Math.round(finalSeconds * 1000) });
     session.closureConfirmed = true;
     session.closureReason = reason;
 
@@ -394,6 +458,11 @@ export class GptLiveManager {
         break;
       }
       case 'tool':
+        session.diagnostics.record({
+          source: 'server', code: event.status === 'running' ? 'tool_start' : 'tool_result',
+          delegationId: session.pendingDelegation ?? undefined, callId: event.callId, tool: event.name,
+          status: event.status, durationMs: event.durationMs, reason: event.reason, statusCode: event.statusCode,
+        });
         if (session.pendingDelegation && session.provider) {
           session.provider.sendThinking(
             'Backend is processing a tool call...',
@@ -401,10 +470,44 @@ export class GptLiveManager {
           );
         }
         break;
+      case 'result':
+        session.lastResultMeta = { durationMs: event.durationMs, numTurns: event.numTurns };
+        break;
       case 'error':
+        session.diagnostics.record({ source: 'server', code: 'backend_error', delegationId: session.pendingDelegation ?? undefined, reason: 'unknown' });
         session.callbacks.onError('Backend processing encountered an issue.');
         break;
     }
+  }
+
+  private setStopCause(session: ActiveTrialSession, cause: GptLiveStopCause): void {
+    if (session.stopCause) return;
+    session.stopCause = cause;
+    // Anything still queued or running when the app stops is an unfinished task.
+    let unfinished = 0;
+    for (const record of session.delegations) {
+      if (record.status === 'queued' || record.status === 'waiting_input' || record.status === 'running') {
+        record.status = 'unfinished';
+        record.settledAt = Date.now();
+        unfinished++;
+      }
+    }
+    session.diagnostics.record({ source: 'server', code: `stop_${cause}`, count: unfinished });
+  }
+
+  private delegationRecord(session: ActiveTrialSession, delegationId: string): GptLiveDelegationRecord | undefined {
+    for (let i = session.delegations.length - 1; i >= 0; i--) {
+      if (session.delegations[i].delegationId === delegationId) return session.delegations[i];
+    }
+    return undefined;
+  }
+
+  private setDelegationStatus(session: ActiveTrialSession, delegationId: string, status: GptLiveDelegationStatus): void {
+    const record = this.delegationRecord(session, delegationId);
+    if (!record) return;
+    record.status = status;
+    if (status === 'running') record.sentAt = Date.now();
+    else if (status !== 'queued' && status !== 'waiting_input') record.settledAt = Date.now();
   }
 
   private handleHarnessResult(sessionId: string, text: string): void {
@@ -429,11 +532,19 @@ export class GptLiveManager {
     if (session.processedDelegationIds.size > 1000) return;
     session.processedDelegationIds.add(delegationId);
 
+    session.delegations.push({ delegationId, offsetMs, createdAt: Date.now(), status: 'queued' });
+    if (session.delegations.length > MAX_DELEGATION_RECORDS) session.delegations.splice(0, session.delegations.length - MAX_DELEGATION_RECORDS);
+    session.diagnostics.record({ source: 'server', code: 'delegation_created', delegationId });
+
     session.callbacks.onDelegationCreated(delegationId, offsetMs);
 
     if (session.pendingDelegation || session.sendSettling) {
       if (session.delegationQueue.length < MAX_DELEGATION_QUEUE) {
         session.delegationQueue.push(delegationId);
+        session.diagnostics.record({ source: 'server', code: 'delegation_queued', delegationId, count: session.delegationQueue.length });
+      } else {
+        this.setDelegationStatus(session, delegationId, 'failed');
+        session.diagnostics.record({ source: 'server', code: 'delegation_dropped', delegationId, reason: 'cancelled' });
       }
       return;
     }
@@ -464,6 +575,8 @@ export class GptLiveManager {
     const session = this.active;
 
     if (!session.harness || !session.harnessReady || session.closing) {
+      this.setDelegationStatus(session, delegationId, session.closing ? 'unfinished' : 'failed');
+      session.diagnostics.record({ source: 'server', code: 'delegation_skipped', delegationId, reason: 'cancelled' });
       session.pendingDelegation = null;
       void this.drainDelegationQueue(sessionId);
       return;
@@ -472,11 +585,15 @@ export class GptLiveManager {
     let userContext = this.assembleUserContext(session);
 
     if (!userContext) {
+      this.setDelegationStatus(session, delegationId, 'waiting_input');
+      session.diagnostics.record({ source: 'server', code: 'delegation_waiting_input', delegationId });
       userContext = await this.waitForInput(session, DELEGATION_INPUT_TIMEOUT_MS);
       if (!this.active || this.active.sessionId !== sessionId || session.closing) return;
     }
 
     if (!userContext) {
+      this.setDelegationStatus(session, delegationId, 'no_input');
+      session.diagnostics.record({ source: 'server', code: 'delegation_no_input', delegationId, reason: 'timeout' });
       session.pendingDelegation = null;
       void this.drainDelegationQueue(sessionId);
       return;
@@ -491,10 +608,16 @@ export class GptLiveManager {
 
     session.sendSettling = true;
     session.pendingResult = null;
+    session.lastResultMeta = null;
+    this.setDelegationStatus(session, delegationId, 'running');
+    const sentAt = Date.now();
+    session.diagnostics.record({ source: 'server', code: 'delegation_started', delegationId });
     try {
       await session.harness.send(userContext);
     } catch (err) {
       session.sendSettling = false;
+      this.setDelegationStatus(session, delegationId, 'failed');
+      session.diagnostics.record({ source: 'server', code: 'backend_failed', delegationId, durationMs: Math.max(0, Date.now() - sentAt), reason: 'unknown' });
       try { session.callbacks.onError('Backend delegation processing failed.'); } catch { /* safe */ }
       session.pendingDelegation = null;
       void this.drainDelegationQueue(sessionId);
@@ -507,24 +630,40 @@ export class GptLiveManager {
     if (!this.active || this.active.sessionId !== sessionId) return;
     const resultText = session.pendingResult;
     session.pendingResult = null;
+    session.diagnostics.record({
+      source: 'server', code: resultText ? 'backend_result' : 'backend_no_result', delegationId,
+      durationMs: Math.max(0, Date.now() - sentAt), count: this.resultTurnCount(session),
+    });
 
+    let delivered = false;
     if (resultText && session.provider && session.pendingDelegation) {
       try {
-        this.sendChunkedCommentary(session.provider, resultText, session.pendingDelegation);
-      } catch { /* provider send error is non-fatal */ }
+        const chunks = this.sendChunkedCommentary(session.provider, resultText, session.pendingDelegation);
+        delivered = chunks > 0;
+        session.diagnostics.record({ source: 'server', code: 'commentary_sent', delegationId, count: chunks });
+      } catch {
+        session.diagnostics.record({ source: 'server', code: 'commentary_failed', delegationId, reason: 'provider' });
+      }
     }
+    this.setDelegationStatus(session, delegationId, delivered ? 'delivered' : 'no_result');
 
     session.pendingDelegation = null;
     void this.drainDelegationQueue(sessionId);
   }
 
-  private sendChunkedCommentary(provider: LiveProvider, text: string, delegationId: string): void {
+  /** Read the harness result metadata set by the event callback during the awaited send. */
+  private resultTurnCount(session: ActiveTrialSession): number | undefined {
+    return session.lastResultMeta?.numTurns;
+  }
+
+  private sendChunkedCommentary(provider: LiveProvider, text: string, delegationId: string): number {
     const trimmed = text.trim();
-    if (!trimmed) return;
+    if (!trimmed) return 0;
     const chunks = splitUtf8Chunks(trimmed, MAX_COMMENTARY_CHUNK_BYTES);
     for (const chunk of chunks) {
       provider.sendCommentary(chunk, delegationId);
     }
+    return chunks.length;
   }
 
   private waitForInput(session: ActiveTrialSession, timeoutMs: number): Promise<string> {
@@ -624,6 +763,7 @@ export class GptLiveManager {
     session.closing = true;
 
     clearTimeout(session.deadline);
+    this.setStopCause(session, toStopCause(reason));
 
     session.closingPromise = new Promise<void>(r => { session.closingResolve = r; });
 
@@ -631,6 +771,7 @@ export class GptLiveManager {
       if (!this.active || this.active.sessionId !== sessionId) return;
       if (session.closureConfirmed !== null) return;
 
+      session.diagnostics.record({ source: 'server', code: 'closure_timeout', reason: 'timeout' });
       session.closureConfirmed = false;
       session.closureReason = reason;
 
@@ -682,6 +823,8 @@ export class GptLiveManager {
 
     await this.safeSave();
 
+    session.endedAt = Date.now();
+    session.diagnostics.record({ source: 'server', code: 'session_closed', durationMs: Math.max(0, session.endedAt - session.startedAt) });
     this.lastDiagnosticSnapshot = this.buildDiagnostics(session);
     this.lastSessionOwnerId = session.ownerId;
 
@@ -704,8 +847,17 @@ export class GptLiveManager {
       closureConfirmed: session.closureConfirmed,
       closureReason: session.closureReason,
       delegationsProcessed: session.processedDelegationIds.size,
-      delegationsSkipped: 0,
+      delegationsSkipped: session.delegations.filter(d => d.status === 'no_input' || d.status === 'failed').length,
       transcript: session.transcript.map(t => ({ ...t })),
+      maxSessionSeconds: this.options.maxSessionSeconds,
+      startedAt: session.startedAt,
+      endedAt: session.endedAt,
+      deadlineAt: session.deadlineAt,
+      stopCause: session.stopCause,
+      unfinishedDelegation: session.delegations.some(d => d.status === 'unfinished'),
+      backendReportedModel: session.backendModel,
+      delegations: session.delegations.map(d => ({ ...d })),
+      diagnostics: session.diagnostics.snapshot(),
     };
   }
 
@@ -737,6 +889,15 @@ export class GptLiveManager {
       delegationsProcessed: 0,
       delegationsSkipped: 0,
       transcript: [],
+      maxSessionSeconds: this.options.maxSessionSeconds,
+      startedAt: null,
+      endedAt: null,
+      deadlineAt: null,
+      stopCause: null,
+      unfinishedDelegation: false,
+      backendReportedModel: null,
+      delegations: [],
+      diagnostics: { entries: [], dropped: 0 },
     };
   }
 

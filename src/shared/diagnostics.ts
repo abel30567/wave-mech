@@ -9,6 +9,8 @@ export interface DiagnosticInput {
   turnId?: number;
   responseId?: number;
   callId?: string;
+  /** Opaque GPT-Live delegation identifier the event belongs to (trial mode only). */
+  delegationId?: string;
   tool?: string;
   status?: DiagnosticToolStatus;
   reason?: DiagnosticReason;
@@ -38,6 +40,7 @@ export function safeDiagnostic(input: DiagnosticInput): DiagnosticInput {
   }
   if (input.tool && /^(Read|Write|Edit|Bash|Grep|Glob|Agent|Task|Skill|WebSearch|WebFetch|ToolSearch|mcp__fermi__[a-z][a-z0-9_]{0,99})$/.test(input.tool)) result.tool = input.tool;
   if (input.callId && /^[a-zA-Z0-9_-]{1,100}$/.test(input.callId)) result.callId = input.callId;
+  if (input.delegationId && /^[a-zA-Z0-9_-]{1,100}$/.test(input.delegationId)) result.delegationId = input.delegationId;
   if (input.status && STATUSES.has(input.status)) result.status = input.status;
   if (input.reason && REASONS.has(input.reason)) result.reason = input.reason;
   return result;

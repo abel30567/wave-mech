@@ -326,6 +326,24 @@ describe('createHarness — onResult callback', () => {
   });
 });
 
+describe('createHarness — result metadata event', () => {
+  it('emits duration and turn count from a successful result line, never the text, cost or usage', async () => {
+    const { session, events } = build('text_only');
+    await session.start();
+    await session.send('hi');
+    const result = events.filter((e) => e.type === 'result');
+    expect(result).toEqual([{ type: 'result', durationMs: 1234, numTurns: 2 }]);
+    expect(JSON.stringify(result)).not.toMatch(/Simple direct answer|total_cost|usage|input_tokens/);
+  });
+
+  it('emits no result metadata for an error result', async () => {
+    const { session, events } = build('error');
+    await session.start();
+    await expect(session.send('hi')).rejects.toThrow();
+    expect(events.some((e) => e.type === 'result')).toBe(false);
+  });
+});
+
 describe('createHarness — model validation', () => {
   it('preserves a safe Claude model identifier from system/init', async () => {
     const { session, events } = build('basic', { MODEL: 'claude-opus-4-6' });

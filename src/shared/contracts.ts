@@ -4,6 +4,8 @@ export type HarnessEvent =
   | { type: 'ready'; sessionId?: string; model?: string; tools?: string[]; mcp?: Array<{ name: string; status: string }> }
   | { type: 'text'; text: string }
   | { type: 'tool'; name: string; status: DiagnosticToolStatus; callId?: string; reason?: DiagnosticReason; statusCode?: number; durationMs?: number }
+  /** Safe metadata from a successful CLI `result` line (never the result text or usage payload). */
+  | { type: 'result'; durationMs?: number; numTurns?: number }
   | { type: 'error'; message: string };
 
 export interface HarnessOptions {

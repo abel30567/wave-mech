@@ -43,6 +43,12 @@ interface CliMessage {
   is_error?: boolean;
   error?: unknown;
   result?: unknown;
+  duration_ms?: unknown;
+  num_turns?: unknown;
+}
+
+function safeCount(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined;
 }
 
 interface PendingInterrupt {
@@ -588,6 +594,8 @@ class ClaudeCliHarness implements HarnessSession {
       this.failPending(new Error('Result arrived on a quarantined or interrupted generation.'));
       return;
     }
+    // Timing/turn metadata mirrors the CLI transcript record; never the text or usage payload.
+    this.emit({ type: 'result', durationMs: safeCount(msg.duration_ms), numTurns: safeCount(msg.num_turns) });
     if (this.options.onResult) {
       const resultText = typeof msg.result === 'string' ? msg.result.trim() : '';
       if (resultText.length > 0) {

@@ -3,7 +3,9 @@ import type {
   GptLiveTrialStatus,
   GptLiveTranscriptEntry,
   GptLiveDiagnostics,
+  GptLiveStopCause,
 } from '../../shared/gpt-live-trial.js';
+import { browserReport, formatTranscriptReport } from '../transcript.js';
 
 export type GptLivePhase = 'idle' | 'connecting' | 'active' | 'muted' | 'ending' | 'ended' | 'error';
 
@@ -11,6 +13,8 @@ interface GptLivePanelProps {
   trialStatus: GptLiveTrialStatus | null;
   defaultModeActive: boolean;
   onModeSwitch: (mode: 'default' | 'gpt-live') => void;
+  mode?: 'live' | 'fixture';
+  buildId?: string;
 }
 
 interface SessionState {
@@ -22,6 +26,9 @@ interface SessionState {
   errorMessage: string | null;
   budgetRemainingUsd: number;
   closureConfirmed: boolean | null;
+  stopCause: GptLiveStopCause | null;
+  unfinishedDelegation: boolean;
+  remainingSeconds: number | null;
   autoplayBlocked: boolean;
   copyStatus: 'idle' | 'copied' | 'fallback';
   copyFallback: string;
@@ -36,51 +43,41 @@ const initialState: SessionState = {
   errorMessage: null,
   budgetRemainingUsd: 0,
   closureConfirmed: null,
+  stopCause: null,
+  unfinishedDelegation: false,
+  remainingSeconds: null,
   autoplayBlocked: false,
   copyStatus: 'idle',
   copyFallback: '',
 };
 
-const SDP_SECRET_RE = /v=0\r?\no=|a=candidate:|a=ice-ufrag:|a=ice-pwd:|a=fingerprint:/;
-const KEY_HEADER_RE = /sk-[a-zA-Z0-9_-]{8,}|Bearer [a-zA-Z0-9._\-]+|authorization:\s/i;
+// Safety net past the server deadline: if the provider never flips ICE state
+// after the server closes, the panel still stops claiming an active session.
+const DEADLINE_GRACE_MS = 5000;
 
-function looksLikeRawPayload(text: string): boolean {
-  return SDP_SECRET_RE.test(text) || KEY_HEADER_RE.test(text);
+function limitLabel(seconds: number): string {
+  return seconds % 60 === 0 ? `${seconds / 60}-minute` : `${seconds}-second`;
 }
 
-function sanitizeText(text: string): string {
-  return text
-    .replace(/sk-[a-zA-Z0-9_-]{8,}/g, '[key-redacted]')
-    .replace(/Bearer [a-zA-Z0-9._\-]+/g, 'Bearer [redacted]')
-    .slice(0, 2000);
+function clock(seconds: number): string {
+  const whole = Math.max(0, Math.floor(seconds));
+  return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')}`;
 }
 
-function buildReport(diag: GptLiveDiagnostics): string {
-  const safeTranscript = diag.transcript
-    .filter(t => !looksLikeRawPayload(t.text))
-    .slice(-100)
-    .map(t => ({ ...t, text: sanitizeText(t.text) }));
-
-  return [
-    'wave-mech GPT-Live trial diagnostics',
-    '— Review before sharing —',
-    '',
-    `Voice model: ${diag.voiceModel}`,
-    `Backend model: ${diag.backendModel}`,
-    `Session ID: ${diag.sessionId ?? 'none'}`,
-    `Cumulative voice: ${diag.cumulativeVoiceSeconds.toFixed(1)}s`,
-    `Estimated cost: $${diag.estimatedCostUsd.toFixed(4)}`,
-    `Closure confirmed: ${diag.closureConfirmed}`,
-    `Closure reason: ${diag.closureReason ?? 'none'}`,
-    `Delegations processed: ${diag.delegationsProcessed}`,
-    `Delegations skipped: ${diag.delegationsSkipped}`,
-    '',
-    'TRANSCRIPT',
-    ...safeTranscript.map(t => `[${t.source}] ${t.role}: ${t.text}`),
-  ].join('\n');
+function stopNotice(stopCause: GptLiveStopCause | null, unfinished: boolean, maxSeconds: number): string | null {
+  const unfinishedText = unfinished ? ' A backend task was still running, so its answer was not delivered.' : '';
+  switch (stopCause) {
+    case 'deadline': return `The session ended at the ${limitLabel(maxSeconds)} limit.${unfinishedText}`;
+    case 'budget_exceeded': return `The session ended because reported voice usage reached the configured limit.${unfinishedText}`;
+    case 'provider_closed': return `The provider closed the session.${unfinishedText}`;
+    case 'sideband_error':
+    case 'sideband_failure': return `The provider control channel failed, so the session was stopped.${unfinishedText}`;
+    case 'shutdown': return `The server stopped the session.${unfinishedText}`;
+    default: return unfinished ? `The session ended while a backend task was still running; its answer was not delivered.` : null;
+  }
 }
 
-export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: GptLivePanelProps) {
+export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch, mode, buildId }: GptLivePanelProps) {
   const [state, setState] = useState<SessionState>(() => ({
     ...initialState,
     budgetRemainingUsd: trialStatus?.budgetRemainingUsd ?? 0,
@@ -94,6 +91,8 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
   const startingRef = useRef(false);
   const endingRef = useRef(false);
   const lastDiagRef = useRef<GptLiveDiagnostics | null>(null);
+  const startedAtRef = useRef<number | null>(null);
+  const maxSessionSeconds = trialStatus?.maxSessionSeconds ?? 0;
 
   const stopLocalMedia = useCallback(() => {
     if (streamRef.current) {
@@ -139,18 +138,19 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
     const g = ++genRef.current;
 
     stopLocalMedia();
+    startedAtRef.current = null;
 
     const sid = sessionIdRef.current;
     sessionIdRef.current = null;
     startingRef.current = false;
 
     if (!sid) {
-      setState(prev => ({ ...prev, phase: 'idle', errorMessage: null, autoplayBlocked: false }));
+      setState(prev => ({ ...prev, phase: 'idle', errorMessage: null, autoplayBlocked: false, remainingSeconds: null }));
       endingRef.current = false;
       return;
     }
 
-    setState(prev => ({ ...prev, phase: 'ending', autoplayBlocked: false }));
+    setState(prev => ({ ...prev, phase: 'ending', autoplayBlocked: false, remainingSeconds: null }));
 
     await endOnServer(sid);
     if (genRef.current !== g) { endingRef.current = false; return; }
@@ -162,6 +162,8 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
       ...prev,
       phase: 'ended',
       closureConfirmed: diag?.closureConfirmed ?? null,
+      stopCause: diag?.stopCause ?? null,
+      unfinishedDelegation: diag?.unfinishedDelegation === true,
       cumulativeSeconds: diag?.cumulativeVoiceSeconds ?? prev.cumulativeSeconds,
       estimatedCostUsd: diag?.estimatedCostUsd ?? prev.estimatedCostUsd,
       transcript: diag?.transcript ?? prev.transcript,
@@ -181,6 +183,23 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
       }
     };
   }, [stopLocalMedia, endOnServer]);
+
+  const isActive = state.phase === 'active' || state.phase === 'muted';
+
+  // Countdown toward the configured limit while the paid session is active.
+  useEffect(() => {
+    if (!isActive || !maxSessionSeconds) return;
+    const tick = () => {
+      const startedAt = startedAtRef.current;
+      if (startedAt === null) return;
+      const elapsed = (Date.now() - startedAt) / 1000;
+      setState(prev => ({ ...prev, remainingSeconds: Math.max(0, maxSessionSeconds - elapsed) }));
+      if (elapsed * 1000 > maxSessionSeconds * 1000 + DEADLINE_GRACE_MS) void endSession();
+    };
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [isActive, maxSessionSeconds, endSession]);
 
   const startSession = useCallback(async () => {
     if (!trialStatus?.enabled || !trialStatus?.hasApiKey) return;
@@ -262,6 +281,9 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
         return;
       }
       sessionIdRef.current = data.sessionId;
+      // The server's deadline started when the provider session was created,
+      // just before this response; the countdown is anchored here.
+      startedAtRef.current = Date.now();
 
       pc.ontrack = (ev) => {
         if (genRef.current !== g) return;
@@ -303,6 +325,7 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
     } catch (error) {
       if (genRef.current !== g) { startingRef.current = false; return; }
       stopLocalMedia();
+      startedAtRef.current = null;
       const sid = sessionIdRef.current;
       if (sid) { sessionIdRef.current = null; void endOnServer(sid); }
       startingRef.current = false;
@@ -344,13 +367,28 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
         cumulativeVoiceSeconds: state.cumulativeSeconds,
         estimatedCostUsd: state.estimatedCostUsd,
         closureConfirmed: state.closureConfirmed,
-        closureReason: state.phase === 'ended' ? 'user_ended' : null,
+        closureReason: null,
+        stopCause: state.phase === 'ended' ? 'user_ended' : null,
+        unfinishedDelegation: state.unfinishedDelegation,
         delegationsProcessed: 0,
         delegationsSkipped: 0,
         transcript: state.transcript,
+        diagnostics: { entries: [], dropped: 0 },
       };
     }
-    const report = buildReport(diag);
+    // Same report format as the default mode's Copy transcript: ISO timestamps,
+    // structured tool/error/lifecycle lines, no raw payloads or credentials.
+    const report = formatTranscriptReport({
+      messages: [],
+      diagnostics: diag.diagnostics ?? { entries: [], dropped: 0 },
+      capturedAt: Date.now(),
+      mode,
+      configuredModel: diag.backendModel,
+      reportedModel: diag.backendReportedModel ?? undefined,
+      buildId,
+      browser: browserReport(),
+      gptLiveTrial: diag,
+    });
     try {
       if (!navigator.clipboard?.writeText) throw new Error('unavailable');
       await navigator.clipboard.writeText(report);
@@ -358,14 +396,14 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
     } catch {
       setState(prev => ({ ...prev, copyStatus: 'fallback', copyFallback: report }));
     }
-  }, [state, fetchDiag]);
+  }, [state, fetchDiag, mode, buildId]);
 
   if (!trialStatus?.enabled) return null;
 
-  const isActive = state.phase === 'active' || state.phase === 'muted';
   const canStart = trialStatus.hasApiKey && state.phase === 'idle' && !defaultModeActive
     && trialStatus.budgetRemainingUsd > 0;
   const showEnd = state.phase === 'connecting' || isActive;
+  const endNotice = state.phase === 'ended' ? stopNotice(state.stopCause, state.unfinishedDelegation, maxSessionSeconds) : null;
 
   return (
     <div className="gpt-live-panel" data-testid="gpt-live-panel">
@@ -427,6 +465,9 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
 
         {(state.phase === 'ended' || state.phase === 'error') && (
           <>
+            {endNotice && (
+              <div className="gpt-live-notice gpt-live-stop-notice" role="status">{endNotice}</div>
+            )}
             {state.closureConfirmed === false && (
               <div className="gpt-live-notice">
                 Session closure was not confirmed by the provider. Usage may be conservatively estimated.
@@ -483,13 +524,15 @@ export function GptLivePanel({ trialStatus, defaultModeActive, onModeSwitch }: G
       {isActive && (
         <div className="gpt-live-status">
           <span>Budget: ${(trialStatus.budgetRemainingUsd - state.estimatedCostUsd).toFixed(2)} remaining</span>
-          <span>Max: {trialStatus.maxSessionSeconds}s</span>
+          <span data-testid="gpt-live-time-left">
+            {state.remainingSeconds === null ? `Max: ${trialStatus.maxSessionSeconds}s` : `Time left: ${clock(state.remainingSeconds)} of ${clock(maxSessionSeconds)}`}
+          </span>
         </div>
       )}
 
       <div className="gpt-live-disclosure">
         Audio is processed by OpenAI (gpt-live-1). Backend actions use Claude Code.
-        Paid usage: ~$0.05/min voice. Trial budget: $5.
+        Paid usage: ~$0.05/min voice. Trial budget: $5. Sessions stop automatically at {clock(maxSessionSeconds)}.
       </div>
 
       {state.transcript.length > 0 && (

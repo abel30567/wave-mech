@@ -286,7 +286,11 @@ async function runTextOnly() {
   await streamEvent({ type: 'content_block_stop', index: 0 });
   await streamEvent({ type: 'message_stop' });
 
-  await emit({ type: 'result', subtype: 'success', is_error: false, result: 'Simple direct answer.', session_id: SESSION_ID });
+  await emit({
+    type: 'result', subtype: 'success', is_error: false, result: 'Simple direct answer.', session_id: SESSION_ID,
+    duration_ms: 1234, duration_api_ms: 1100, num_turns: 2, total_cost_usd: 0.01,
+    usage: { input_tokens: 10, output_tokens: 5 },
+  });
 }
 
 async function runMultiToolRounds() {

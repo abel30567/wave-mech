@@ -198,13 +198,26 @@ async function setupGptLiveRoutes(
         cumulativeVoiceSeconds: 12.5,
         estimatedCostUsd: 0.0104,
         closureConfirmed: opts.closureConfirmed !== undefined ? opts.closureConfirmed : true,
-        closureReason: 'user_ended',
+        closureReason: 'close_requested',
         delegationsProcessed: 1,
         delegationsSkipped: 0,
         transcript: opts.diagTranscript ?? [
           { role: 'user', text: 'Hello test', source: 'voice-model', timestampMs: 1000 },
           { role: 'assistant', text: 'Test response', source: 'voice-model', timestampMs: 2000 },
         ],
+        maxSessionSeconds: 300,
+        startedAt: 1_789_567_200_000,
+        deadlineAt: 1_789_567_500_000,
+        endedAt: 1_789_567_212_500,
+        stopCause: 'user_ended',
+        unfinishedDelegation: false,
+        backendReportedModel: 'claude-opus-4-6[1m]',
+        delegations: [{ delegationId: 'dlg_e2e', offsetMs: 1500, createdAt: 1_789_567_201_500, sentAt: 1_789_567_201_600, settledAt: 1_789_567_205_000, status: 'delivered' }],
+        diagnostics: { entries: [
+          { id: 'server:1', at: 1_789_567_200_000, source: 'server', code: 'session_requested' },
+          { id: 'server:2', at: 1_789_567_202_000, source: 'server', code: 'tool_start', delegationId: 'dlg_e2e', callId: 'toolu_e2e', tool: 'mcp__fermi__execute', status: 'running', arguments: 'ARG_SECRET_SENTINEL' },
+          { id: 'server:3', at: 1_789_567_205_000, source: 'server', code: 'backend_result', delegationId: 'dlg_e2e', durationMs: 3400, count: 2 },
+        ], dropped: 0 },
       }),
     });
   });
@@ -475,10 +488,21 @@ test.describe('GPT-Live trial panel', () => {
     expect(report).toContain('Backend completed task');
     expect(report).toContain('TRANSCRIPT');
 
-    // Report must NOT contain raw SDP, ICE, or keys
+    // Same timestamped structure as the default-mode report: lifecycle, delegation, tool and result records.
+    expect(report).toContain('Session limit: 300s');
+    expect(report).toContain('Stop cause (app): user_ended');
+    expect(report).toContain('Provider closure reason: close_requested');
+    expect(report).toContain('2026-09-16T14:00:00.000Z [server:1] {"source":"server","code":"session_requested"}');
+    expect(report).toContain('[server:2] {"source":"server","code":"tool_start","tool":"mcp__fermi__execute","callId":"toolu_e2e","delegationId":"dlg_e2e","status":"running"}');
+    expect(report).toContain('[server:3] {"source":"server","code":"backend_result","durationMs":3400,"count":2,"delegationId":"dlg_e2e"}');
+    expect(report).toContain('[delegation:dlg_e2e] status=delivered offset=1500ms sent=+100ms settled=+3500ms');
+    expect(report).toContain('1970-01-01T00:00:01.000Z [voice-model] user: Hello from voice');
+
+    // Report must NOT contain raw SDP, ICE, keys, or smuggled tool payloads
     expect(report).not.toContain('ice-ufrag');
     expect(report).not.toContain('sk-proj-');
     expect(report).not.toContain('AAAAAAAAAAAABBBB');
+    expect(report).not.toContain('ARG_SECRET_SENTINEL');
   });
 
   test('clipboard fallback when clipboard is denied', async ({ page }) => {
