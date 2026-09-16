@@ -69,11 +69,22 @@ export interface RealtimeSpeech extends Omit<SpeechSession, 'writeAudio'> {
   writeAudio(pcm: Uint8Array): boolean;
   abortRecognition(): void;
   cancelSpeech(): void;
+  /**
+   * Optionally pre-open the TTS stream-input socket (token fetch + websocket
+   * open) so the first synthesized audio arrives sooner. Optional so main can
+   * wire it incrementally; the coordinator tolerates its absence.
+   */
+  prewarm?(): void;
 }
 export interface ConversationOptions {
   id: string;
   mode: 'live' | 'fixture';
-  harness(onEvent: (event: HarnessEvent) => void): RealtimeHarness;
+  /**
+   * `onResult` delivers the final assistant text of a turn (the text after the
+   * last tool call). Optional so main can wire it in one line; the coordinator
+   * tolerates its absence and simply speaks nothing extra after tools.
+   */
+  harness(onEvent: (event: HarnessEvent) => void, onResult?: (text: string) => void): RealtimeHarness;
   speech?: (callbacks: {
     onPartial(text: string): void;
     onAudio(audio: string, sampleRate: number): void;

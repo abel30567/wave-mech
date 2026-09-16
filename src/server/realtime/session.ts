@@ -43,6 +43,16 @@ interface ActiveResponse {
   inferenceActive: boolean;
   awaitingPlayback: boolean;
   assistantIndex: number | undefined;
+  /** A tool has started in this turn: streamed narration is no longer spoken. */
+  toolStarted: boolean;
+  /** Pre-tool narration has been written to an open synthesis stream. */
+  narrationOpen: boolean;
+  /** The speech_gated diagnostic has been recorded once for this turn. */
+  gatedNarration: boolean;
+  /** Concise final answer text delivered via onResult (spoken after tools). */
+  finalText: string | undefined;
+  /** In-flight end-of-sequence of the preamble stream, awaited before the final. */
+  preambleFinish: Promise<void> | undefined;
 }
 
 /** Cheap order-sensitive checksum used only to spot conflicting duplicate frames. */
@@ -104,7 +114,10 @@ class Conversation implements RetainedConversation {
     if (this.startPromise) return this.startPromise;
     if (this.closed) return Promise.reject(new Error('Conversation is closed.'));
 
-    this.harness = this.options.harness((event) => this.onHarness(event));
+    this.harness = this.options.harness(
+      (event) => this.onHarness(event),
+      (text) => this.onResult(text),
+    );
     if (this.options.speech) {
       this.speech = this.options.speech({
         onPartial: (text) => this.onPartial(text),
@@ -446,6 +459,11 @@ class Conversation implements RetainedConversation {
       inferenceActive: true,
       awaitingPlayback: false,
       assistantIndex: undefined,
+      toolStarted: false,
+      narrationOpen: false,
+      gatedNarration: false,
+      finalText: undefined,
+      preambleFinish: undefined,
     };
     // A response created while detached has no audience for TTS; suppress it up
     // front so we never synthesize unheard audio.
@@ -454,6 +472,16 @@ class Conversation implements RetainedConversation {
     this.input = undefined;
     this.setPhase('thinking');
     this.recordDiagnostic({ source: 'server', code: 'turn_start', turnId, responseId: response.responseId });
+    // Pre-open the TTS socket in parallel with inference so first audio is fast.
+    // The adapter fences the open on its own synthesis epoch, so a cancellation
+    // cannot leak a late-opened socket into a replacement turn.
+    if (this.speech && !response.ttsSuppressed) {
+      try {
+        this.speech.prewarm?.();
+      } catch {
+        /* prewarm is best-effort latency; never fail the turn on it */
+      }
+    }
     this.inference = this.runInference(response, text);
   }
 
@@ -479,11 +507,43 @@ class Conversation implements RetainedConversation {
 
     // Flush and await final TTS unless output was suppressed (detached / no audience).
     if (this.speech && !response.ttsSuppressed) {
-      try {
-        await this.speech.finishSpeech();
-      } catch {
-        if (response.cancelled || this.closed) return;
-        response.audioInterrupted = true;
+      // A tool ended the preamble stream mid-turn; let that finalize (its audio
+      // has already streamed) before opening a fresh stream for the final answer.
+      if (response.preambleFinish) {
+        try {
+          await response.preambleFinish;
+        } catch {
+          /* preamble finalize faults are already reflected on the response */
+        }
+        response.preambleFinish = undefined;
+      }
+      if (response.cancelled || this.closed) return;
+
+      if (response.toolStarted) {
+        // Tools ran: speak only the concise final answer delivered via onResult,
+        // never the gated preamble/interim narration.
+        if (response.finalText) {
+          try {
+            this.speech.writeText(response.finalText);
+            await this.speech.finishSpeech();
+            this.recordDiagnostic({ source: 'server', code: 'final_answer_synthesized', turnId: response.turnId, responseId: response.responseId });
+          } catch {
+            if (response.cancelled || this.closed) return;
+            response.audioInterrupted = true;
+          }
+        } else {
+          // No concise final text: say nothing more and report it rather than
+          // re-speaking the narration.
+          this.recordDiagnostic({ source: 'server', code: 'final_answer_synthesized', turnId: response.turnId, responseId: response.responseId, count: 0 });
+        }
+      } else {
+        // No tools ran: flush the streamed narration and await its final audio.
+        try {
+          await this.speech.finishSpeech();
+        } catch {
+          if (response.cancelled || this.closed) return;
+          response.audioInterrupted = true;
+        }
       }
     }
     if (response.cancelled || this.closed) return;
@@ -564,12 +624,24 @@ class Conversation implements RetainedConversation {
         if (!response || !response.inferenceActive || response.cancelled) return;
         this.appendAssistant(response, event.text);
         this.emit({ type: 'text', turnId: response.turnId, responseId: response.responseId, text: event.text });
+        // Speak only what a listener wants to hear: stream pre-tool narration for
+        // fast first audio, but once a tool has started keep the text in the
+        // transcript only and stop feeding synthesis (the concise final answer is
+        // spoken later via onResult).
         if (this.speech && !response.ttsSuppressed) {
-          try {
-            this.speech.writeText(event.text);
-          } catch {
-            response.audioInterrupted = true;
-            this.emitNotice('tts_error', 'Speech output failed for this response.');
+          if (response.toolStarted) {
+            if (!response.gatedNarration) {
+              response.gatedNarration = true;
+              this.recordDiagnostic({ source: 'server', code: 'speech_gated', turnId: response.turnId, responseId: response.responseId });
+            }
+          } else {
+            try {
+              this.speech.writeText(event.text);
+              response.narrationOpen = true;
+            } catch {
+              response.audioInterrupted = true;
+              this.emitNotice('tts_error', 'Speech output failed for this response.');
+            }
           }
         }
         return;
@@ -582,6 +654,22 @@ class Conversation implements RetainedConversation {
         this.recordDiagnostic({ source: 'server', code: event.status === 'running' ? 'tool_start' : 'tool_result',
           callId: event.callId, tool: event.name, status: event.status, durationMs: event.durationMs,
           reason: event.reason, statusCode: event.statusCode, turnId: response.turnId, responseId: response.responseId });
+        if (event.status === 'running' && !response.toolStarted) {
+          response.toolStarted = true;
+          // End (end-of-sequence) the open preamble stream right away rather than
+          // leaving it open and idle across the tool wait; its audio has already
+          // been streamed. A fresh stream is opened lazily for the final answer.
+          if (this.speech && !response.ttsSuppressed && response.narrationOpen && !response.preambleFinish) {
+            response.narrationOpen = false;
+            try {
+              response.preambleFinish = this.speech.finishSpeech().catch(() => {
+                response.audioInterrupted = true;
+              });
+            } catch {
+              /* best-effort; a fresh stream still serves the final answer */
+            }
+          }
+        }
         return;
       }
       case 'result': {
@@ -608,6 +696,19 @@ class Conversation implements RetainedConversation {
     if (input && input.status === 'recording') {
       this.emit({ type: 'partial', turnId: input.turnId, text });
     }
+  }
+
+  /**
+   * The final assistant text of a turn (text after the last tool call). Captured
+   * on the active response so runInference can speak the concise answer once
+   * tools have run. Tolerated as absent — main wires it optionally.
+   */
+  private onResult(text: string): void {
+    if (this.closed) return;
+    const response = this.response;
+    if (!response || response.cancelled) return;
+    const trimmed = text.trim();
+    if (trimmed) response.finalText = trimmed;
   }
 
   private onAudio(audio: string, sampleRate: number): void {

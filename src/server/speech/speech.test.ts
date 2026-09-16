@@ -276,19 +276,91 @@ describe('synthesis idle keepalive (long tool waits)', () => {
     expect(h.errors).toEqual([]);
   });
 
-  it('reports the dropped socket honestly when idle exceeds the keepalive window', async () => {
+  it('treats an idle warm-socket close as benign and reopens lazily on the next write', async () => {
     // With keepalives effectively disabled (interval far longer than the idle
-    // window), the same tool wait lets the server close the socket. The adapter
-    // must surface that drop as an error and must not synthesize phantom audio —
-    // this is exactly the failure the keepalive above prevents.
+    // window), a long tool wait lets the provider close the warm socket. An idle
+    // close mid-wait is NOT a synthesis error — it must not surface as tts_error —
+    // and no phantom audio is faked for the dropped preamble. The next writeText
+    // reopens lazily on a fresh socket/token and the answer still synthesizes.
     const h = await makeHarness({ ttsInactivityMs: 60 }, {}, { ttsKeepAliveMs: 10_000 });
     h.session.writeText('preamble ');
     await delay(150); // exceeds the 60 ms idle window with no keepalive
-    // The drop is reported, not swallowed.
-    expect(h.errors).toContain('speech_socket_closed');
-    // The lost preamble is never faked as delivered audio.
-    await h.session.finishSpeech().catch(() => undefined);
-    expect(h.audio).toEqual([]);
+    // The idle drop is swallowed as benign, never reported as an error.
+    expect(h.errors).toEqual([]);
+    // Lazy reopen: a subsequent write establishes a fresh socket and synthesizes.
+    h.session.writeText('answer ');
+    await h.session.finishSpeech();
+    expect(decode(h.audio.at(-1)!.audio)).toContain('answer');
+    // A second token proves the dropped socket was reopened, not silently reused.
+    expect(h.tokenCalls.filter((k) => k === 'tts_websocket').length).toBeGreaterThanOrEqual(2);
+    expect(h.errors).toEqual([]);
+  });
+});
+
+describe('synthesis prewarm, sentence flush and keepalive shape (issue 15)', () => {
+  it('prewarms the TTS socket once per turn and is fenced by cancel', async () => {
+    const diagnostics: import('../../shared/diagnostics.js').DiagnosticInput[] = [];
+    const h = await makeHarness({}, { onDiagnostic: (e) => diagnostics.push(e) });
+    h.session.prewarm();
+    h.session.prewarm(); // idempotent within the turn: still one socket
+    await delay(30);
+    expect(h.fixture.ttsConnections()).toBe(1);
+    expect(diagnostics.filter((d) => d.code === 'tts_prewarmed')).toHaveLength(1);
+
+    // A cancel that races the prewarm fences it: the warm socket is dropped and a
+    // later response opens a genuinely fresh one.
+    h.session.cancelSpeech!();
+    h.session.writeText('after cancel ');
+    await h.session.finishSpeech();
+    expect(decode(h.audio.map((v) => v.audio).join(''))).toContain('after cancel');
+    expect(h.errors).toEqual([]);
+  });
+
+  it('warms first audio: prewarm opens before any text so writeText reuses the socket', async () => {
+    const h = await makeHarness();
+    h.session.prewarm();
+    await delay(30); // socket is already open and warm
+    h.session.writeText('First sentence. ');
+    await h.session.finishSpeech();
+    // A single socket/token served the whole response — prewarm + reuse.
+    expect(h.tokenCalls.filter((k) => k === 'tts_websocket')).toHaveLength(1);
+    expect(h.errors).toEqual([]);
+  });
+
+  it('flushes at a sentence boundary but not mid-sentence', async () => {
+    const h = await makeHarness();
+    h.session.writeText('Hello there. '); // ends a sentence -> flush expected
+    h.session.writeText('still going '); // mid-sentence -> no flush
+    await delay(20);
+    const flushes = h.fixture.ttsFrames.filter((f) => {
+      const m = JSON.parse(f) as { text?: string; flush?: boolean };
+      return m.flush === true;
+    });
+    expect(flushes).toHaveLength(1);
+    await h.session.finishSpeech();
+    expect(h.errors).toEqual([]);
+  });
+
+  it('never sends an empty-string keepalive (empty text is EOS, not a keepalive)', async () => {
+    // Keepalive far below the idle window; any ping must be a single space, never
+    // an empty string (which would end generation).
+    const h = await makeHarness({ ttsInactivityMs: 120 }, {}, { ttsKeepAliveMs: 20 });
+    h.session.writeText('preamble ');
+    await delay(120); // several keepalive intervals during a simulated tool wait
+    h.session.writeText('answer ');
+    await h.session.finishSpeech();
+    // Before the EOS at finish, no frame carried an empty text without a flush
+    // flag (that shape is EOS and must never appear as a keepalive).
+    const framesBeforeEos = [...h.fixture.ttsFrames];
+    for (const raw of framesBeforeEos) {
+      const m = JSON.parse(raw) as { text?: string; flush?: boolean };
+      if (m.text === '' && m.flush !== true) {
+        // The only legitimate empty-text frame is the terminating EOS; assert it
+        // is the last frame, never an intermediate keepalive.
+        expect(raw).toBe(framesBeforeEos.at(-1));
+      }
+    }
+    expect(h.errors).toEqual([]);
   });
 });
 

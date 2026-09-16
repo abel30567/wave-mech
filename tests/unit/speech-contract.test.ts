@@ -1,11 +1,31 @@
 import { describe, expect, it } from 'vitest';
-import { parseSttEvent, sttChunkFrame, ttsFlushFrame } from '../../src/server/speech/protocol.js';
+import {
+  DEFAULT_TTS_ENDPOINT,
+  TTS_INACTIVITY_TIMEOUT_SECONDS,
+  parseSttEvent,
+  sttChunkFrame,
+  ttsFlushFrame,
+  ttsForceFlushFrame,
+} from '../../src/server/speech/protocol.js';
 
 // Provider-reference examples, deliberately independent of the WS fixture.
 // https://elevenlabs.io/docs/api-reference/speech-to-text/v-1-speech-to-text-realtime
+// https://elevenlabs.io/docs/api-reference/text-to-speech/v-1-text-to-speech-voice-id-stream-input
 
 it('ends TTS with empty text rather than combining EOS with a keep-open flush', () => {
   expect(JSON.parse(ttsFlushFrame())).toEqual({ text: '' });
+});
+
+it('forces generation with the documented flush flag without ending the stream', () => {
+  // The keep-open flush is distinct from EOS: it carries the `flush` flag so a
+  // short first sentence synthesizes immediately, and does not close generation.
+  expect(JSON.parse(ttsForceFlushFrame())).toEqual({ text: '', flush: true });
+});
+
+it('requests the documented inactivity_timeout (<=180s) so a warm socket survives tool waits', () => {
+  expect(TTS_INACTIVITY_TIMEOUT_SECONDS).toBeLessThanOrEqual(180);
+  const url = new URL(DEFAULT_TTS_ENDPOINT.replace('{voiceId}', 'v'));
+  expect(url.searchParams.get('inactivity_timeout')).toBe(String(TTS_INACTIVITY_TIMEOUT_SECONDS));
 });
 
 describe('documented ElevenLabs STT contract', () => {

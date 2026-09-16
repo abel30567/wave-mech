@@ -15,9 +15,13 @@ export const DEFAULT_STT_ENDPOINT =
   'wss://api.elevenlabs.io/v1/speech-to-text/realtime' +
   '?model_id=scribe_v2_realtime&audio_format=pcm_16000&commit_strategy=manual';
 
+// `inactivity_timeout` (documented, max 180 s) keeps the stream-input socket
+// open across a long tool wait so a warm socket survives instead of being
+// dropped at the 20 s default; we pin the documented maximum.
+export const TTS_INACTIVITY_TIMEOUT_SECONDS = 180;
 export const DEFAULT_TTS_ENDPOINT =
   'wss://api.elevenlabs.io/v1/text-to-speech/{voiceId}/stream-input' +
-  '?model_id=eleven_flash_v2_5&output_format=pcm_24000';
+  `?model_id=eleven_flash_v2_5&output_format=pcm_24000&inactivity_timeout=${TTS_INACTIVITY_TIMEOUT_SECONDS}`;
 
 export const TTS_SAMPLE_RATE = 24000;
 export const STT_SAMPLE_RATE = 16000;
@@ -105,9 +109,18 @@ export function ttsTextFrame(text: string): string {
   return JSON.stringify({ text });
 }
 
-/** Empty text is the documented end-of-input signal; flush alone keeps the stream open. */
+/** Empty text is the documented end-of-input signal (EOS): it closes generation. */
 export function ttsFlushFrame(): string {
   return JSON.stringify({ text: '' });
+}
+
+/**
+ * Force generation of already-buffered text without ending the stream. The
+ * documented `flush` flag (paired with empty text) makes a short first sentence
+ * synthesize immediately instead of waiting for the provider's buffer threshold.
+ */
+export function ttsForceFlushFrame(): string {
+  return JSON.stringify({ text: '', flush: true });
 }
 
 // ---- TTS inbound frames ----------------------------------------------------

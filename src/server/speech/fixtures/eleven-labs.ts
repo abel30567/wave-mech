@@ -39,6 +39,10 @@ export interface Fixture {
   close(): Promise<void>;
   /** Tokens observed on incoming connections, to assert they are forwarded. */
   readonly seenTokens: string[];
+  /** Raw JSON frames received on TTS sockets, to assert keepalive/flush shapes. */
+  readonly ttsFrames: string[];
+  /** Count of TTS sockets opened, to assert prewarm/reopen behaviour. */
+  readonly ttsConnections: () => number;
 }
 
 function send(ws: WebSocket, payload: unknown): void {
@@ -47,6 +51,8 @@ function send(ws: WebSocket, payload: unknown): void {
 
 export async function startFixture(options: FixtureOptions = {}): Promise<Fixture> {
   const seenTokens: string[] = [];
+  const ttsFrames: string[] = [];
+  let ttsConnections = 0;
   const server = new WebSocketServer({ port: 0, host: '127.0.0.1' });
   await new Promise<void>((resolve) => server.once('listening', resolve));
   const { port } = server.address() as AddressInfo;
@@ -57,13 +63,19 @@ export async function startFixture(options: FixtureOptions = {}): Promise<Fixtur
     if (token) seenTokens.push(token);
 
     if (url.pathname.startsWith('/stt')) handleStt(ws, options);
-    else handleTts(ws, options);
+    else {
+      ttsConnections += 1;
+      ws.on('message', (data) => ttsFrames.push(data.toString()));
+      handleTts(ws, options);
+    }
   });
 
   return {
     sttEndpoint: `ws://127.0.0.1:${port}/stt?model_id=scribe_v2_realtime&commit_strategy=manual`,
     ttsEndpoint: `ws://127.0.0.1:${port}/tts/{voiceId}/stream-input?model_id=eleven_flash_v2_5`,
     seenTokens,
+    ttsFrames,
+    ttsConnections: () => ttsConnections,
     close(): Promise<void> {
       return new Promise((resolve, reject) => {
         for (const client of server.clients) client.terminate();

@@ -70,6 +70,7 @@ async function build(options: BuildOptions = {}): Promise<Built> {
             startRecognition: () => s.startRecognition(),
             writeAudio: (pcm) => s.acceptAudio!(pcm),
             commitRecognition: () => s.commitRecognition(),
+            prewarm: () => s.prewarm(),
             writeText: (text) => s.writeText(text),
             finishSpeech: () => s.finishSpeech(),
             close: () => s.close(),
@@ -404,11 +405,16 @@ describe('createConversation — detach / attach recovery', () => {
     await b.conv.handle({ type: 'text', turnId: 1, text: 'slow one' });
     await vi.waitFor(() => expect(only(b.events, 'text')).not.toHaveLength(0));
     b.conv.detach();
+    // Whatever audio was emitted while attached is legitimately heard; the fence
+    // is that NO further audio is synthesized once the sink is gone.
+    const audioAtDetach = only(b.events, 'audio').length;
 
     await vi.waitFor(() => expect(b.conv.snapshot().response?.finished).toBe(true), { timeout: 2000 });
     const snap = b.conv.snapshot();
     expect(snap.response?.audioInterrupted).toBe(true);
-    expect(snap.response?.lastAudioSeq).toBe(0);
+    // No unheard audio was produced after detach.
+    expect(only(b.events, 'audio').length).toBe(audioAtDetach);
+    expect(snap.response?.lastAudioSeq).toBe(audioAtDetach);
     expect(snap.messages.some((m) => m.role === 'assistant' && m.text === 'Hello café 🌊 world')).toBe(true);
   });
 

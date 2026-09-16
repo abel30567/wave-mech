@@ -10,6 +10,7 @@ import {
   sttChunkFrame,
   sttCommitFrame,
   ttsFlushFrame,
+  ttsForceFlushFrame,
   ttsInitFrame,
   ttsTextFrame,
   withSttToken,
@@ -172,7 +173,7 @@ function rawToString(data: RawData): string {
   return Buffer.from(data as ArrayBuffer).toString('utf8');
 }
 
-export function createSpeech(options: SpeechOptions, tuning: SpeechTuning = {}): SpeechSession {
+export function createSpeech(options: SpeechOptions, tuning: SpeechTuning = {}): SpeechSession & { prewarm(): void } {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const sttEndpoint = options.endpoints?.stt ?? DEFAULT_STT_ENDPOINT;
   const ttsEndpoint = options.endpoints?.tts ?? DEFAULT_TTS_ENDPOINT;
@@ -399,9 +400,17 @@ export function createSpeech(options: SpeechOptions, tuning: SpeechTuning = {}):
     if (tts || ttsStarting) return;
     const generation = ttsGeneration;
     const socket = new SpeechSocket(handleTtsFrame, (message) => {
+      // A warm-but-idle socket dropped by the provider's inactivity timeout (a
+      // clean close while we are not finalizing) is NOT a synthesis error: the
+      // next writeText reopens lazily. Only surface real failures.
+      const idleClose = message === 'speech_socket_closed' && !pendingFinish;
+      if (tts === socket) teardownTts();
+      if (idleClose) {
+        emitDiagnostic({ source: 'speech', code: 'tts_idle_closed' });
+        return;
+      }
       settleFinish(new Error(message));
       options.onError(message);
-      if (tts === socket) teardownTts();
     });
     tts = socket;
     socket.send(ttsInitFrame());
@@ -427,6 +436,19 @@ export function createSpeech(options: SpeechOptions, tuning: SpeechTuning = {}):
     });
   };
 
+  /**
+   * Pre-open the TTS stream-input socket (token fetch + websocket open) so the
+   * first synthesized audio arrives sooner. Idempotent within a turn (a second
+   * call while a socket is open/opening is a no-op) and fenced by the synthesis
+   * epoch, so a cancel that races the open drops the orphaned socket.
+   */
+  const prewarm = (): void => {
+    if (closed || tts || ttsStarting) return;
+    ttsFirstAudio = false;
+    ensureTts();
+    emitDiagnostic({ source: 'speech', code: 'tts_prewarmed' });
+  };
+
   const writeText = (text: string): void => {
     if (closed || !text) return;
     if (!tts && !ttsStarting) ttsFirstAudio = false;
@@ -435,9 +457,14 @@ export function createSpeech(options: SpeechOptions, tuning: SpeechTuning = {}):
     let end = textBuffer.length;
     while (end > 0 && !/\s/.test(textBuffer[end - 1])) end--;
     if (!end) return;
+    const chunk = textBuffer.slice(0, end);
     ensureTts();
-    tts?.send(ttsTextFrame(textBuffer.slice(0, end)));
+    tts?.send(ttsTextFrame(chunk));
     textBuffer = textBuffer.slice(end);
+    // Force generation at a sentence boundary so a short first sentence is
+    // synthesized immediately instead of waiting for the provider's buffer
+    // threshold. Only whole sentences flush; mid-sentence fragments do not.
+    if (/[.!?…][)\]"'”’]*\s*$/.test(chunk)) tts?.send(ttsForceFlushFrame());
     // Real text resets the idle window; re-arm so the next tool wait is covered.
     armTtsKeepAlive();
   };
@@ -500,6 +527,7 @@ export function createSpeech(options: SpeechOptions, tuning: SpeechTuning = {}):
     abortRecognition,
     cancelSpeech,
     commitRecognition,
+    prewarm,
     writeText,
     finishSpeech,
     close,
