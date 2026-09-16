@@ -1,72 +1,12 @@
 {
-  "kind": "artifact",
-  "name": "result.json",
-  "worker": "agent/gpt-live-contract-verify-20260915",
-  "base_commit": "5bf8c53995afaa4883889bd921b9311912dcbf7f",
-  "branch": "agent/gpt-live-contract-verify-20260915",
-  "model": "claude-opus-4-6",
-  "node_version": "22.23.2",
-  "timestamp": "2026-09-15T04:35:00Z",
-  "findings": [
-    {
-      "priority": 1,
-      "area": "End + diagnostics CONTRACT",
-      "status": "FIXED",
-      "description": "getDiagnostics() returned empty default state after finishCleanup cleared this.active. Fixed by retaining lastDiagnosticSnapshot before clearing active session. Added owner-bound access control so non-owning callers get empty diagnostics.",
-      "files_changed": ["src/server/live/session.ts", "src/server/index.ts"],
-      "tests_added": ["contract-verification.test.ts: End + diagnostics lifecycle (3 tests)", "session.test.ts: diagnostics return empty for non-owning caller"]
-    },
-    {
-      "priority": 2,
-      "area": "Fresh input delegation",
-      "status": "FIXED",
-      "description": "assembleUserContext() used ALL historical user transcript entries, potentially re-executing previous consequential requests on new delegations. Fixed by adding per-delegation inputCursor that advances after each delegation send settles. New delegations only see transcript entries added after the cursor.",
-      "files_changed": ["src/server/live/session.ts"],
-      "tests_added": ["contract-verification.test.ts: fresh-input cursor prevents stale replay (4 tests)"],
-      "tests_updated": ["delegation-regression.test.ts: updated 2 tests to reflect cursor-based input isolation"]
-    },
-    {
-      "priority": 3,
-      "area": "Final result delivery",
-      "status": "VERIFIED_EXISTING",
-      "description": "sendCommentary/sendThinking are fire-and-forget void calls per the SDK. Chunked commentary preserves full text. Provider send errors are caught and non-fatal. End during in-flight send is properly fenced. The SDK CommentaryAppendedEvent acknowledgment correlation is NOT implemented — the SDK sends void, and the session correctly does not mark delivery on socket.send alone. This is a limitation of the current provider adapter, not a bug.",
-      "remaining_gate": "SDK acknowledgment correlation for CommentaryAppendedEvent is not implemented. Would require provider adapter extension to track client_event_id on sends and match against incoming acknowledgment events. NOT COMPLETE — labeled as future work.",
-      "tests_added": ["contract-verification.test.ts: final result delivery (3 tests)"]
-    },
-    {
-      "priority": 4,
-      "area": "Billing/transport stop conditions",
-      "status": "VERIFIED_EXISTING",
-      "description": "Unknown create before session ID blocks across restart. Persist-failure latch. Sync-close race (idempotent). Valid >300s actual usage retained. Corrupt ledger rejected. Sideband socket error triggers safe teardown. maxRetries:0 in provider constructor. All verified with existing + new tests.",
-      "remaining_gate": "Automatic orphan reconciliation is NOT implemented. Only lockout + manual confirmClosure resolves uncertain state. This is by design per the spec — uncertain closures remain locked until manually reconciled. No automatic paid POST retries confirmed.",
-      "tests_added": ["contract-verification.test.ts: billing stop conditions (6 tests)"]
-    },
-    {
-      "priority": 5,
-      "area": "Scope/credentials/cleanup",
-      "status": "FIXED",
-      "description": "Added owner checks on /end and /diagnostics endpoints. Server /end handler now verifies ownerId matches session owner. /diagnostics passes ownerId for owner-bound access. Transcript bounded to 500 entries. getSessionOwnerId() exposed for server entry integration. No raw credential fields in diagnostics output.",
-      "files_changed": ["src/server/index.ts", "src/server/live/session.ts"],
-      "tests_added": ["contract-verification.test.ts: scope/credentials/cleanup (5 tests)"]
-    }
-  ],
-  "test_results": {
-    "check": "PASS — tsc --noEmit clean",
-    "unit_tests": "PASS — 465 tests in 26 files (was 442 in 25 files)",
-    "build": "PASS — vite build + tsc server",
-    "browser_default": "PASS — 14 default voice tests",
-    "browser_trial": "PASS — 9 GPT-Live trial tests",
-    "total_browser": "PASS — 23 browser tests",
-    "fixture_mode": "WAVE_CLAUDE_BIN=/nonexistent-wave-fixture used for all runs"
-  },
-  "not_performed": [
-    "Real OpenAI provider API calls",
-    "iPhone/mobile qualification",
-    "Live WebRTC media verification",
-    "Production credential integration"
-  ],
-  "commits": [
-    "1c6c2be: fix: retain diagnostic snapshot after End, per-delegation fresh-input cursor, owner checks on /end and /diagnostics",
-    "058acf5: test: contract verification tests for all five priority integration areas"
-  ]
+  "sha": "86032cf7f24588bf2e69cb7bc2821907869cb2df",
+  "tested_code_sha": "6d93d742d99415cc0cc2c089a317fd10e1c08e9f",
+  "branch": "agent/issue-15-default-speech-20260916",
+  "base_sha": "218f578acf9a5b9add7b85f956e24d05fb3c0a5b",
+  "check": "pass (tsc --noEmit)",
+  "unit": "pass (494 passed / 30 files; WAVE_CLAUDE_BIN=/nonexistent-wave-fixture npm test)",
+  "build": "pass (npm run build; client bundle emitted)",
+  "e2e": "pass (25 passed, chromium; npx playwright install --with-deps chromium && npm run test:e2e)",
+  "first_audio_latency_fixture_ms": { "cold_no_prewarm": 44.0, "warm_prewarm": 0.6, "improvement": 43.4, "simulated_token_latency": 40 },
+  "notes": "Issue 15 section 3 complete: narration gating + onResult final-answer synthesis; TTS prewarm + inactivity_timeout keepalive + sentence flush + benign idle-close; consumption-based output flow control (playback_progress, bounded 120s server outbox, 12s client look-ahead, output_truncated diagnostics, time-based old-client fallback); source-node fence on cancel/interrupt/truncation; diagnostics with units and new codes. All changes within owned paths. Main must map prewarm/onResult into its adapters (optional, tolerated absent) for the live latency win."
 }
